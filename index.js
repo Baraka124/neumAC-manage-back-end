@@ -70,7 +70,17 @@ const upload = multer({
 });
 
 // ============ CORS CONFIGURATION ============
-const allowedOrigins = ALLOWED_ORIGINS.split(',');
+const {
+  SUPABASE_URL,
+  SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY,
+  JWT_SECRET = process.env.JWT_SECRET || 'sb_secret_ah53o9afyZzuAfccFM2HNA_rEmi6-iJ',
+  NODE_ENV = 'production',
+  ALLOWED_ORIGINS: ENV_ALLOWED_ORIGINS
+} = process.env;
+
+// Use environment variable with fallback
+const ALLOWED_ORIGINS_STRING = ENV_ALLOWED_ORIGINS || 'https://baraka124.github.io,http://localhost:3000,http://localhost:8080';
+const allowedOrigins = ALLOWED_ORIGINS_STRING.split(',').map(origin => origin.trim());
 
 console.log('🌐 CORS Configuration:', {
   allowedOrigins,
@@ -91,9 +101,6 @@ const corsOptions = {
         const regex = new RegExp(allowedOrigin.replace(/\*/g, '.*'));
         return regex.test(origin);
       }
-      
-      // Check if origin matches allowed origin pattern
-      if (origin.startsWith(allowedOrigin)) return true;
       
       return false;
     });
