@@ -1,9 +1,7 @@
 {
-  "build": {
-    "builder": "NIXPACKS",
-    "buildCommand": "npm install --no-cache",
-    "cache": {
-      "enabled": false
-    }
+  "name": "neumac-backend",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node server.js"  // or whatever your main file is
   }
 }
