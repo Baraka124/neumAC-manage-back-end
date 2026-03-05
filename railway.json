@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "npm install --no-cache",
+    "cache": {
+      "enabled": false
+    }
+  }
+}
