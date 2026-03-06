@@ -4279,7 +4279,449 @@ app.get('/api/export/csv', authenticateToken, checkPermission('system_settings',
     res.status(500).json({ error: 'Failed to export data', message: error.message });
   }
 });
+// ===== 23. RESEARCH LINES ENDPOINTS =====
 
+/**
+ * @route GET /api/research-lines
+ * @description Get all research lines with coordinator info
+ * @access Private
+ */
+app.get('/api/research-lines', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('research_lines_with_coordinators')
+      .select('*')
+      .order('sort_order');
+    
+    if (error) throw error;
+    res.json({
+      success: true,
+      data: data || []
+    });
+  } catch (error) {
+    console.error('Failed to fetch research lines:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route GET /api/research-lines/:id
+ * @description Get single research line with details
+ * @access Private
+ */
+app.get('/api/research-lines/:id', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('research_lines')
+      .select('*, medical_staff!coordinator_id(full_name, professional_email, staff_type)')
+      .eq('id', id)
+      .single();
+    
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Research line not found' });
+      }
+      throw error;
+    }
+    
+    res.json({
+      success: true,
+      data: data
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route PUT /api/research-lines/:id/coordinator
+ * @description Assign coordinator to research line (from UI)
+ * @access Private
+ */
+app.put('/api/research-lines/:id/coordinator', authenticateToken, checkPermission('medical_staff', 'update'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { coordinator_id } = req.body;
+    
+    // Verify coordinator exists in medical_staff
+    if (coordinator_id) {
+      const { data: staff, error: staffError } = await supabase
+        .from('medical_staff')
+        .select('id')
+        .eq('id', coordinator_id)
+        .single();
+      
+      if (staffError || !staff) {
+        return res.status(400).json({ error: 'Invalid coordinator ID' });
+      }
+    }
+    
+    const { data, error } = await supabase
+      .from('research_lines')
+      .update({ 
+        coordinator_id: coordinator_id || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    res.json({
+      success: true,
+      data: data,
+      message: coordinator_id ? 'Coordinator assigned successfully' : 'Coordinator removed successfully'
+    });
+  } catch (error) {
+    console.error('Failed to assign coordinator:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== 24. CLINICAL TRIALS ENDPOINTS =====
+
+/**
+ * @route GET /api/clinical-trials/website
+ * @description Get trials for website display (public - no auth)
+ * @access Public
+ */
+app.get('/api/clinical-trials/website', apiLimiter, async (req, res) => {
+  try {
+    const { line, phase, status, search } = req.query;
+    
+    let query = supabase
+      .from('clinical_trials')
+      .select(`
+        *,
+        research_line:research_lines(name, line_number)
+      `)
+      .eq('featured_in_website', true)
+      .order('display_order');
+    
+    if (line && line !== 'All Lines') {
+      query = query.eq('research_line_id', line);
+    }
+    if (phase && phase !== 'All Phases') {
+      query = query.eq('phase', phase);
+    }
+    if (status && status !== 'All Status') {
+      query = query.eq('status', status);
+    }
+    if (search) {
+      query = query.or(`title.ilike.%${search}%,protocol_id.ilike.%${search}%`);
+    }
+    
+    const { data, error } = await query.limit(10); // Show 10 as sample
+    
+    if (error) throw error;
+    
+    res.json({
+      success: true,
+      data: data || [],
+      message: 'Sample of 10 trials shown. Contact for complete database.'
+    });
+  } catch (error) {
+    console.error('Failed to fetch clinical trials:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route GET /api/clinical-trials
+ * @description Get all clinical trials (authenticated)
+ * @access Private
+ */
+app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { research_line_id, phase, status, page = 1, limit = 50 } = req.query;
+    const offset = (page - 1) * limit;
+    
+    let query = supabase
+      .from('clinical_trials')
+      .select('*, research_lines(name)', { count: 'exact' });
+    
+    if (research_line_id) query = query.eq('research_line_id', research_line_id);
+    if (phase) query = query.eq('phase', phase);
+    if (status) query = query.eq('status', status);
+    
+    const { data, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+    
+    if (error) throw error;
+    
+    res.json({
+      success: true,
+      data: data || [],
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route POST /api/clinical-trials
+ * @description Create new clinical trial
+ * @access Private
+ */
+app.post('/api/clinical-trials', authenticateToken, checkPermission('communications', 'create'), async (req, res) => {
+  try {
+    const trialData = {
+      ...req.body,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    
+    const { data, error } = await supabase
+      .from('clinical_trials')
+      .insert([trialData])
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    res.status(201).json({
+      success: true,
+      data: data,
+      message: 'Clinical trial created successfully'
+    });
+  } catch (error) {
+    console.error('Failed to create clinical trial:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route PUT /api/clinical-trials/:id
+ * @description Update clinical trial
+ * @access Private
+ */
+app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('communications', 'update'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = {
+      ...req.body,
+      updated_at: new Date().toISOString()
+    };
+    
+    const { data, error } = await supabase
+      .from('clinical_trials')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+    
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Clinical trial not found' });
+      }
+      throw error;
+    }
+    
+    res.json({
+      success: true,
+      data: data,
+      message: 'Clinical trial updated successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route DELETE /api/clinical-trials/:id
+ * @description Delete clinical trial
+ * @access Private
+ */
+app.delete('/api/clinical-trials/:id', authenticateToken, checkPermission('communications', 'delete'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const { error } = await supabase
+      .from('clinical_trials')
+      .delete()
+      .eq('id', id);
+    
+    if (error) throw error;
+    
+    res.json({
+      success: true,
+      message: 'Clinical trial deleted successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== 25. INNOVATION PROJECTS ENDPOINTS =====
+
+/**
+ * @route GET /api/innovation-projects/website
+ * @description Get innovation projects for website display (public)
+ * @access Public
+ */
+app.get('/api/innovation-projects/website', apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('innovation_projects')
+      .select(`
+        *,
+        research_line:research_lines(name)
+      `)
+      .eq('featured_in_website', true)
+      .order('display_order');
+    
+    if (error) throw error;
+    
+    res.json({
+      success: true,
+      data: data || []
+    });
+  } catch (error) {
+    console.error('Failed to fetch innovation projects:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route GET /api/innovation-projects
+ * @description Get all innovation projects (authenticated)
+ * @access Private
+ */
+app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { research_line_id, category, page = 1, limit = 50 } = req.query;
+    const offset = (page - 1) * limit;
+    
+    let query = supabase
+      .from('innovation_projects')
+      .select('*, research_lines(name)', { count: 'exact' });
+    
+    if (research_line_id) query = query.eq('research_line_id', research_line_id);
+    if (category) query = query.eq('category', category);
+    
+    const { data, error, count } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+    
+    if (error) throw error;
+    
+    res.json({
+      success: true,
+      data: data || [],
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route POST /api/innovation-projects
+ * @description Create new innovation project
+ * @access Private
+ */
+app.post('/api/innovation-projects', authenticateToken, checkPermission('communications', 'create'), async (req, res) => {
+  try {
+    const projectData = {
+      ...req.body,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    
+    const { data, error } = await supabase
+      .from('innovation_projects')
+      .insert([projectData])
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    res.status(201).json({
+      success: true,
+      data: data,
+      message: 'Innovation project created successfully'
+    });
+  } catch (error) {
+    console.error('Failed to create innovation project:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route PUT /api/innovation-projects/:id
+ * @description Update innovation project
+ * @access Private
+ */
+app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('communications', 'update'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updateData = {
+      ...req.body,
+      updated_at: new Date().toISOString()
+    };
+    
+    const { data, error } = await supabase
+      .from('innovation_projects')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+    
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Innovation project not found' });
+      }
+      throw error;
+    }
+    
+    res.json({
+      success: true,
+      data: data,
+      message: 'Innovation project updated successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route DELETE /api/innovation-projects/:id
+ * @description Delete innovation project
+ * @access Private
+ */
+app.delete('/api/innovation-projects/:id', authenticateToken, checkPermission('communications', 'delete'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const { error } = await supabase
+      .from('innovation_projects')
+      .delete()
+      .eq('id', id);
+    
+    if (error) throw error;
+    
+    res.json({
+      success: true,
+      message: 'Innovation project deleted successfully'
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 // ============ ERROR HANDLING ============
 
 /**
