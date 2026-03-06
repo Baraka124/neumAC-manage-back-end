@@ -4279,6 +4279,7 @@ app.get('/api/export/csv', authenticateToken, checkPermission('system_settings',
     res.status(500).json({ error: 'Failed to export data', message: error.message });
   }
 });
+
 // ===== 23. RESEARCH LINES ENDPOINTS =====
 
 /**
@@ -4288,95 +4289,70 @@ app.get('/api/export/csv', authenticateToken, checkPermission('system_settings',
  */
 app.get('/api/research-lines', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    // Try to use the view first
+    const { data: viewData, error: viewError } = await supabase
       .from('research_lines_with_coordinators')
       .select('*')
       .order('sort_order');
     
-    if (error) throw error;
+    if (!viewError && viewData) {
+      // Format the view data to match what frontend expects
+      const formattedData = viewData.map(line => ({
+        id: line.id,
+        line_number: line.line_number,
+        research_line_name: line.name,  // Map name to research_line_name
+        description: line.description,
+        capabilities: line.capabilities,
+        sort_order: line.sort_order,
+        active: line.active,
+        coordinator_id: line.coordinator_id,
+        coordinator_name: line.full_name,
+        coordinator_email: line.professional_email,
+        coordinator_type: line.staff_type
+      }));
+      
+      return res.json({
+        success: true,
+        data: formattedData
+      });
+    }
+    
+    // Fallback to direct table query if view fails
+    console.log('View query failed, falling back to direct table query:', viewError);
+    const { data: directData, error: directError } = await supabase
+      .from('research_lines')
+      .select('*')
+      .order('sort_order');
+    
+    if (directError) throw directError;
+    
+    // Format direct data
+    const formattedData = directData.map(line => ({
+      id: line.id,
+      line_number: line.line_number,
+      research_line_name: line.name,
+      description: line.description,
+      capabilities: line.capabilities,
+      sort_order: line.sort_order,
+      active: line.active,
+      coordinator_id: line.coordinator_id,
+      coordinator_name: null,
+      coordinator_email: null,
+      coordinator_type: null
+    }));
+    
     res.json({
       success: true,
-      data: data || []
+      data: formattedData
     });
+    
   } catch (error) {
     console.error('Failed to fetch research lines:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * @route GET /api/research-lines/:id
- * @description Get single research line with details
- * @access Private
- */
-app.get('/api/research-lines/:id', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { data, error } = await supabase
-      .from('research_lines')
-      .select('*, medical_staff!coordinator_id(full_name, professional_email, staff_type)')
-      .eq('id', id)
-      .single();
-    
-    if (error) {
-      if (error.code === 'PGRST116') {
-        return res.status(404).json({ error: 'Research line not found' });
-      }
-      throw error;
-    }
-    
-    res.json({
-      success: true,
-      data: data
+    res.status(500).json({ 
+      error: error.message,
+      details: error.details,
+      hint: error.hint
     });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * @route PUT /api/research-lines/:id/coordinator
- * @description Assign coordinator to research line (from UI)
- * @access Private
- */
-app.put('/api/research-lines/:id/coordinator', authenticateToken, checkPermission('medical_staff', 'update'), async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { coordinator_id } = req.body;
-    
-    // Verify coordinator exists in medical_staff
-    if (coordinator_id) {
-      const { data: staff, error: staffError } = await supabase
-        .from('medical_staff')
-        .select('id')
-        .eq('id', coordinator_id)
-        .single();
-      
-      if (staffError || !staff) {
-        return res.status(400).json({ error: 'Invalid coordinator ID' });
-      }
-    }
-    
-    const { data, error } = await supabase
-      .from('research_lines')
-      .update({ 
-        coordinator_id: coordinator_id || null,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', id)
-      .select()
-      .single();
-    
-    if (error) throw error;
-    
-    res.json({
-      success: true,
-      data: data,
-      message: coordinator_id ? 'Coordinator assigned successfully' : 'Coordinator removed successfully'
-    });
-  } catch (error) {
-    console.error('Failed to assign coordinator:', error);
-    res.status(500).json({ error: error.message });
   }
 });
 
