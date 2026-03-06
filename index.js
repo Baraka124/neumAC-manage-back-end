@@ -32,7 +32,7 @@ const {
 } = process.env;
 
 // Use environment variable with fallback
-const ALLOWED_ORIGINS_STRING = ENV_ALLOWED_ORIGINS || 'https://baraka124.github.io,http://localhost:3000,http://localhost:8080';
+const ALLOWED_ORIGINS_STRING = ENV_ALLOWED_ORIGINS || 'https://baraka124.github.io,https://baraka124.github.io,http://localhost:3000,http://localhost:8080';
 const allowedOrigins = ALLOWED_ORIGINS_STRING.split(',').map(origin => origin.trim());
 
 console.log('🌐 CORS Configuration:', {
