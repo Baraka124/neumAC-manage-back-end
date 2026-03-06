@@ -4791,6 +4791,7 @@ app.use('*', (req, res) => {
       '/api/medical-staff',
       '/api/departments',
       '/api/training-units',
+      '/api/research-lines/:id/coordinator',
       '/api/rotations',
       '/api/rotations/current',
       '/api/rotations/upcoming',
