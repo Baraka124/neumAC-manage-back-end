@@ -5594,66 +5594,108 @@ app.get('/api/analytics/summary', authenticateToken, apiLimiter, async (req, res
 /**
  * 404 Handler
  */
-app.use('*', (req, res) => {
+// ===== 404 HANDLER =====
+app.use((req, res) => {
+  const availableEndpoints = [
+    // Auth endpoints
+    '/api/auth/login',
+    '/api/auth/me',
+    '/api/auth/logout',
+    '/api/auth/change-password',
+    
+    // User management
+    '/api/users',
+    '/api/users/:id',
+    '/api/users/:id/toggle-status',
+    
+    // Research Lines
+    '/api/research-lines',
+    '/api/research-lines/:id/coordinator',
+    '/api/research-lines/:id',  // PUT and DELETE
+    
+    // Clinical Trials
+    '/api/clinical-trials/website',
+    '/api/clinical-trials',
+    '/api/clinical-trials/:id',
+    
+    // Innovation Projects
+    '/api/innovation-projects/website',
+    '/api/innovation-projects',
+    '/api/innovation-projects/:id',
+    
+    // Analytics Endpoints
+    '/api/analytics/research-dashboard',
+    '/api/analytics/research-lines-performance',
+    '/api/analytics/partner-collaborations',
+    '/api/analytics/clinical-trials-timeline',
+    '/api/analytics/export/:type',
+    '/api/analytics/summary',
+    
+    // Staff Management
+    '/api/medical-staff',
+    '/api/medical-staff/:id',
+    
+    // Departments
+    '/api/departments',
+    '/api/departments/:id',
+    
+    // Training Units
+    '/api/training-units',
+    '/api/training-units/:id',
+    
+    // Rotations
+    '/api/resident-rotations',
+    '/api/resident-rotations/:id',
+    
+    // On-call Schedule
+    '/api/oncall-schedule',
+    '/api/oncall-schedule/:id',
+    
+    // Daily Assignments
+    '/api/daily-assignments',
+    '/api/daily-assignments/:id',
+    
+    // Absence Management
+    '/api/staff-absence',
+    '/api/staff-absence/:id',
+    '/api/staff-absence/:id/status',
+    
+    // Announcements
+    '/api/announcements',
+    '/api/announcements/:id',
+    
+    // Clinical Status Updates
+    '/api/clinical-status',
+    '/api/clinical-status/:id',
+    
+    // Live Updates
+    '/api/live-updates',
+    '/api/live-updates/:id',
+    
+    // Notifications
+    '/api/notifications',
+    '/api/notifications/:id/read',
+    
+    // System
+    '/api/system/settings',
+    '/api/system/permissions',
+    '/api/system/roles',
+    '/api/system/audit-logs',
+    
+    // Partners
+    '/api/partners',
+    '/api/partners/:id',
+    
+    // Tags
+    '/api/tags',
+    '/api/tags/:id'
+  ];
+
   res.status(404).json({
     error: 'Endpoint not found',
-    message: `The requested endpoint ${req.originalUrl} does not exist`,
-    availableEndpoints: [
-      '/health',
-      '/api/auth/login',
-      '/api/auth/register',
-      '/api/auth/forgot-password',
-      '/api/auth/reset-password',
-      '/api/auth/logout',
-      '/api/users',
-      '/api/users/profile',
-      '/api/users/change-password',
-      '/api/medical-staff',
-      '/api/departments',
-      '/api/training-units',
-      '/api/research-lines/:id/coordinator',
-      '/api/rotations',
-      '/api/rotations/current',
-      '/api/rotations/upcoming',
-      '/api/oncall',
-      '/api/oncall/today',
-      '/api/oncall/upcoming',
-      '/api/absence-records',
-      '/api/absence-records/current',
-      '/api/absence-records/upcoming',
-      '/api/absence-records/dashboard/stats',
-      '/api/announcements',
-      '/api/announcements/urgent',
-      '/api/live-status/current',
-      '/api/live-status',
-      '/api/live-status/history',
-      '/api/live-updates',
-      '/api/notifications',
-      '/api/notifications/unread',
-      '/api/audit-logs',
-      '/api/attachments/upload',
-      '/api/dashboard/stats',
-      '/api/dashboard/upcoming-events',
-      '/api/settings',
-      '/api/available-data',
-      '/api/search/medical-staff',
-      '/api/reports/staff-distribution',
-      '/api/reports/rotation-summary',
-      '/api/calendar/events',
-      '/api/export/csv',
-      '/api/debug/tables',
-      '/api/debug/cors',
-      '/api/debug/live-status'
-      '/api/research-lines', // POST
-'/api/research-lines/:id', // PUT
-'/api/research-lines/:id', // DELETE
-'/api/analytics/research-dashboard',
-'/api/analytics/research-lines-performance',
-'/api/analytics/partner-collaborations',
-'/api/analytics/clinical-trials-timeline',
-'/api/analytics/export/:type',
-'/api/analytics/summary'
-    ]
+    message: `The requested endpoint ${req.method} ${req.path} does not exist`,
+    availableEndpoints: availableEndpoints,
+    timestamp: new Date().toISOString()
   });
 });
 
