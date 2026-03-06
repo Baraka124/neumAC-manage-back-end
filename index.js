@@ -4356,6 +4356,77 @@ app.get('/api/research-lines', authenticateToken, apiLimiter, async (req, res) =
   }
 });
 
+/**
+ * @route PUT /api/research-lines/:id/coordinator
+ * @description Assign coordinator to research line
+ * @access Private
+ */
+app.put('/api/research-lines/:id/coordinator', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { coordinator_id } = req.body;
+    
+    console.log(`📝 Assigning coordinator to research line ${id}:`, coordinator_id);
+    
+    // Validate research line exists
+    const { data: researchLine, error: lineError } = await supabase
+      .from('research_lines')
+      .select('id, name')
+      .eq('id', id)
+      .single();
+    
+    if (lineError || !researchLine) {
+      return res.status(404).json({ 
+        error: 'Research line not found',
+        message: `No research line found with id ${id}`
+      });
+    }
+    
+    // Verify coordinator exists in medical_staff if provided
+    if (coordinator_id) {
+      const { data: staff, error: staffError } = await supabase
+        .from('medical_staff')
+        .select('id, full_name')
+        .eq('id', coordinator_id)
+        .single();
+      
+      if (staffError || !staff) {
+        return res.status(400).json({ 
+          error: 'Invalid coordinator',
+          message: 'Selected coordinator not found in medical staff'
+        });
+      }
+    }
+    
+    // Update the research line
+    const { data, error } = await supabase
+      .from('research_lines')
+      .update({ 
+        coordinator_id: coordinator_id || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    console.log(`✅ Coordinator assigned successfully to line ${id}`);
+    
+    res.json({
+      success: true,
+      data: data,
+      message: coordinator_id ? 'Coordinator assigned successfully' : 'Coordinator removed successfully'
+    });
+    
+  } catch (error) {
+    console.error('❌ Failed to assign coordinator:', error);
+    res.status(500).json({ 
+      error: error.message,
+      details: error.details
+    });
+  }
+});
 // ===== 24. CLINICAL TRIALS ENDPOINTS =====
 
 /**
