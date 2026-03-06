@@ -4769,6 +4769,826 @@ app.delete('/api/innovation-projects/:id', authenticateToken, checkPermission('c
     res.status(500).json({ error: error.message });
   }
 });
+// ===== 26. RESEARCH LINES - MISSING CRUD ENDPOINTS =====
+
+/**
+ * @route POST /api/research-lines
+ * @description Create a new research line
+ * @access Private (Admin/Department Head)
+ */
+app.post('/api/research-lines', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
+  try {
+    const { line_number, name, description, capabilities, sort_order, active } = req.body;
+    
+    // Validation
+    if (!name) {
+      return res.status(400).json({ error: 'Research line name is required' });
+    }
+    
+    // Check if line_number already exists
+    if (line_number) {
+      const { data: existing } = await supabase
+        .from('research_lines')
+        .select('id')
+        .eq('line_number', line_number)
+        .single();
+      
+      if (existing) {
+        return res.status(409).json({ error: 'Line number already exists' });
+      }
+    }
+    
+    const newLine = {
+      line_number: line_number || null,
+      name,
+      description: description || '',
+      capabilities: capabilities || 'Alcance y capacidades',
+      sort_order: sort_order || 0,
+      active: active !== undefined ? active : true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    
+    const { data, error } = await supabase
+      .from('research_lines')
+      .insert([newLine])
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    res.status(201).json({
+      success: true,
+      data: data,
+      message: 'Research line created successfully'
+    });
+    
+  } catch (error) {
+    console.error('Create research line error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route PUT /api/research-lines/:id
+ * @description Update a research line
+ * @access Private (Admin/Department Head)
+ */
+app.put('/api/research-lines/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { line_number, name, description, capabilities, sort_order, active } = req.body;
+    
+    // Check if research line exists
+    const { data: existing, error: checkError } = await supabase
+      .from('research_lines')
+      .select('id')
+      .eq('id', id)
+      .single();
+    
+    if (checkError || !existing) {
+      return res.status(404).json({ error: 'Research line not found' });
+    }
+    
+    // Check if line_number is taken by another line
+    if (line_number) {
+      const { data: lineWithNumber } = await supabase
+        .from('research_lines')
+        .select('id')
+        .eq('line_number', line_number)
+        .neq('id', id)
+        .single();
+      
+      if (lineWithNumber) {
+        return res.status(409).json({ error: 'Line number already in use by another research line' });
+      }
+    }
+    
+    const updateData = {
+      line_number: line_number !== undefined ? line_number : existing.line_number,
+      name: name || existing.name,
+      description: description !== undefined ? description : existing.description,
+      capabilities: capabilities !== undefined ? capabilities : existing.capabilities,
+      sort_order: sort_order !== undefined ? sort_order : existing.sort_order,
+      active: active !== undefined ? active : existing.active,
+      updated_at: new Date().toISOString()
+    };
+    
+    const { data, error } = await supabase
+      .from('research_lines')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    res.json({
+      success: true,
+      data: data,
+      message: 'Research line updated successfully'
+    });
+    
+  } catch (error) {
+    console.error('Update research line error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route DELETE /api/research-lines/:id
+ * @description Delete a research line (soft delete by setting active=false)
+ * @access Private (Admin only)
+ */
+app.delete('/api/research-lines/:id', authenticateToken, checkPermission('research_lines', 'delete'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { permanent } = req.query; // ?permanent=true for hard delete
+    
+    // Check if research line exists and has dependencies
+    const { data: existing, error: checkError } = await supabase
+      .from('research_lines')
+      .select('id, name')
+      .eq('id', id)
+      .single();
+    
+    if (checkError || !existing) {
+      return res.status(404).json({ error: 'Research line not found' });
+    }
+    
+    // Check for dependent clinical trials
+    const { count: trialsCount } = await supabase
+      .from('clinical_trials')
+      .select('*', { count: 'exact', head: true })
+      .eq('research_line_id', id);
+    
+    // Check for dependent innovation projects
+    const { count: projectsCount } = await supabase
+      .from('innovation_projects')
+      .select('*', { count: 'exact', head: true })
+      .eq('research_line_id', id);
+    
+    if (permanent === 'true') {
+      // Permanent delete (only if no dependencies or admin forces it)
+      if ((trialsCount > 0 || projectsCount > 0) && !req.query.force) {
+        return res.status(409).json({ 
+          error: 'Cannot delete research line with existing dependencies',
+          details: {
+            clinicalTrials: trialsCount,
+            innovationProjects: projectsCount
+          }
+        });
+      }
+      
+      const { error } = await supabase
+        .from('research_lines')
+        .delete()
+        .eq('id', id);
+      
+      if (error) throw error;
+      
+      res.json({
+        success: true,
+        message: 'Research line permanently deleted'
+      });
+      
+    } else {
+      // Soft delete - just mark as inactive
+      const { data, error } = await supabase
+        .from('research_lines')
+        .update({ 
+          active: false, 
+          updated_at: new Date().toISOString() 
+        })
+        .eq('id', id)
+        .select()
+        .single();
+      
+      if (error) throw error;
+      
+      res.json({
+        success: true,
+        data: data,
+        message: 'Research line deactivated successfully'
+      });
+    }
+    
+  } catch (error) {
+    console.error('Delete research line error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===== 27. ANALYTICS & REPORTING ENDPOINTS =====
+
+/**
+ * @route GET /api/analytics/research-dashboard
+ * @description Get comprehensive research dashboard statistics
+ * @access Private
+ */
+app.get('/api/analytics/research-dashboard', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    // 1. Research Lines Stats
+    const { data: researchLines, error: linesError } = await supabase
+      .from('research_lines')
+      .select('id, line_number, name, active, coordinator_id');
+    
+    if (linesError) throw linesError;
+    
+    // 2. Clinical Trials Stats with research line names
+    const { data: trials, error: trialsError } = await supabase
+      .from('clinical_trials')
+      .select(`
+        id,
+        protocol_id,
+        title,
+        phase,
+        status,
+        research_line_id,
+        research_line:research_lines(name)
+      `);
+    
+    if (trialsError) throw trialsError;
+    
+    // 3. Innovation Projects Stats
+    const { data: projects, error: projectsError } = await supabase
+      .from('innovation_projects')
+      .select(`
+        id,
+        title,
+        category,
+        current_stage,
+        research_line_id,
+        partner_needs,
+        research_line:research_lines(name)
+      `);
+    
+    if (projectsError) throw projectsError;
+    
+    // 4. Calculate statistics
+    const totalResearchLines = researchLines?.length || 0;
+    const activeResearchLines = researchLines?.filter(l => l.active !== false).length || 0;
+    
+    // Trials by phase
+    const trialsByPhase = {
+      'Phase I': 0,
+      'Phase II': 0,
+      'Phase III': 0,
+      'Phase IV': 0
+    };
+    
+    // Trials by status
+    const trialsByStatus = {
+      'Reclutando': 0,
+      'Activo': 0,
+      'Completado': 0,
+      'En preparación': 0
+    };
+    
+    trials?.forEach(trial => {
+      if (trial.phase && trialsByPhase.hasOwnProperty(trial.phase)) {
+        trialsByPhase[trial.phase]++;
+      }
+      if (trial.status && trialsByStatus.hasOwnProperty(trial.status)) {
+        trialsByStatus[trial.status]++;
+      }
+    });
+    
+    // Projects by stage
+    const projectsByStage = {
+      'Idea': 0,
+      'Prototipo': 0,
+      'Piloto': 0,
+      'Validación': 0,
+      'Escalamiento': 0,
+      'Comercialización': 0
+    };
+    
+    // Projects by category
+    const projectsByCategory = {
+      'Dispositivo': 0,
+      'Salud Digital': 0,
+      'IA / ML': 0,
+      'Tecnología Quirúrgica': 0
+    };
+    
+    // Partner needs aggregation
+    const partnerNeeds = {};
+    
+    projects?.forEach(project => {
+      // By stage
+      if (project.current_stage && projectsByStage.hasOwnProperty(project.current_stage)) {
+        projectsByStage[project.current_stage]++;
+      }
+      
+      // By category
+      if (project.category && projectsByCategory.hasOwnProperty(project.category)) {
+        projectsByCategory[project.category]++;
+      }
+      
+      // Partner needs
+      if (project.partner_needs && Array.isArray(project.partner_needs)) {
+        project.partner_needs.forEach(need => {
+          partnerNeeds[need] = (partnerNeeds[need] || 0) + 1;
+        });
+      }
+    });
+    
+    // Trials by research line
+    const trialsByResearchLine = {};
+    researchLines?.forEach(line => {
+      const count = trials?.filter(t => t.research_line_id === line.id).length || 0;
+      if (count > 0) {
+        trialsByResearchLine[line.name] = count;
+      }
+    });
+    
+    // Projects by research line
+    const projectsByResearchLine = {};
+    researchLines?.forEach(line => {
+      const count = projects?.filter(p => p.research_line_id === line.id).length || 0;
+      if (count > 0) {
+        projectsByResearchLine[line.name] = count;
+      }
+    });
+    
+    res.json({
+      success: true,
+      data: {
+        summary: {
+          totalResearchLines,
+          activeResearchLines,
+          totalTrials: trials?.length || 0,
+          activeTrials: (trialsByStatus['Activo'] || 0) + (trialsByStatus['Reclutando'] || 0),
+          totalProjects: projects?.length || 0,
+          activeProjects: (projectsByStage['Piloto'] || 0) + (projectsByStage['Validación'] || 0) + (projectsByStage['Escalamiento'] || 0)
+        },
+        researchLines: researchLines?.map(line => ({
+          id: line.id,
+          line_number: line.line_number,
+          name: line.name,
+          active: line.active,
+          coordinator_id: line.coordinator_id,
+          trialsCount: trials?.filter(t => t.research_line_id === line.id).length || 0,
+          projectsCount: projects?.filter(p => p.research_line_id === line.id).length || 0
+        })),
+        clinicalTrials: {
+          byPhase: trialsByPhase,
+          byStatus: trialsByStatus,
+          byResearchLine: trialsByResearchLine
+        },
+        innovationProjects: {
+          byStage: projectsByStage,
+          byCategory: projectsByCategory,
+          byResearchLine: projectsByResearchLine,
+          partnerNeeds: Object.entries(partnerNeeds)
+            .map(([name, count]) => ({ name, count }))
+            .sort((a, b) => b.count - a.count)
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error('Research dashboard analytics error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route GET /api/analytics/research-lines-performance
+ * @description Get detailed performance metrics per research line
+ * @access Private
+ */
+app.get('/api/analytics/research-lines-performance', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data: researchLines, error: linesError } = await supabase
+      .from('research_lines')
+      .select('id, line_number, name, coordinator_id, active');
+    
+    if (linesError) throw linesError;
+    
+    const performance = await Promise.all(researchLines.map(async (line) => {
+      // Get coordinator name if exists
+      let coordinatorName = null;
+      if (line.coordinator_id) {
+        const { data: staff } = await supabase
+          .from('medical_staff')
+          .select('full_name, professional_email')
+          .eq('id', line.coordinator_id)
+          .single();
+        coordinatorName = staff?.full_name || null;
+      }
+      
+      // Get trials for this line
+      const { data: trials, error: trialsError } = await supabase
+        .from('clinical_trials')
+        .select('id, phase, status, created_at')
+        .eq('research_line_id', line.id);
+      
+      // Get projects for this line
+      const { data: projects, error: projectsError } = await supabase
+        .from('innovation_projects')
+        .select('id, category, current_stage, created_at')
+        .eq('research_line_id', line.id);
+      
+      // Calculate phase distribution
+      const trialsByPhase = {};
+      trials?.forEach(t => {
+        trialsByPhase[t.phase] = (trialsByPhase[t.phase] || 0) + 1;
+      });
+      
+      // Calculate status distribution
+      const trialsByStatus = {};
+      trials?.forEach(t => {
+        trialsByStatus[t.status] = (trialsByStatus[t.status] || 0) + 1;
+      });
+      
+      // Calculate projects by stage
+      const projectsByStage = {};
+      projects?.forEach(p => {
+        projectsByStage[p.current_stage] = (projectsByStage[p.current_stage] || 0) + 1;
+      });
+      
+      return {
+        id: line.id,
+        line_number: line.line_number,
+        name: line.name,
+        active: line.active,
+        coordinator: coordinatorName,
+        stats: {
+          totalTrials: trials?.length || 0,
+          activeTrials: trials?.filter(t => t.status === 'Activo' || t.status === 'Reclutando').length || 0,
+          completedTrials: trials?.filter(t => t.status === 'Completado').length || 0,
+          trialsByPhase,
+          trialsByStatus,
+          totalProjects: projects?.length || 0,
+          activeProjects: projects?.filter(p => 
+            p.current_stage === 'Piloto' || 
+            p.current_stage === 'Validación' || 
+            p.current_stage === 'Escalamiento'
+          ).length || 0,
+          commercialized: projects?.filter(p => p.current_stage === 'Comercialización').length || 0,
+          projectsByStage
+        }
+      };
+    }));
+    
+    // Sort by line number
+    performance.sort((a, b) => (a.line_number || 999) - (b.line_number || 999));
+    
+    res.json({
+      success: true,
+      data: performance
+    });
+    
+  } catch (error) {
+    console.error('Research lines performance error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route GET /api/analytics/partner-collaborations
+ * @description Get partner collaboration statistics
+ * @access Private
+ */
+app.get('/api/analytics/partner-collaborations', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data: projects, error: projectsError } = await supabase
+      .from('innovation_projects')
+      .select(`
+        id,
+        title,
+        category,
+        partner_needs,
+        research_line_id,
+        research_line:research_lines(name)
+      `);
+    
+    if (projectsError) throw projectsError;
+    
+    // Aggregate partner needs
+    const partnerNeeds = {};
+    const needsByCategory = {};
+    const needsByResearchLine = {};
+    
+    projects?.forEach(project => {
+      if (project.partner_needs && Array.isArray(project.partner_needs)) {
+        project.partner_needs.forEach(need => {
+          // Count by need
+          partnerNeeds[need] = (partnerNeeds[need] || 0) + 1;
+          
+          // Count by project category
+          if (!needsByCategory[project.category]) {
+            needsByCategory[project.category] = {};
+          }
+          needsByCategory[project.category][need] = (needsByCategory[project.category][need] || 0) + 1;
+          
+          // Count by research line
+          if (project.research_line?.name) {
+            if (!needsByResearchLine[project.research_line.name]) {
+              needsByResearchLine[project.research_line.name] = {};
+            }
+            needsByResearchLine[project.research_line.name][need] = 
+              (needsByResearchLine[project.research_line.name][need] || 0) + 1;
+          }
+        });
+      }
+    });
+    
+    // Categorize needs by type
+    const needsByType = {
+      'Manufacturing': 0,
+      'Regulatory': 0,
+      'Financial': 0,
+      'Technical': 0,
+      'Clinical': 0,
+      'Other': 0
+    };
+    
+    Object.entries(partnerNeeds).forEach(([need, count]) => {
+      const needLower = need.toLowerCase();
+      if (needLower.includes('manufactur') || needLower.includes('scale')) {
+        needsByType['Manufacturing'] += count;
+      } else if (needLower.includes('regulatory') || needLower.includes('ce') || needLower.includes('samd')) {
+        needsByType['Regulatory'] += count;
+      } else if (needLower.includes('invest') || needLower.includes('co-development')) {
+        needsByType['Financial'] += count;
+      } else if (needLower.includes('software') || needLower.includes('ux') || needLower.includes('ai') || needLower.includes('algorithm')) {
+        needsByType['Technical'] += count;
+      } else if (needLower.includes('multi-centre') || needLower.includes('data')) {
+        needsByType['Clinical'] += count;
+      } else {
+        needsByType['Other'] += count;
+      }
+    });
+    
+    res.json({
+      success: true,
+      data: {
+        totalProjectsWithPartners: projects?.filter(p => p.partner_needs?.length > 0).length || 0,
+        totalPartnerNeeds: Object.values(partnerNeeds).reduce((a, b) => a + b, 0),
+        uniquePartnerNeeds: Object.keys(partnerNeeds).length,
+        partnerNeeds: Object.entries(partnerNeeds)
+          .map(([name, count]) => ({ name, count }))
+          .sort((a, b) => b.count - a.count),
+        needsByType: Object.entries(needsByType)
+          .map(([type, count]) => ({ type, count }))
+          .filter(item => item.count > 0),
+        needsByCategory,
+        needsByResearchLine
+      }
+    });
+    
+  } catch (error) {
+    console.error('Partner collaborations analytics error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route GET /api/analytics/clinical-trials-timeline
+ * @description Get clinical trials timeline data
+ * @access Private
+ */
+app.get('/api/analytics/clinical-trials-timeline', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { years = 3 } = req.query; // Default to last 3 years
+    
+    const { data: trials, error } = await supabase
+      .from('clinical_trials')
+      .select('id, protocol_id, title, phase, status, created_at, research_line_id');
+    
+    if (error) throw error;
+    
+    const now = new Date();
+    const startDate = new Date();
+    startDate.setFullYear(now.getFullYear() - parseInt(years));
+    
+    // Group by month
+    const monthlyData = {};
+    const statusOverTime = {};
+    
+    trials?.forEach(trial => {
+      const created = new Date(trial.created_at);
+      if (created >= startDate) {
+        const monthKey = `${created.getFullYear()}-${String(created.getMonth() + 1).padStart(2, '0')}`;
+        
+        // Count by month
+        monthlyData[monthKey] = (monthlyData[monthKey] || 0) + 1;
+        
+        // Track status changes (simplified - would need actual timeline data in real implementation)
+        if (!statusOverTime[monthKey]) {
+          statusOverTime[monthKey] = {};
+        }
+        statusOverTime[monthKey][trial.status] = (statusOverTime[monthKey][trial.status] || 0) + 1;
+      }
+    });
+    
+    // Format for charting
+    const timeline = Object.entries(monthlyData)
+      .map(([month, count]) => ({ month, count }))
+      .sort((a, b) => a.month.localeCompare(b.month));
+    
+    res.json({
+      success: true,
+      data: {
+        timeline,
+        statusOverTime,
+        totalInPeriod: trials?.filter(t => new Date(t.created_at) >= startDate).length || 0
+      }
+    });
+    
+  } catch (error) {
+    console.error('Clinical trials timeline error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route GET /api/analytics/export/:type
+ * @description Export analytics data as CSV
+ * @access Private
+ */
+app.get('/api/analytics/export/:type', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { type } = req.params;
+    const { format = 'csv' } = req.query;
+    
+    let data = [];
+    let filename = '';
+    let headers = [];
+    
+    switch (type) {
+      case 'research-lines':
+        const { data: lines } = await supabase
+          .from('research_lines')
+          .select(`
+            line_number,
+            name,
+            description,
+            capabilities,
+            active,
+            coordinator_id,
+            created_at
+          `)
+          .order('line_number');
+        
+        data = lines || [];
+        filename = 'research-lines-report';
+        headers = ['Line Number', 'Name', 'Description', 'Capabilities', 'Active', 'Coordinator ID', 'Created At'];
+        break;
+        
+      case 'clinical-trials':
+        const { data: trials } = await supabase
+          .from('clinical_trials')
+          .select(`
+            protocol_id,
+            title,
+            phase,
+            status,
+            research_line:research_lines(name),
+            principal_investigator_id,
+            created_at
+          `)
+          .order('created_at', { ascending: false });
+        
+        data = trials || [];
+        filename = 'clinical-trials-report';
+        headers = ['Protocol ID', 'Title', 'Phase', 'Status', 'Research Line', 'PI ID', 'Created At'];
+        break;
+        
+      case 'innovation-projects':
+        const { data: projects } = await supabase
+          .from('innovation_projects')
+          .select(`
+            title,
+            category,
+            current_stage,
+            research_line:research_lines(name),
+            lead_investigator_id,
+            partner_needs,
+            created_at
+          `)
+          .order('created_at', { ascending: false });
+        
+        data = projects || [];
+        filename = 'innovation-projects-report';
+        headers = ['Title', 'Category', 'Stage', 'Research Line', 'Lead ID', 'Partner Needs', 'Created At'];
+        break;
+        
+      case 'research-performance':
+        // This would call the performance endpoint and format for export
+        return res.redirect('/api/analytics/research-lines-performance?format=csv');
+        
+      default:
+        return res.status(400).json({ error: 'Invalid export type' });
+    }
+    
+    if (format === 'csv') {
+      if (!data.length) {
+        return res.status(404).json({ error: 'No data to export' });
+      }
+      
+      // Create CSV
+      let csv = headers.join(',') + '\n';
+      
+      data.forEach(item => {
+        const row = [];
+        Object.values(item).forEach(val => {
+          if (val === null || val === undefined) {
+            row.push('');
+          } else if (typeof val === 'object') {
+            if (Array.isArray(val)) {
+              row.push(`"${val.join('; ')}"`);
+            } else if (val.name) {
+              row.push(`"${val.name}"`);
+            } else {
+              row.push(`"${JSON.stringify(val).replace(/"/g, '""')}"`);
+            }
+          } else if (typeof val === 'string') {
+            row.push(`"${val.replace(/"/g, '""')}"`);
+          } else {
+            row.push(val);
+          }
+        });
+        csv += row.join(',') + '\n';
+      });
+      
+      res.header('Content-Type', 'text/csv');
+      res.header('Content-Disposition', `attachment; filename=${filename}-${new Date().toISOString().split('T')[0]}.csv`);
+      res.send(csv);
+      
+    } else {
+      res.json({ success: true, data });
+    }
+    
+  } catch (error) {
+    console.error('Export error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * @route GET /api/analytics/summary
+ * @description Get quick summary stats for dashboard widgets
+ * @access Private
+ */
+app.get('/api/analytics/summary', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    // Run parallel queries for efficiency
+    const [
+      { count: totalResearchLines },
+      { count: totalTrials },
+      { count: activeTrials },
+      { count: totalProjects },
+      { count: activeProjects }
+    ] = await Promise.all([
+      supabase.from('research_lines').select('*', { count: 'exact', head: true }),
+      supabase.from('clinical_trials').select('*', { count: 'exact', head: true }),
+      supabase.from('clinical_trials').select('*', { count: 'exact', head: true })
+        .in('status', ['Activo', 'Reclutando']),
+      supabase.from('innovation_projects').select('*', { count: 'exact', head: true }),
+      supabase.from('innovation_projects').select('*', { count: 'exact', head: true })
+        .in('current_stage', ['Piloto', 'Validación', 'Escalamiento'])
+    ]);
+    
+    // Get recent activity
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const { count: recentTrials } = await supabase
+      .from('clinical_trials')
+      .select('*', { count: 'exact', head: true })
+      .gte('created_at', thirtyDaysAgo.toISOString());
+    
+    const { count: recentProjects } = await supabase
+      .from('innovation_projects')
+      .select('*', { count: 'exact', head: true })
+      .gte('created_at', thirtyDaysAgo.toISOString());
+    
+    res.json({
+      success: true,
+      data: {
+        researchLines: totalResearchLines || 0,
+        clinicalTrials: {
+          total: totalTrials || 0,
+          active: activeTrials || 0,
+          recent: recentTrials || 0
+        },
+        innovationProjects: {
+          total: totalProjects || 0,
+          active: activeProjects || 0,
+          recent: recentProjects || 0
+        }
+      }
+    });
+    
+  } catch (error) {
+    console.error('Summary analytics error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 // ============ ERROR HANDLING ============
 
 /**
@@ -4824,6 +5644,15 @@ app.use('*', (req, res) => {
       '/api/debug/tables',
       '/api/debug/cors',
       '/api/debug/live-status'
+      '/api/research-lines', // POST
+'/api/research-lines/:id', // PUT
+'/api/research-lines/:id', // DELETE
+'/api/analytics/research-dashboard',
+'/api/analytics/research-lines-performance',
+'/api/analytics/partner-collaborations',
+'/api/analytics/clinical-trials-timeline',
+'/api/analytics/export/:type',
+'/api/analytics/summary'
     ]
   });
 });
