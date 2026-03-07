@@ -1936,18 +1936,26 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
   try {
     const dataSource = req.validatedData || req.body;
     
+    // CRITICAL FIX: Ensure dates are in YYYY-MM-DD format for database
+    const startDate = dataSource.start_date.split('T')[0]; // Remove time if present
+    const endDate = dataSource.end_date.split('T')[0];
+    
+    console.log('Creating rotation with dates:', { 
+      original: { start: dataSource.start_date, end: dataSource.end_date },
+      formatted: { start: startDate, end: endDate }
+    });
+    
     // Check for overlap BEFORE inserting
     const { data: existingRotations, error: checkError } = await supabase
       .from('resident_rotations')
       .select('id, start_date, end_date, rotation_status')
       .eq('resident_id', dataSource.resident_id)
       .neq('rotation_status', 'cancelled')
-      .not('end_date', 'lt', dataSource.start_date)
-      .not('start_date', 'gt', dataSource.end_date);
+      .not('end_date', 'lt', startDate)
+      .not('start_date', 'gt', endDate);
     
     if (checkError) throw checkError;
     
-    // If any existing rotations found, it's an overlap
     if (existingRotations && existingRotations.length > 0) {
       return res.status(409).json({ 
         error: 'Scheduling conflict', 
@@ -1956,9 +1964,10 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
       });
     }
     
-    // Only insert if no overlaps
     const rotationData = { 
-      ...dataSource, 
+      ...dataSource,
+      start_date: startDate, // Use formatted date
+      end_date: endDate,     // Use formatted date
       rotation_id: generateId('ROT'), 
       created_at: new Date().toISOString(), 
       updated_at: new Date().toISOString() 
@@ -1974,6 +1983,7 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
     
     res.status(201).json(data);
   } catch (error) {
+    console.error('Failed to create rotation:', error);
     res.status(500).json({ error: 'Failed to create rotation', message: error.message });
   }
 });
@@ -1987,8 +1997,15 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
   try {
     const { id } = req.params;
     const dataSource = req.validatedData || req.body;
+    
+    // CRITICAL FIX: Ensure dates are in YYYY-MM-DD format
+    const startDate = dataSource.start_date.split('T')[0];
+    const endDate = dataSource.end_date.split('T')[0];
+    
     const rotationData = { 
-      ...dataSource, 
+      ...dataSource,
+      start_date: startDate,
+      end_date: endDate,
       updated_at: new Date().toISOString() 
     };
     
@@ -2008,6 +2025,7 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
     
     res.json(data);
   } catch (error) {
+    console.error('Failed to update rotation:', error);
     res.status(500).json({ error: 'Failed to update rotation', message: error.message });
   }
 });
