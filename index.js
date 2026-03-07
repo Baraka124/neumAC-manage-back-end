@@ -2221,6 +2221,227 @@ app.delete('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedul
     res.status(500).json({ error: 'Failed to delete on-call schedule', message: error.message });
   }
 });
+// ===== 9.1 ON-CALL SCHEDULE ENDPOINTS (WITHOUT HYPHEN) =====
+// These match what the frontend expects
+
+/**
+ * @route GET /api/oncall
+ * @description List on-call schedules
+ * @access Private
+ */
+app.get('/api/oncall', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { start_date, end_date, physician_id } = req.query;
+    
+    let query = supabase
+      .from('oncall_schedule')
+      .select(`
+        *,
+        primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name, professional_email, mobile_phone),
+        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(full_name, professional_email, mobile_phone)
+      `)
+      .order('duty_date');
+    
+    if (start_date) query = query.gte('duty_date', start_date);
+    if (end_date) query = query.lte('duty_date', end_date);
+    if (physician_id) query = query.or(`primary_physician_id.eq.${physician_id},backup_physician_id.eq.${physician_id}`);
+    
+    const { data, error } = await query;
+    
+    if (error) throw error;
+    
+    const transformedData = (data || []).map(item => ({
+      id: item.id,
+      duty_date: item.duty_date,
+      shift_type: item.shift_type,
+      start_time: item.start_time,
+      end_time: item.end_time,
+      primary_physician_id: item.primary_physician_id,
+      backup_physician_id: item.backup_physician_id,
+      coverage_area: item.coverage_area || null,
+      coverage_notes: item.coverage_notes || '',
+      schedule_id: item.schedule_id,
+      created_at: item.created_at,
+      primary_physician: item.primary_physician ? {
+        full_name: item.primary_physician.full_name,
+        professional_email: item.primary_physician.professional_email,
+        mobile_phone: item.primary_physician.mobile_phone
+      } : null,
+      backup_physician: item.backup_physician ? {
+        full_name: item.backup_physician.full_name,
+        professional_email: item.backup_physician.professional_email,
+        mobile_phone: item.backup_physician.mobile_phone
+      } : null
+    }));
+    
+    res.json(transformedData);
+  } catch (error) {
+    console.error('Failed to fetch on-call schedule:', error);
+    res.status(500).json({ error: 'Failed to fetch on-call schedule', message: error.message });
+  }
+});
+
+/**
+ * @route GET /api/oncall/today
+ * @description Get today's on-call
+ * @access Private
+ */
+app.get('/api/oncall/today', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const { data, error } = await supabase
+      .from('oncall_schedule')
+      .select(`
+        *,
+        primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name, professional_email, mobile_phone, staff_type),
+        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(full_name, professional_email, mobile_phone)
+      `)
+      .eq('duty_date', today);
+    
+    if (error) throw error;
+    
+    const transformedData = (data || []).map(item => ({
+      id: item.id,
+      duty_date: item.duty_date,
+      shift_type: item.shift_type,
+      start_time: item.start_time,
+      end_time: item.end_time,
+      primary_physician_id: item.primary_physician_id,
+      backup_physician_id: item.backup_physician_id,
+      coverage_area: item.coverage_area || null,
+      coverage_notes: item.coverage_notes || '',
+      primary_physician: item.primary_physician ? {
+        full_name: item.primary_physician.full_name,
+        professional_email: item.primary_physician.professional_email,
+        mobile_phone: item.primary_physician.mobile_phone,
+        staff_type: item.primary_physician.staff_type
+      } : null,
+      backup_physician: item.backup_physician ? {
+        full_name: item.backup_physician.full_name,
+        professional_email: item.backup_physician.professional_email,
+        mobile_phone: item.backup_physician.mobile_phone
+      } : null
+    }));
+    
+    res.json(transformedData);
+  } catch (error) {
+    console.error('Failed to fetch today\'s on-call:', error);
+    res.status(500).json({ error: 'Failed to fetch today\'s on-call', message: error.message });
+  }
+});
+
+/**
+ * @route GET /api/oncall/upcoming
+ * @description Get upcoming on-call (next 7 days)
+ * @access Private
+ */
+app.get('/api/oncall/upcoming', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const nextWeek = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    
+    const { data, error } = await supabase
+      .from('oncall_schedule')
+      .select(`
+        *,
+        primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name, professional_email)
+      `)
+      .gte('duty_date', today)
+      .lte('duty_date', nextWeek)
+      .order('duty_date');
+    
+    if (error) throw error;
+    
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch upcoming on-call', message: error.message });
+  }
+});
+
+/**
+ * @route POST /api/oncall
+ * @description Create on-call schedule
+ * @access Private
+ */
+app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'create'), validate(schemas.onCall), async (req, res) => {
+  try {
+    const dataSource = req.validatedData || req.body;
+    const scheduleData = { 
+      ...dataSource, 
+      schedule_id: dataSource.schedule_id || generateId('SCH'), 
+      created_by: req.user.id, 
+      created_at: new Date().toISOString(), 
+      updated_at: new Date().toISOString() 
+    };
+    
+    const { data, error } = await supabase
+      .from('oncall_schedule')
+      .insert([scheduleData])
+      .select()
+      .single();
+    
+    if (error) throw error;
+    
+    res.status(201).json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create on-call schedule', message: error.message });
+  }
+});
+
+/**
+ * @route PUT /api/oncall/:id
+ * @description Update on-call schedule
+ * @access Private
+ */
+app.put('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), validate(schemas.onCall), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const dataSource = req.validatedData || req.body;
+    const scheduleData = { 
+      ...dataSource, 
+      updated_at: new Date().toISOString() 
+    };
+    
+    const { data, error } = await supabase
+      .from('oncall_schedule')
+      .update(scheduleData)
+      .eq('id', id)
+      .select()
+      .single();
+    
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Schedule not found' });
+      }
+      throw error;
+    }
+    
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update on-call schedule', message: error.message });
+  }
+});
+
+/**
+ * @route DELETE /api/oncall/:id
+ * @description Delete on-call schedule
+ * @access Private
+ */
+app.delete('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedule', 'delete'), apiLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase
+      .from('oncall_schedule')
+      .delete()
+      .eq('id', id);
+    
+    if (error) throw error;
+    
+    res.json({ message: 'On-call schedule deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete on-call schedule', message: error.message });
+  }
+});
 
 // ===== 10. STAFF ABSENCE RECORDS ENDPOINTS (NEW - REPLACES OLD /api/absences) =====
 
