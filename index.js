@@ -223,16 +223,33 @@ const schemas = {
     staff_id: Joi.string().optional(),
     employment_status: Joi.string().valid('active', 'on_leave', 'inactive').default('active'),
     professional_email: Joi.string().email().required(),
-    department_id: Joi.string().uuid().optional(),
-    academic_degree: Joi.string().optional(),
+    department_id: Joi.string().uuid().optional().allow(null),
+    academic_degree: Joi.string().optional().allow('', null),
     specialization: Joi.string().optional().allow('', null),
     training_year: Joi.when('staff_type', {
       is: 'medical_resident',
       then: Joi.string().required(),
       otherwise: Joi.string().optional().allow('').allow(null)
     }),
+    // Extended fields (Bug 12 fix: Joi was stripping these silently)
+    mobile_phone: Joi.string().optional().allow('', null),
+    medical_license: Joi.string().optional().allow('', null),
+    clinical_certificate: Joi.string().optional().allow('', null),
     clinical_study_certificate: Joi.string().optional().allow('', null),
-    certificate_status: Joi.string().optional()
+    clinical_study_certificates: Joi.array().items(Joi.string()).optional().allow(null),
+    other_certificate: Joi.string().optional().allow('', null),
+    certificate_status: Joi.string().optional().allow('', null),
+    special_notes: Joi.string().optional().allow('', null),
+    can_supervise_residents: Joi.boolean().optional().default(false),
+    can_be_pi: Joi.boolean().optional().default(false),
+    can_be_coi: Joi.boolean().optional().default(false),
+    resident_category: Joi.string().valid('department_internal', 'rotating_other_dept', 'external_resident').optional().allow(null),
+    home_department: Joi.string().optional().allow('', null),
+    external_institution: Joi.string().optional().allow('', null),
+    is_chief_of_department: Joi.boolean().optional().default(false),
+    is_research_coordinator: Joi.boolean().optional().default(false),
+    is_resident_manager: Joi.boolean().optional().default(false),
+    is_oncall_manager: Joi.boolean().optional().default(false)
   }),
 
   announcement: Joi.object({
@@ -2090,7 +2107,7 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
   }
 });
 
-app.post('/api/clinical-trials', authenticateToken, checkPermission('communications', 'create'), async (req, res) => {
+app.post('/api/clinical-trials', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('clinical_trials').insert([{ ...req.body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
     if (error) throw error;
@@ -2100,7 +2117,7 @@ app.post('/api/clinical-trials', authenticateToken, checkPermission('communicati
   }
 });
 
-app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('communications', 'update'), async (req, res) => {
+app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('clinical_trials').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
     if (error) {
@@ -2113,7 +2130,7 @@ app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('communic
   }
 });
 
-app.delete('/api/clinical-trials/:id', authenticateToken, checkPermission('communications', 'delete'), async (req, res) => {
+app.delete('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'delete'), async (req, res) => {
   try {
     const { error } = await supabase.from('clinical_trials').delete().eq('id', req.params.id);
     if (error) throw error;
@@ -2149,7 +2166,7 @@ app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, r
   }
 });
 
-app.post('/api/innovation-projects', authenticateToken, checkPermission('communications', 'create'), async (req, res) => {
+app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('innovation_projects').insert([{ ...req.body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
     if (error) throw error;
@@ -2159,7 +2176,7 @@ app.post('/api/innovation-projects', authenticateToken, checkPermission('communi
   }
 });
 
-app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('communications', 'update'), async (req, res) => {
+app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
     const { data, error } = await supabase.from('innovation_projects').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
     if (error) {
@@ -2172,7 +2189,7 @@ app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('comm
   }
 });
 
-app.delete('/api/innovation-projects/:id', authenticateToken, checkPermission('communications', 'delete'), async (req, res) => {
+app.delete('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'delete'), async (req, res) => {
   try {
     const { error } = await supabase.from('innovation_projects').delete().eq('id', req.params.id);
     if (error) throw error;
