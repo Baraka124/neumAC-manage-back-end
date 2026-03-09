@@ -256,7 +256,7 @@ const schemas = {
     title: Joi.string().required(),
     content: Joi.string().required(),
     priority_level: Joi.string().valid('low', 'normal', 'high', 'urgent').default('normal'),
-    target_audience: Joi.string().valid('all_staff', 'attending_only', 'residents_only').default('all_staff'),
+    target_audience: Joi.string().valid('all_staff', 'all', 'attending_only', 'residents_only').default('all_staff'),
     publish_start_date: Joi.date().optional(),
     publish_end_date: Joi.date().optional()
   }),
@@ -892,16 +892,9 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
 app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_staff', 'update'), validate(schemas.medicalStaff), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
-    let trainingYearValue = null;
-    if (dataSource.training_year || dataSource.resident_year) {
-      const yearValue = dataSource.training_year || dataSource.resident_year;
-      if (typeof yearValue === 'string') {
-        const match = yearValue.match(/\d+/);
-        trainingYearValue = match ? parseInt(match[0], 10) : parseInt(yearValue, 10);
-      } else {
-        trainingYearValue = parseInt(yearValue, 10);
-      }
-    }
+    // FIX: DB column is TEXT — keep training_year as string, no parseInt conversion
+    // parseInt('PGY-2') → NaN → null, silently erasing valid values
+    const trainingYearValue = dataSource.training_year || dataSource.resident_year || null;
     const updateData = {
       full_name: dataSource.full_name,
       staff_type: dataSource.staff_type,
@@ -990,6 +983,22 @@ app.put('/api/departments/:id', authenticateToken, checkPermission('departments'
   }
 });
 
+// DELETE /api/departments/:id — soft delete
+app.delete('/api/departments/:id', authenticateToken, checkPermission('departments', 'delete'), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('departments')
+      .update({ status: 'inactive', updated_at: new Date().toISOString() })
+      .eq('id', req.params.id).select('name').single();
+    if (error) {
+      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Department not found' });
+      throw error;
+    }
+    res.json({ message: 'Department deactivated successfully', name: data.name });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to deactivate department', message: error.message });
+  }
+});
+
 // ===== 7. TRAINING UNITS =====
 app.get('/api/training-units', authenticateToken, apiLimiter, async (req, res) => {
   try {
@@ -1056,8 +1065,30 @@ app.post('/api/training-units', authenticateToken, checkPermission('training_uni
 
 app.put('/api/training-units/:id', authenticateToken, checkPermission('training_units', 'update'), validate(schemas.trainingUnit), async (req, res) => {
   try {
+    const dataSource = req.validatedData || req.body;
+    // FIX: Joi field 'supervising_attending_id' must map to DB columns 'supervisor_id' + 'default_supervisor_id'
+    // stripUnknown:true would drop supervising_attending_id since it's not a DB column name
+    const updateData = {
+      unit_name:         dataSource.unit_name,
+      unit_code:         dataSource.unit_code,
+      department_id:     dataSource.department_id,
+      maximum_residents: dataSource.maximum_residents,
+      unit_status:       dataSource.unit_status || 'active',
+      updated_at:        new Date().toISOString()
+    };
+    if (dataSource.supervising_attending_id) {
+      updateData.supervisor_id         = dataSource.supervising_attending_id;
+      updateData.default_supervisor_id = dataSource.supervising_attending_id;
+    } else if (dataSource.supervising_attending_id === null) {
+      updateData.supervisor_id         = null;
+      updateData.default_supervisor_id = null;
+    }
+    if (dataSource.specialty !== undefined)         updateData.specialty         = dataSource.specialty || null;
+    if (dataSource.location_building !== undefined) updateData.location_building = dataSource.location_building || null;
+    if (dataSource.location_floor !== undefined)    updateData.location_floor    = dataSource.location_floor || null;
+
     const { data, error } = await supabase.from('training_units')
-      .update({ ...(req.validatedData || req.body), updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+      .update(updateData).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Training unit not found' });
       throw error;
@@ -1065,6 +1096,22 @@ app.put('/api/training-units/:id', authenticateToken, checkPermission('training_
     res.json(data);
   } catch (error) {
     res.status(500).json({ error: 'Failed to update training unit', message: error.message });
+  }
+});
+
+// DELETE /api/training-units/:id — soft delete
+app.delete('/api/training-units/:id', authenticateToken, checkPermission('training_units', 'delete'), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('training_units')
+      .update({ unit_status: 'inactive', updated_at: new Date().toISOString() })
+      .eq('id', req.params.id).select('unit_name').single();
+    if (error) {
+      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Training unit not found' });
+      throw error;
+    }
+    res.json({ message: 'Training unit deactivated successfully', unit_name: data.unit_name });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to deactivate training unit', message: error.message });
   }
 });
 
@@ -1128,9 +1175,11 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
     console.log('Creating rotation with dates:', { startDate, endDate });
 
     // Overlap check
+    // FIX: Only 'scheduled', 'active', 'extended' are truly blocking — completed/terminated/cancelled are not
     const { data: existingRotations, error: checkError } = await supabase.from('resident_rotations')
       .select('id, start_date, end_date, rotation_status')
-      .eq('resident_id', dataSource.resident_id).neq('rotation_status', 'cancelled')
+      .eq('resident_id', dataSource.resident_id)
+      .in('rotation_status', ['scheduled', 'active', 'extended'])
       .not('end_date', 'lt', startDate).not('start_date', 'gt', endDate);
     if (checkError) throw checkError;
     if (existingRotations && existingRotations.length > 0) {
@@ -2022,7 +2071,7 @@ app.post('/api/research-lines', authenticateToken, checkPermission('research_lin
   try {
     const { line_number, name, description, capabilities, sort_order, active } = req.body;
     if (!name) return res.status(400).json({ error: 'Research line name is required' });
-    const { data, error } = await supabase.from('research_lines').insert([{ line_number: line_number || null, name, description: description || '', capabilities: capabilities || 'Alcance y capacidades', sort_order: sort_order || 0, active: active !== undefined ? active : true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    const { data, error } = await supabase.from('research_lines').insert([{ line_number: line_number || null, name, description: description || '', capabilities: (capabilities !== undefined && capabilities !== null) ? capabilities : 'Alcance y capacidades', sort_order: sort_order || 0, active: active !== undefined ? active : true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Research line created successfully' });
   } catch (error) {
