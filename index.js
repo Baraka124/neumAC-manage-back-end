@@ -935,10 +935,23 @@ app.delete('/api/medical-staff/:id', authenticateToken, checkPermission('medical
 // ===== 6. DEPARTMENTS =====
 app.get('/api/departments', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('departments')
-      .select('*, medical_staff!departments_head_of_department_id_fkey(full_name, professional_email)').order('name');
+    const { include_inactive } = req.query;
+    let query = supabase.from('departments')
+      .select('*, medical_staff!departments_head_of_department_id_fkey(full_name, professional_email)')
+      .order('name');
+    // Default: active only. Pass ?include_inactive=true for name-resolution lookups
+    if (!include_inactive || include_inactive !== 'true') {
+      query = query.eq('status', 'active');
+    }
+    const { data, error } = await query;
     if (error) throw error;
-    res.json((data || []).map(item => ({ ...item, head_of_department: { full_name: item.medical_staff?.full_name || null, professional_email: item.medical_staff?.professional_email || null } })));
+    res.json((data || []).map(item => ({
+      ...item,
+      head_of_department: {
+        full_name: item.medical_staff?.full_name || null,
+        professional_email: item.medical_staff?.professional_email || null
+      }
+    })));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch departments', message: error.message });
   }
@@ -983,17 +996,99 @@ app.put('/api/departments/:id', authenticateToken, checkPermission('departments'
   }
 });
 
-// DELETE /api/departments/:id — soft delete
+// GET /api/departments/:id/impact — pre-delete impact scan
+app.get('/api/departments/:id/impact', authenticateToken, checkPermission('departments', 'delete'), async (req, res) => {
+  try {
+    const deptId = req.params.id;
+    const [
+      { data: dept },
+      { data: activeStaff },
+      { data: activeUnits },
+      { data: activeRotations }
+    ] = await Promise.all([
+      supabase.from('departments').select('name, code').eq('id', deptId).single(),
+      supabase.from('medical_staff').select('id, full_name, staff_type, employment_status')
+        .eq('department_id', deptId).eq('employment_status', 'active'),
+      supabase.from('training_units').select('id, unit_name, unit_status')
+        .eq('department_id', deptId).eq('unit_status', 'active'),
+      supabase.from('resident_rotations').select('id, rotation_status, training_unit_id, supervisor_id')
+        .eq('rotation_status', 'active')
+        .in('training_unit_id',
+          (await supabase.from('training_units').select('id').eq('department_id', deptId)).data?.map(u => u.id) || []
+        )
+    ]);
+    res.json({
+      department: dept,
+      impact: {
+        activeStaff:     activeStaff     || [],
+        activeUnits:     activeUnits     || [],
+        activeRotations: activeRotations || [],
+        canDelete: (activeStaff?.length === 0 && activeRotations?.length === 0)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to check department impact', message: error.message });
+  }
+});
+
+// DELETE /api/departments/:id — soft delete with optional staff/unit reassignment
 app.delete('/api/departments/:id', authenticateToken, checkPermission('departments', 'delete'), async (req, res) => {
   try {
+    const deptId = req.params.id;
+    const { reassignments } = req.body || {};  // { staffDeptId, unitsDeptId } — target dept IDs
+
+    // Re-check impact at delete time (race-condition safety)
+    const [{ data: activeStaff }, { data: activeUnits }] = await Promise.all([
+      supabase.from('medical_staff').select('id').eq('department_id', deptId).eq('employment_status', 'active'),
+      supabase.from('training_units').select('id').eq('department_id', deptId).eq('unit_status', 'active')
+    ]);
+
+    const hasActiveStaff = (activeStaff || []).length > 0;
+    const hasActiveUnits = (activeUnits || []).length > 0;
+
+    // Block if there are active records but no reassignment targets provided
+    if ((hasActiveStaff || hasActiveUnits) && !reassignments) {
+      return res.status(409).json({
+        error: 'Department has active dependencies',
+        message: `This department has ${activeStaff?.length || 0} active staff and ${activeUnits?.length || 0} active units. Provide reassignment targets or reassign manually first.`,
+        activeStaff: activeStaff?.length || 0,
+        activeUnits: activeUnits?.length || 0
+      });
+    }
+
+    // Apply reassignments if provided
+    if (reassignments?.staffDeptId && hasActiveStaff) {
+      const { error: staffErr } = await supabase.from('medical_staff')
+        .update({ department_id: reassignments.staffDeptId, updated_at: new Date().toISOString() })
+        .eq('department_id', deptId).eq('employment_status', 'active');
+      if (staffErr) throw staffErr;
+    }
+    if (reassignments?.unitsDeptId && hasActiveUnits) {
+      const { error: unitErr } = await supabase.from('training_units')
+        .update({ department_id: reassignments.unitsDeptId, updated_at: new Date().toISOString() })
+        .eq('department_id', deptId).eq('unit_status', 'active');
+      if (unitErr) throw unitErr;
+    }
+
+    // Soft-delete the department
     const { data, error } = await supabase.from('departments')
       .update({ status: 'inactive', updated_at: new Date().toISOString() })
-      .eq('id', req.params.id).select('name').single();
+      .eq('id', deptId).select('name').single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Department not found' });
       throw error;
     }
-    res.json({ message: 'Department deactivated successfully', name: data.name });
+
+    await auditLog('DELETE', 'departments', deptId, {
+      name: data.name,
+      reassignments: reassignments || null
+    });
+
+    res.json({
+      message: 'Department deactivated successfully',
+      name: data.name,
+      reassigned: !!reassignments
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to deactivate department', message: error.message });
   }
