@@ -219,7 +219,7 @@ const hashPassword = async (password) => await bcrypt.hash(password, 10);
 const schemas = {
   medicalStaff: Joi.object({
     full_name: Joi.string().required(),
-    staff_type: Joi.string().valid('medical_resident', 'attending_physician', 'fellow', 'nurse_practitioner', 'administrator').required(),
+    staff_type: Joi.string().min(1).max(100).required(), // Open-ended: accepts any staff type including custom ones
     staff_id: Joi.string().optional(),
     employment_status: Joi.string().valid('active', 'on_leave', 'inactive').default('active'),
     professional_email: Joi.string().email().required(),
@@ -246,10 +246,7 @@ const schemas = {
     resident_category: Joi.string().valid('department_internal', 'rotating_other_dept', 'external_resident').optional().allow(null),
     home_department: Joi.string().optional().allow('', null),
     external_institution: Joi.string().optional().allow('', null),
-    is_chief_of_department: Joi.boolean().optional().default(false),
     is_research_coordinator: Joi.boolean().optional().default(false),
-    is_resident_manager: Joi.boolean().optional().default(false),
-    is_oncall_manager: Joi.boolean().optional().default(false),
     hospital_id: Joi.string().uuid().optional().allow(null)
   }),
 
@@ -916,9 +913,7 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       home_department: dataSource.home_department || null,
       can_supervise_residents: dataSource.can_supervise_residents || false,
       is_research_coordinator: dataSource.is_research_coordinator || false,
-      is_chief_of_department: dataSource.is_chief_of_department || false,
-      is_resident_manager: dataSource.is_resident_manager || false,
-      is_oncall_manager: dataSource.is_oncall_manager || false,
+
       mobile_phone: dataSource.mobile_phone || null,
       special_notes: dataSource.special_notes || null,
       hospital_id: dataSource.hospital_id || null,
