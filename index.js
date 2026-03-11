@@ -219,7 +219,7 @@ const hashPassword = async (password) => await bcrypt.hash(password, 10);
 const schemas = {
   medicalStaff: Joi.object({
     full_name: Joi.string().required(),
-    staff_type: Joi.string().valid('medical_resident', 'attending_physician', 'fellow', 'nurse_practitioner', 'administrator').required(),
+    staff_type: Joi.string().min(1).max(80).required(), // dynamic — validated against staff_types table at runtime
     staff_id: Joi.string().optional(),
     employment_status: Joi.string().valid('active', 'on_leave', 'inactive').default('active'),
     professional_email: Joi.string().email().required(),
@@ -445,6 +445,7 @@ const checkPermission = (resource, action) => {
       notifications:        ['system_admin', 'department_head', 'resident_manager'],
       attachments:          ['system_admin', 'department_head', 'resident_manager'],
       research_lines:       ['system_admin', 'department_head'],   // ← FIX 5
+      staff_types:          ['system_admin', 'department_head'],   // ← dynamic staff type management
     };
 
     const allowedRoles = rolePermissions[resource];
@@ -2820,6 +2821,104 @@ app.delete('/api/innovation-projects/:projectId/partners/:partnerId', authentica
   }
 });
 
+// ============ STAFF TYPES ROUTES ============
+// These routes serve the dynamic staff_types table — replacing hardcoded enums everywhere.
+
+// GET /api/staff-types — public to all authenticated users (needed for dropdowns app-wide)
+app.get('/api/staff-types', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const includeInactive = req.query.include_inactive === 'true';
+    let query = supabase.from('staff_types').select('*').order('display_order', { ascending: true }).order('display_name', { ascending: true });
+    if (!includeInactive) query = query.eq('is_active', true);
+    const { data, error } = await query;
+    if (error) throw error;
+    return res.json({ success: true, data: data || [] });
+  } catch (err) {
+    console.error('GET /api/staff-types error:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch staff types', message: err.message });
+  }
+});
+
+// POST /api/staff-types — create a new staff type (admin / dept head only)
+app.post('/api/staff-types', authenticateToken, checkPermission('staff_types', 'create'), async (req, res) => {
+  try {
+    const schema = Joi.object({
+      type_key:        Joi.string().min(2).max(60).pattern(/^[a-z0-9_]+$/).required()
+                         .messages({ 'string.pattern.base': 'type_key must be lowercase letters, numbers and underscores only' }),
+      display_name:    Joi.string().min(2).max(80).required(),
+      badge_class:     Joi.string().max(40).default('badge-secondary'),
+      is_resident_type: Joi.boolean().default(false),
+      can_supervise:   Joi.boolean().default(false),
+      is_active:       Joi.boolean().default(true),
+      display_order:   Joi.number().integer().min(0).default(0),
+    });
+    const { error: ve, value } = schema.validate(req.body);
+    if (ve) return res.status(400).json({ error: 'Validation error', message: ve.details[0].message });
+
+    // Check uniqueness of type_key
+    const { data: existing } = await supabase.from('staff_types').select('id').eq('type_key', value.type_key).single();
+    if (existing) return res.status(409).json({ error: 'Conflict', message: `A staff type with key "${value.type_key}" already exists` });
+
+    const { data, error } = await supabase.from('staff_types').insert(value).select().single();
+    if (error) throw error;
+    return res.status(201).json({ success: true, data });
+  } catch (err) {
+    console.error('POST /api/staff-types error:', err.message);
+    return res.status(500).json({ error: 'Failed to create staff type', message: err.message });
+  }
+});
+
+// PUT /api/staff-types/:id — update a staff type
+app.put('/api/staff-types/:id', authenticateToken, checkPermission('staff_types', 'update'), async (req, res) => {
+  try {
+    const schema = Joi.object({
+      display_name:    Joi.string().min(2).max(80),
+      badge_class:     Joi.string().max(40),
+      is_resident_type: Joi.boolean(),
+      can_supervise:   Joi.boolean(),
+      is_active:       Joi.boolean(),
+      display_order:   Joi.number().integer().min(0),
+      // type_key intentionally NOT updatable — it's referenced as a string in medical_staff records
+    });
+    const { error: ve, value } = schema.validate(req.body);
+    if (ve) return res.status(400).json({ error: 'Validation error', message: ve.details[0].message });
+
+    const { data, error } = await supabase.from('staff_types').update({ ...value, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Staff type not found' });
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error('PUT /api/staff-types/:id error:', err.message);
+    return res.status(500).json({ error: 'Failed to update staff type', message: err.message });
+  }
+});
+
+// DELETE /api/staff-types/:id — soft-delete (deactivate) unless no staff uses it, then hard delete
+app.delete('/api/staff-types/:id', authenticateToken, checkPermission('staff_types', 'delete'), async (req, res) => {
+  try {
+    // First check if any medical_staff records reference this type_key
+    const { data: typeRow } = await supabase.from('staff_types').select('type_key').eq('id', req.params.id).single();
+    if (!typeRow) return res.status(404).json({ error: 'Staff type not found' });
+
+    const { count } = await supabase.from('medical_staff').select('*', { count: 'exact', head: true }).eq('staff_type', typeRow.type_key);
+
+    if (count > 0) {
+      // Soft delete — deactivate so it no longer appears in dropdowns but data integrity is preserved
+      const { data, error } = await supabase.from('staff_types').update({ is_active: false, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+      if (error) throw error;
+      return res.json({ success: true, action: 'deactivated', message: `Staff type deactivated (${count} staff member(s) still reference it). It will no longer appear in dropdowns.`, data });
+    } else {
+      // Hard delete — safe, nothing references it
+      const { error } = await supabase.from('staff_types').delete().eq('id', req.params.id);
+      if (error) throw error;
+      return res.json({ success: true, action: 'deleted', message: 'Staff type permanently deleted.' });
+    }
+  } catch (err) {
+    console.error('DELETE /api/staff-types/:id error:', err.message);
+    return res.status(500).json({ error: 'Failed to delete staff type', message: err.message });
+  }
+});
+
 // ===== 404 HANDLER =====
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
@@ -2837,7 +2936,7 @@ app.use((err, req, res, next) => {
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`
     ======================================================
-    🏥 NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API v5.3
+    🏥 NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API v5.4
     ======================================================
     ✅ ALL 9 BUGS FIXED
     ✅ FIX 1: Rotation/OnCall dates — formatDate() handles Joi Date objects
@@ -2848,6 +2947,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     ✅ FIX 6: Duplicate on-call routes removed
     ✅ FIX 8: full_name included in all JWT payloads
     ✅ FIX 9: Absence PUT recalculates total_days + current_status
+    ✅ NEW:   Dynamic staff_types — /api/staff-types CRUD routes added
     ======================================================
     Server running on port: ${PORT}
     Environment: ${NODE_ENV}
