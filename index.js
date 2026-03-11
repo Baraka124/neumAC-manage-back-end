@@ -8,7 +8,7 @@
 // FIX 6: Duplicate on-call routes removed
 // FIX 8: full_name added to JWT payload
 // FIX 9: Absence PUT recalculates total_days + current_status
-// =======================================-==========================
+// =================================================================
 
 const express = require('express');
 const cors = require('cors');
