@@ -8,7 +8,7 @@
 // FIX 6: Duplicate on-call routes removed
 // FIX 8: full_name added to JWT payload
 // FIX 9: Absence PUT recalculates total_days + current_status
-// ================================================================-=
+// =================================================================
 
 const express = require('express');
 const cors = require('cors');
@@ -219,7 +219,7 @@ const hashPassword = async (password) => await bcrypt.hash(password, 10);
 const schemas = {
   medicalStaff: Joi.object({
     full_name: Joi.string().required(),
-    staff_type: Joi.string().min(1).max(100).required().required(),
+    staff_type: Joi.string().valid('medical_resident', 'attending_physician', 'fellow', 'nurse_practitioner', 'administrator').required(),
     staff_id: Joi.string().optional(),
     employment_status: Joi.string().valid('active', 'on_leave', 'inactive').default('active'),
     professional_email: Joi.string().email().required(),
@@ -2497,175 +2497,4 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 
-
-// ── API routes added from newer version ──────────────────────
-
-app.get('/api/hospitals', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { network_type, is_active } = req.query;
-    let query = supabase.from('hospitals').select('*').order('name');
-    if (network_type) query = query.eq('parent_complex', network_type);
-    if (is_active !== undefined) query = query.eq('is_active', is_active === 'true');
-    const { data, error } = await query;
-    if (error) throw error;
-    res.json({ success: true, data: data || [] });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch hospitals', message: error.message });
-  }
-});
-
-app.get('/api/hospitals/:id', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('hospitals').select('*').eq('id', req.params.id).single();
-    if (error) {
-      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Hospital not found' });
-      throw error;
-    }
-    res.json({ success: true, data });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch hospital', message: error.message });
-  }
-});
-
-// POST — create a new hospital (any authenticated user can add a hospital they don't find in the list)
-
-app.get('/api/clinical-units', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { department_id, status } = req.query;
-    let query = supabase.from('clinical_units')
-      .select('*, departments!clinical_units_department_id_fkey(name, code), supervisor:medical_staff!fkey(full_name)')
-      .order('name');
-    if (department_id) query = query.eq('department_id', department_id);
-    if (status) query = query.eq('status', status);
-    else query = query.eq('status', 'active');
-    const { data, error } = await query;
-    if (error) throw error;
-    res.json({ success: true, data: (data || []).map(u => ({
-      ...u,
-      department: u.departments ? { name: u.departments.name, code: u.departments.code } : null
-    }))});
-  } catch (error) {
-    // If clinical_units table doesn't exist yet, return empty gracefully
-    res.json({ success: true, data: [], message: 'No clinical units found' });
-  }
-});
-
-app.get('/api/clinical-units/:id', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('clinical_units')
-      .select('*, departments!clinical_units_department_id_fkey(name, code)')
-      .eq('id', req.params.id).single();
-    if (error) {
-      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Clinical unit not found' });
-      throw error;
-    }
-    res.json({ success: true, data });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch clinical unit', message: error.message });
-  }
-});
-
-app.get('/api/clinical-units/:id/staff', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('clinical_unit_assignments')
-      .select('*, staff:medical_staff!clinical_unit_assignments_staff_id_fkey(id, full_name, professional_email, staff_type, employment_status)')
-      .eq('clinical_unit_id', req.params.id)
-      .eq('status', 'active')
-      .order('created_at');
-    if (error) throw error;
-    res.json({ success: true, data: data || [] });
-  } catch (error) {
-    res.json({ success: true, data: [] });
-  }
-});
-
-// Assign staff to a clinical unit
-
-app.delete('/api/clinical-units/:unitId/staff/:assignmentId', authenticateToken, checkPermission('departments', 'update'), async (req, res) => {
-  try {
-    const { error } = await supabase.from('clinical_unit_assignments')
-      .update({ status: 'inactive', end_date: formatDate(new Date()), updated_at: new Date().toISOString() })
-      .eq('id', req.params.assignmentId);
-    if (error) throw error;
-    res.json({ success: true, message: 'Staff removed from clinical unit' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to remove staff from clinical unit', message: error.message });
-  }
-});
-
-// ===== 27. PARTNERS (Research) =====
-
-app.get('/api/partners', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { type, search } = req.query;
-    let query = supabase.from('partners').select('*').order('name');
-    if (type) query = query.eq('type', type);
-    if (search) query = query.ilike('name', `%${search}%`);
-    const { data, error } = await query;
-    if (error) throw error;
-    res.json({ success: true, data: data || [] });
-  } catch (error) {
-    res.json({ success: true, data: [] });
-  }
-});
-
-app.put('/api/partners/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('partners')
-      .update({ ...req.body, updated_at: new Date().toISOString() })
-      .eq('id', req.params.id).select().single();
-    if (error) throw error;
-    res.json({ success: true, data });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update partner', message: error.message });
-  }
-});
-
-app.get('/api/partner-needs', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('partner_needs').select('*').order('need_name');
-    if (error) throw error;
-    res.json({ success: true, data: data || [] });
-  } catch (error) {
-    res.json({ success: true, data: [] });
-  }
-});
-
-app.get('/api/innovation-projects/:id/partners', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('project_partners')
-      .select('*, partner:partners!project_partners_partner_id_fkey(*)')
-      .eq('project_id', req.params.id);
-    if (error) throw error;
-    res.json({ success: true, data: data || [] });
-  } catch (error) {
-    res.json({ success: true, data: [] });
-  }
-});
-
-app.delete('/api/innovation-projects/:projectId/partners/:partnerId', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
-  try {
-    const { error } = await supabase.from('project_partners')
-      .delete()
-      .eq('project_id', req.params.projectId)
-      .eq('partner_id', req.params.partnerId);
-    if (error) throw error;
-    res.json({ success: true, message: 'Partner unlinked from project' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to unlink partner', message: error.message });
-  }
-});
-
-// ===== 404 HANDLER =====
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
-});
-
-// ===== GLOBAL ERROR HANDLER =====
-app.use((err, req, res, next) => {
-  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} - Error:`, err.message);
-  if (err.message?.includes('CORS')) return res.status(403).json({ error: 'CORS error', message: 'Request blocked by CORS policy', your_origin: req.headers.origin, allowed_origins: allowedOrigins });
-  if (err.message?.includes('JWT') || err.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Authentication error', message: 'Invalid or expired authentication token' });
-  res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'An unexpected error occurred', timestamp: new Date().toISOString() });
-});
-
+module.exports = app;
