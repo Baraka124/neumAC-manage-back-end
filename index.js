@@ -820,7 +820,12 @@ app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff'
       .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex)', { count: 'exact' });
     if (search) query = query.or(`full_name.ilike.%${search}%,staff_id.ilike.%${search}%,professional_email.ilike.%${search}%`);
     if (staff_type) query = query.eq('staff_type', staff_type);
-    if (employment_status) query = query.eq('employment_status', employment_status);
+    // Exclude inactive by default; pass ?employment_status=inactive to retrieve them
+    if (employment_status) {
+      query = query.eq('employment_status', employment_status);
+    } else {
+      query = query.neq('employment_status', 'inactive');
+    }
     if (department_id) query = query.eq('department_id', department_id);
     const { data, error, count } = await query.order('full_name').range(offset, offset + limit - 1);
     if (error) throw error;
@@ -1119,7 +1124,12 @@ app.get('/api/training-units', authenticateToken, apiLimiter, async (req, res) =
       .select('*, departments!training_units_department_id_fkey(name, code), medical_staff!training_units_supervisor_id_fkey(full_name, professional_email)')
       .order('unit_name');
     if (department_id) query = query.eq('department_id', department_id);
-    if (unit_status) query = query.eq('unit_status', unit_status);
+    // Exclude inactive by default; pass ?unit_status=inactive to retrieve them
+    if (unit_status) {
+      query = query.eq('unit_status', unit_status);
+    } else {
+      query = query.neq('unit_status', 'inactive');
+    }
     const { data, error } = await query;
     if (error) throw error;
     res.json((data || []).map(item => ({
@@ -1238,7 +1248,12 @@ app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
         training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name, unit_code)
       `, { count: 'exact' });
     if (resident_id) query = query.eq('resident_id', resident_id);
-    if (rotation_status) query = query.eq('rotation_status', rotation_status);
+    // Exclude terminated_early by default; pass ?rotation_status=terminated_early to retrieve them
+    if (rotation_status) {
+      query = query.eq('rotation_status', rotation_status);
+    } else {
+      query = query.neq('rotation_status', 'terminated_early');
+    }
     if (training_unit_id) query = query.eq('training_unit_id', training_unit_id);
     if (start_date) query = query.gte('start_date', start_date);
     if (end_date) query = query.lte('end_date', end_date);
