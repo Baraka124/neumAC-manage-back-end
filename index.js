@@ -2669,28 +2669,3 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'An unexpected error occurred', timestamp: new Date().toISOString() });
 });
 
-// ============ SERVER STARTUP ============
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`
-    ======================================================
-    🏥 NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API v5.3
-    ======================================================
-    ✅ ALL 9 BUGS FIXED
-    ✅ FIX 1: Rotation/OnCall dates — formatDate() handles Joi Date objects
-    ✅ FIX 2: Absence total_days + current_status NOT NULL columns populated
-    ✅ FIX 3: FK safety — recorded_by nullable-safe
-    ✅ FIX 4: rotation_category Joi enum matches DB CHECK constraint
-    ✅ FIX 5: research_lines added to rolePermissions
-    ✅ FIX 6: Duplicate on-call routes removed
-    ✅ FIX 8: full_name included in all JWT payloads
-    ✅ FIX 9: Absence PUT recalculates total_days + current_status
-    ======================================================
-    Server running on port: ${PORT}
-    Environment: ${NODE_ENV}
-    ======================================================
-  `);
-});
-
-process.on('SIGTERM', () => { server.close(() => process.exit(0)
-
-module.exports = app;
