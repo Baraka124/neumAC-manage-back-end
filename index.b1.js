@@ -1138,6 +1138,141 @@ app.delete('/api/departments/:id', authenticateToken, checkPermission('departmen
   }
 });
 
+// ===== 6b. DEPARTMENT SUMMARY — unified overview for dept cards =====
+// Returns resident counts by category + unit occupancy in one server-side query
+app.get('/api/departments/:id/summary', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const deptId = req.params.id;
+
+    // Parallel: dept info, units, all active rotations for those units, residents
+    const [deptResult, unitsResult, staffResult] = await Promise.all([
+      supabase.from('departments')
+        .select('*, head:medical_staff!departments_head_of_department_id_fkey(full_name, professional_email, staff_type)')
+        .eq('id', deptId).single(),
+      supabase.from('training_units')
+        .select('id, unit_name, unit_code, maximum_residents, unit_status, specialty')
+        .eq('department_id', deptId),
+      supabase.from('medical_staff')
+        .select('id, full_name, staff_type, resident_category, employment_status, external_contact_name, external_contact_email, external_contact_phone, home_department_id')
+        .or(`department_id.eq.${deptId},home_department_id.eq.${deptId}`)
+        .neq('employment_status', 'inactive')
+    ]);
+
+    if (deptResult.error) throw deptResult.error;
+
+    const units = unitsResult.data || [];
+    const unitIds = units.map(u => u.id);
+
+    // Active + scheduled rotations for these units
+    let rotations = [];
+    if (unitIds.length > 0) {
+      const { data: rots } = await supabase.from('resident_rotations')
+        .select('id, resident_id, training_unit_id, start_date, end_date, rotation_status')
+        .in('training_unit_id', unitIds)
+        .in('rotation_status', ['active', 'scheduled']);
+      rotations = rots || [];
+    }
+
+    // Resident counts by category (residents whose department_id = this dept)
+    const residents = (staffResult.data || []).filter(s => {
+      const stf = s.staff_type;
+      return stf === 'medical_resident' || stf?.includes('resident');
+    });
+    const deptResidents = residents.filter(r => r.department_id === deptId || (!r.department_id && r.home_department_id === deptId));
+    const counts = {
+      internal: deptResidents.filter(r => r.resident_category === 'department_internal').length,
+      rotating: deptResidents.filter(r => r.resident_category === 'rotating_other_dept').length,
+      external: deptResidents.filter(r => r.resident_category === 'external_resident').length,
+      total: deptResidents.length
+    };
+
+    // Unit occupancy
+    const unitsWithOcc = units.map(u => {
+      const activeRots = rotations.filter(r => r.training_unit_id === u.id && r.rotation_status === 'active');
+      const scheduledRots = rotations.filter(r => r.training_unit_id === u.id && r.rotation_status === 'scheduled');
+      // Next available: earliest end_date among active rotations
+      const nextFree = activeRots.length >= u.maximum_residents
+        ? activeRots.map(r => r.end_date).sort()[0]
+        : null;
+      return {
+        ...u,
+        active_count: activeRots.length,
+        scheduled_count: scheduledRots.length,
+        next_free_date: nextFree
+      };
+    });
+
+    res.json({
+      department: deptResult.data,
+      resident_counts: counts,
+      units: unitsWithOcc,
+      total_units: units.length,
+      active_rotations: rotations.filter(r => r.rotation_status === 'active').length
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch department summary', message: error.message });
+  }
+});
+
+// ===== 6c. ROTATION AVAILABILITY CHECK =====
+// Checks slot availability + resident conflict before creating rotation
+app.get('/api/rotations/availability', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { resident_id, training_unit_id, start_date, end_date, exclude_id } = req.query;
+    if (!training_unit_id || !start_date || !end_date) {
+      return res.status(400).json({ error: 'training_unit_id, start_date, end_date required' });
+    }
+
+    const [unitResult, unitRotsResult, residentRotsResult] = await Promise.all([
+      supabase.from('training_units').select('maximum_residents, unit_name').eq('id', training_unit_id).single(),
+      supabase.from('resident_rotations')
+        .select('id, resident_id, start_date, end_date, rotation_status, resident:medical_staff!resident_rotations_resident_id_fkey(full_name)')
+        .eq('training_unit_id', training_unit_id)
+        .in('rotation_status', ['active', 'scheduled'])
+        .lte('start_date', end_date)
+        .gte('end_date', start_date),
+      resident_id ? supabase.from('resident_rotations')
+        .select('id, training_unit_id, start_date, end_date, rotation_status, training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name)')
+        .eq('resident_id', resident_id)
+        .in('rotation_status', ['active', 'scheduled'])
+        .lte('start_date', end_date)
+        .gte('end_date', start_date) : Promise.resolve({ data: [] })
+    ]);
+
+    if (unitResult.error) throw unitResult.error;
+
+    const maxResidents = unitResult.data.maximum_residents;
+    const overlappingUnitRots = (unitRotsResult.data || []).filter(r => exclude_id ? r.id !== exclude_id : true);
+    const unitSlotsUsed = overlappingUnitRots.length;
+    const unitHasSlot = unitSlotsUsed < maxResidents;
+
+    const residentConflicts = (residentRotsResult.data || []).filter(r => exclude_id ? r.id !== exclude_id : true);
+    const residentFree = residentConflicts.length === 0;
+
+    res.json({
+      unit_name: unitResult.data.unit_name,
+      unit_has_slot: unitHasSlot,
+      unit_slots_used: unitSlotsUsed,
+      unit_max: maxResidents,
+      unit_conflicts: overlappingUnitRots.map(r => ({
+        id: r.id,
+        resident_name: r.resident?.full_name || 'Unknown',
+        start_date: r.start_date,
+        end_date: r.end_date
+      })),
+      resident_free: residentFree,
+      resident_conflicts: residentConflicts.map(r => ({
+        id: r.id,
+        unit_name: r.training_unit?.unit_name || 'Unknown',
+        start_date: r.start_date,
+        end_date: r.end_date
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to check availability', message: error.message });
+  }
+});
+
 // ===== 7. TRAINING UNITS =====
 app.get('/api/training-units', authenticateToken, apiLimiter, async (req, res) => {
   try {
@@ -1265,9 +1400,16 @@ app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
     const { resident_id, rotation_status, training_unit_id, start_date, end_date, page = 1, limit = 100 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('resident_rotations').select(`
-        *, resident:medical_staff!resident_rotations_resident_id_fkey(full_name, professional_email, staff_type),
+        *, resident:medical_staff!resident_rotations_resident_id_fkey(
+          full_name, professional_email, staff_type, resident_category,
+          external_contact_name, external_contact_email, external_contact_phone,
+          home_department_id
+        ),
         supervising_attending:medical_staff!resident_rotations_supervising_attending_id_fkey(full_name, professional_email),
-        training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name, unit_code)
+        training_unit:training_units!resident_rotations_training_unit_id_fkey(
+          unit_name, unit_code, department_id,
+          dept:departments!training_units_department_id_fkey(name, code)
+        )
       `, { count: 'exact' });
     if (resident_id) query = query.eq('resident_id', resident_id);
     // Exclude terminated_early by default; pass ?rotation_status=terminated_early to retrieve them
@@ -2975,14 +3117,7 @@ app.use((err, req, res, next) => {
 // ============================================================================
 
 // DEBUG — test academic degrees without auth (remove after confirming)
-app.get('/api/debug/academic-degrees', apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('academic_degrees').select('*').order('display_order');
-    res.json({ count: data?.length ?? 0, error: error?.message || null, data: data || [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+// DEBUG ENDPOINT REMOVED (security)
 
 app.get('/api/academic-degrees', authenticateToken, apiLimiter, async (req, res) => {
   try {
