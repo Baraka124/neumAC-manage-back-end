@@ -245,7 +245,11 @@ const schemas = {
     can_be_coi: Joi.boolean().optional().default(false),
     resident_category: Joi.string().valid('department_internal', 'rotating_other_dept', 'external_resident').optional().allow(null),
     home_department: Joi.string().optional().allow('', null),
+    home_department_id: Joi.string().uuid().optional().allow(null),
     external_institution: Joi.string().optional().allow('', null),
+    external_contact_name: Joi.string().optional().allow('', null),
+    external_contact_email: Joi.string().email().optional().allow('', null),
+    external_contact_phone: Joi.string().optional().allow('', null),
     is_chief_of_department: Joi.boolean().optional().default(false),
     is_research_coordinator: Joi.boolean().optional().default(false),
     is_resident_manager: Joi.boolean().optional().default(false),
@@ -817,7 +821,7 @@ app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff'
     const { search, staff_type, employment_status, department_id, page = 1, limit = 100 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('medical_staff')
-      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex)', { count: 'exact' });
+      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code)', { count: 'exact' });
     if (search) query = query.or(`full_name.ilike.%${search}%,staff_id.ilike.%${search}%,professional_email.ilike.%${search}%`);
     if (staff_type) query = query.eq('staff_type', staff_type);
     // Exclude inactive by default; pass ?employment_status=inactive to retrieve them
@@ -842,7 +846,7 @@ app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff'
 app.get('/api/medical-staff/:id', authenticateToken, checkPermission('medical_staff', 'read'), apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('medical_staff')
-      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex)').eq('id', req.params.id).single();
+      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code)').eq('id', req.params.id).single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Medical staff not found' });
       throw error;
@@ -876,7 +880,11 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
       special_notes: dataSource.special_notes || null,
       resident_type: dataSource.resident_type || null,
       home_department: dataSource.home_department || null,
+      home_department_id: dataSource.home_department_id || null,
       external_institution: dataSource.external_institution || null,
+      external_contact_name: dataSource.external_contact_name || null,
+      external_contact_email: dataSource.external_contact_email || null,
+      external_contact_phone: dataSource.external_contact_phone || null,
       years_experience: dataSource.years_experience || null,
       biography: dataSource.biography || null,
       date_of_birth: dataSource.date_of_birth || null,
@@ -919,6 +927,10 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       resident_category: dataSource.resident_category || null,
       external_institution: dataSource.external_institution || null,
       home_department: dataSource.home_department || null,
+      home_department_id: dataSource.home_department_id || null,
+      external_contact_name: dataSource.external_contact_name || null,
+      external_contact_email: dataSource.external_contact_email || null,
+      external_contact_phone: dataSource.external_contact_phone || null,
       can_supervise_residents: dataSource.can_supervise_residents || false,
       can_be_pi: dataSource.can_be_pi || false,
       can_be_coi: dataSource.can_be_coi || false,
