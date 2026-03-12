@@ -2974,16 +2974,31 @@ app.use((err, req, res, next) => {
 // ========================== ACADEMIC DEGREES ================================
 // ============================================================================
 
+// DEBUG — test academic degrees without auth (remove after confirming)
+app.get('/api/debug/academic-degrees', apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('academic_degrees').select('*').order('display_order');
+    res.json({ count: data?.length ?? 0, error: error?.message || null, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/academic-degrees', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data, error, count } = await supabase
       .from('academic_degrees')
-      .select('*')
+      .select('*', { count: 'exact' })
       .eq('is_active', true)
       .order('display_order');
-    if (error) throw error;
+    if (error) {
+      console.error('GET /api/academic-degrees Supabase error:', JSON.stringify(error));
+      throw error;
+    }
+    console.log(`GET /api/academic-degrees → ${data?.length ?? 0} rows (count=${count})`);
     res.json(data || []);
   } catch (err) {
+    console.error('GET /api/academic-degrees caught:', err.message);
     res.status(500).json({ error: 'Failed to fetch academic degrees', message: err.message });
   }
 });
