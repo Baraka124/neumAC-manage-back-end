@@ -224,16 +224,18 @@ const schemas = {
     employment_status: Joi.string().valid('active', 'on_leave', 'inactive').default('active'),
     professional_email: Joi.string().email().required(),
     department_id: Joi.string().uuid().optional().allow(null),
-    academic_degree: Joi.string().optional().allow('', null),
+    academic_degree: Joi.string().optional().allow('', null),       // legacy free-text, kept for backcompat
+    academic_degree_id: Joi.string().uuid().optional().allow(null), // new FK to academic_degrees table
     specialization: Joi.string().optional().allow('', null),
-    training_year: Joi.when('staff_type', {
-      is: 'medical_resident',
-      then: Joi.string().required(),
-      otherwise: Joi.string().optional().allow('').allow(null)
-    }),
+    // training_year kept for display/legacy; residency_start_date drives auto-calc
+    training_year: Joi.string().optional().allow('', null),
+    // Residency date tracking (MIR 4-year programme)
+    residency_start_date:    Joi.string().optional().allow('', null), // YYYY-MM-DD, day always 01
+    residency_year_override: Joi.string().valid('R1','R2','R3','R4','R4+').optional().allow('', null),
     // Extended fields (Bug 12 fix: Joi was stripping these silently)
     mobile_phone: Joi.string().optional().allow('', null),
-    medical_license: Joi.string().optional().allow('', null),
+    medical_license: Joi.string().optional().allow('', null),       // legacy, kept for backcompat
+    has_medical_license: Joi.boolean().optional().default(false),   // new boolean
     clinical_certificate: Joi.string().optional().allow('', null),
     clinical_study_certificate: Joi.string().optional().allow('', null),
     clinical_study_certificates: Joi.array().items(Joi.string()).optional().allow(null),
@@ -821,7 +823,7 @@ app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff'
     const { search, staff_type, employment_status, department_id, page = 1, limit = 100 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('medical_staff')
-      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code)', { count: 'exact' });
+      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)', { count: 'exact' });
     if (search) query = query.or(`full_name.ilike.%${search}%,staff_id.ilike.%${search}%,professional_email.ilike.%${search}%`);
     if (staff_type) query = query.eq('staff_type', staff_type);
     // Exclude inactive by default; pass ?employment_status=inactive to retrieve them
@@ -846,7 +848,7 @@ app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff'
 app.get('/api/medical-staff/:id', authenticateToken, checkPermission('medical_staff', 'read'), apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('medical_staff')
-      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code)').eq('id', req.params.id).single();
+      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)').eq('id', req.params.id).single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Medical staff not found' });
       throw error;
@@ -868,8 +870,12 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
       employment_status: dataSource.employment_status || 'active',
       department_id: dataSource.department_id || null,
       academic_degree: dataSource.academic_degree || null,
+      academic_degree_id: dataSource.academic_degree_id || null,
       specialization: dataSource.specialization || null,
       training_year: dataSource.training_year || null,
+      residency_start_date:    dataSource.residency_start_date || null,
+      residency_year_override: dataSource.residency_year_override || null,
+      has_medical_license: dataSource.has_medical_license || false,
       clinical_study_certificate: dataSource.clinical_certificate || null,
       certificate_status: dataSource.certificate_status || null,
       resident_category: dataSource.resident_category || null,
@@ -920,8 +926,12 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       professional_email: dataSource.professional_email,
       department_id: dataSource.department_id || null,
       academic_degree: dataSource.academic_degree || null,
+      academic_degree_id: dataSource.academic_degree_id || null,
       specialization: dataSource.specialization || null,
       training_year: trainingYearValue,
+      residency_start_date:    dataSource.residency_start_date || null,
+      residency_year_override: dataSource.residency_year_override || null,
+      has_medical_license: dataSource.has_medical_license ?? false,
       clinical_study_certificate: dataSource.clinical_certificate || null,
       certificate_status: dataSource.certificate_status || null,
       resident_category: dataSource.resident_category || null,
@@ -2957,6 +2967,144 @@ app.use((err, req, res, next) => {
   if (err.message?.includes('CORS')) return res.status(403).json({ error: 'CORS error', message: 'Request blocked by CORS policy', your_origin: req.headers.origin, allowed_origins: allowedOrigins });
   if (err.message?.includes('JWT') || err.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Authentication error', message: 'Invalid or expired authentication token' });
   res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'An unexpected error occurred', timestamp: new Date().toISOString() });
+});
+
+
+// ============================================================================
+// ========================== ACADEMIC DEGREES ================================
+// ============================================================================
+
+app.get('/api/academic-degrees', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('academic_degrees')
+      .select('*')
+      .eq('is_active', true)
+      .order('display_order');
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch academic degrees', message: err.message });
+  }
+});
+
+app.post('/api/academic-degrees', authenticateToken, checkPermission('departments', 'create'), async (req, res) => {
+  try {
+    const { name, abbreviation, display_order } = req.body;
+    if (!name?.trim()) return res.status(400).json({ error: 'name is required' });
+    const { data, error } = await supabase
+      .from('academic_degrees')
+      .insert([{ name: name.trim(), abbreviation: abbreviation?.trim() || null, display_order: display_order || 0 }])
+      .select().single();
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'A degree with this name already exists' });
+      throw error;
+    }
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create academic degree', message: err.message });
+  }
+});
+
+app.put('/api/academic-degrees/:id', authenticateToken, checkPermission('departments', 'update'), async (req, res) => {
+  try {
+    const { name, abbreviation, display_order, is_active } = req.body;
+    const { data, error } = await supabase
+      .from('academic_degrees')
+      .update({ name, abbreviation, display_order, is_active, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update academic degree', message: err.message });
+  }
+});
+
+app.delete('/api/academic-degrees/:id', authenticateToken, checkPermission('departments', 'update'), async (req, res) => {
+  try {
+    // Soft delete — mark inactive, keep FK integrity
+    const { error } = await supabase
+      .from('academic_degrees')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete academic degree', message: err.message });
+  }
+});
+
+// ============================================================================
+// ========================== STAFF CERTIFICATES ==============================
+// ============================================================================
+
+// GET all certificates for a staff member
+app.get('/api/medical-staff/:id/certificates', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('staff_certificates')
+      .select('*')
+      .eq('staff_id', req.params.id)
+      .order('expiry_date', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch certificates', message: err.message });
+  }
+});
+
+// POST — add a certificate
+app.post('/api/medical-staff/:id/certificates', authenticateToken, checkPermission('medical_staff', 'update'), async (req, res) => {
+  try {
+    const { certificate_name, issued_date, renewal_months, notes } = req.body;
+    if (!certificate_name?.trim()) return res.status(400).json({ error: 'certificate_name is required' });
+    const { data, error } = await supabase
+      .from('staff_certificates')
+      .insert([{
+        staff_id: req.params.id,
+        certificate_name: certificate_name.trim(),
+        issued_date: issued_date || null,
+        renewal_months: renewal_months || 24,
+        notes: notes || null
+      }])
+      .select().single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to add certificate', message: err.message });
+  }
+});
+
+// PUT — edit a certificate
+app.put('/api/medical-staff/:staffId/certificates/:certId', authenticateToken, checkPermission('medical_staff', 'update'), async (req, res) => {
+  try {
+    const { certificate_name, issued_date, renewal_months, notes } = req.body;
+    const { data, error } = await supabase
+      .from('staff_certificates')
+      .update({ certificate_name, issued_date, renewal_months, notes, updated_at: new Date().toISOString() })
+      .eq('id', req.params.certId)
+      .eq('staff_id', req.params.staffId)
+      .select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update certificate', message: err.message });
+  }
+});
+
+// DELETE — remove a certificate
+app.delete('/api/medical-staff/:staffId/certificates/:certId', authenticateToken, checkPermission('medical_staff', 'update'), async (req, res) => {
+  try {
+    const { error } = await supabase
+      .from('staff_certificates')
+      .delete()
+      .eq('id', req.params.certId)
+      .eq('staff_id', req.params.staffId);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete certificate', message: err.message });
+  }
 });
 
 // ============ SERVER STARTUP ============
