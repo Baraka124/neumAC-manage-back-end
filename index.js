@@ -2464,9 +2464,12 @@ app.get('/api/analytics/research-lines-performance', authenticateToken, apiLimit
       }
       const [{ data: trials }, { data: projects }] = await Promise.all([
         supabase.from('clinical_trials').select('id, phase, status').eq('research_line_id', line.id),
-        supabase.from('innovation_projects').select('id, category, current_stage').eq('research_line_id', line.id)
+        supabase.from('innovation_projects').select('id, category, current_stage, development_stage').eq('research_line_id', line.id)
       ]);
-      return { id: line.id, line_number: line.line_number, name: line.name, active: line.active, coordinator: coordinatorName, stats: { totalTrials: trials?.length || 0, activeTrials: trials?.filter(t => ['Activo','Reclutando'].includes(t.status)).length || 0, completedTrials: trials?.filter(t => t.status === 'Completado').length || 0, totalProjects: projects?.length || 0 } };
+      const ACTIVE_PROJECT_STAGES = ['Prototipo', 'Validación Preclínica', 'Validación Clínica', 'Escalado'];
+      const COMMERCIALIZED_STAGES = ['Comercializado', 'Transferencia Tecnológica'];
+      const projectStage = (p) => p.current_stage || p.development_stage || '';
+      return { id: line.id, line_number: line.line_number, name: line.name, active: line.active, coordinator: coordinatorName, stats: { totalTrials: trials?.length || 0, activeTrials: trials?.filter(t => ['Activo','Reclutando'].includes(t.status)).length || 0, completedTrials: trials?.filter(t => t.status === 'Completado').length || 0, totalProjects: projects?.length || 0, activeProjects: projects?.filter(p => ACTIVE_PROJECT_STAGES.includes(projectStage(p))).length || 0, commercialized: projects?.filter(p => COMMERCIALIZED_STAGES.includes(projectStage(p))).length || 0 } };
     }));
     performance.sort((a, b) => (a.line_number || 999) - (b.line_number || 999));
     res.json({ success: true, data: performance });
