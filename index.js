@@ -1767,6 +1767,34 @@ app.delete('/api/absence-records/:id', authenticateToken, checkPermission('staff
   }
 });
 
+
+// ── Absence hard-delete (purge) ──────────────────────────────────────────────
+// Permanently removes the record + its audit log entries from the DB.
+// Only system_admin / department_head. Used for table hygiene — NOT for audit cancellation.
+app.delete('/api/absence-records/:id/purge', authenticateToken, checkPermission('staff_absence', 'delete'), apiLimiter, async (req, res) => {
+  try {
+    const allowedRoles = ['system_admin', 'department_head'];
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Only system administrators and department heads can permanently delete absence records' });
+    }
+    // Confirm record exists first
+    const { data: record, error: fetchError } = await supabase.from('staff_absence_records').select('id, current_status').eq('id', req.params.id).single();
+    if (fetchError) {
+      if (fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Not found', message: 'Absence record not found' });
+      throw fetchError;
+    }
+    // Delete audit log entries first (FK constraint)
+    const { error: auditError } = await supabase.from('absence_audit_log').delete().eq('absence_record_id', req.params.id);
+    if (auditError) console.warn('Failed to purge audit log entries:', auditError.message);
+    // Hard delete the record
+    const { error } = await supabase.from('staff_absence_records').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true, message: 'Absence record permanently deleted' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete absence record', message: error.message });
+  }
+});
+
 app.get('/api/absence-records/staff/:staffId', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { limit = 20, page = 1 } = req.query;
