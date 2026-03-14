@@ -2270,6 +2270,34 @@ app.get('/api/research-lines', authenticateToken, apiLimiter, async (req, res) =
   }
 });
 
+// ── PUBLIC (no auth) — website-facing research lines ──────────────────────────
+// Used by the public website to render the research lines grid/accordion.
+// Returns only active lines with coordinator name. No sensitive fields exposed.
+app.get('/api/research-lines/website', apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('research_lines')
+      .select(`
+        id,
+        line_number,
+        name,
+        description,
+        capabilities,
+        keywords,
+        sort_order,
+        coordinator:medical_staff!research_lines_coordinator_id_fkey(
+          full_name
+        )
+      `)
+      .eq('active', true)
+      .order('sort_order');
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/research-lines', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
     const { line_number, name, description, capabilities, sort_order, active } = req.body;
