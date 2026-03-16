@@ -3176,6 +3176,104 @@ app.delete('/api/medical-staff/:staffId/certificates/:certId', authenticateToken
   }
 });
 
+// ============ NEWS & POSTS ROUTES ============
+
+// GET /api/news — authenticated, returns all posts (incl. internal)
+app.get('/api/news', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { status, type, is_public } = req.query;
+    let query = supabase
+      .from('news_posts')
+      .select(`*, author:medical_staff!news_posts_author_id_fkey(id, full_name, staff_type), research_line:research_lines!news_posts_research_line_id_fkey(id, line_number, name)`)
+      .order('created_at', { ascending: false });
+    if (status) query = query.eq('status', status);
+    if (type)   query = query.eq('post_type', type);
+    if (is_public !== undefined) query = query.eq('is_public', is_public === 'true');
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ data: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch news', message: err.message });
+  }
+});
+
+// GET /api/news/website — PUBLIC, returns only published+public posts
+app.get('/api/news/website', apiLimiter, async (req, res) => {
+  try {
+    const { type, line, limit = 20 } = req.query;
+    let query = supabase
+      .from('news_posts')
+      .select(`id, post_type, title, body, featured_image_url, word_count, expires_at, published_at, created_at, journal_name, authors_text, doi, author:medical_staff!news_posts_author_id_fkey(id, full_name), research_line:research_lines!news_posts_research_line_id_fkey(id, line_number, name)`)
+      .eq('status', 'published')
+      .eq('is_public', true)
+      .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString())
+      .order('published_at', { ascending: false })
+      .limit(parseInt(limit));
+    if (type) query = query.eq('post_type', type);
+    if (line) query = query.eq('research_line_id', line);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ data: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch news', message: err.message });
+  }
+});
+
+// POST /api/news — create
+app.post('/api/news', authenticateToken, checkPermission('research_lines', 'create'), apiLimiter, async (req, res) => {
+  try {
+    const { title, post_type, body, author_id, research_line_id, is_public,
+            status, expires_at, featured_image_url, journal_name, authors_text, doi, word_count } = req.body;
+    if (!title) return res.status(400).json({ error: 'Title is required' });
+    const payload = {
+      title, post_type: post_type || 'update', body: body || null,
+      author_id: author_id || null, research_line_id: research_line_id || null,
+      is_public: is_public === true || is_public === 'true',
+      status: status || 'draft',
+      expires_at: expires_at || null,
+      featured_image_url: featured_image_url || null,
+      journal_name: journal_name || null,
+      authors_text: authors_text || null,
+      doi: doi || null,
+      word_count: word_count || null,
+      published_at: status === 'published' ? new Date().toISOString() : null
+    };
+    const { data, error } = await supabase.from('news_posts').insert(payload).select().single();
+    if (error) throw error;
+    res.status(201).json({ data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create post', message: err.message });
+  }
+});
+
+// PUT /api/news/:id — update
+app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'update'), apiLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = { ...req.body, updated_at: new Date().toISOString() };
+    if (updates.status === 'published' && !updates.published_at) {
+      updates.published_at = new Date().toISOString();
+    }
+    delete updates.id; delete updates.created_at;
+    const { data, error } = await supabase.from('news_posts').update(updates).eq('id', id).select().single();
+    if (error) throw error;
+    res.json({ data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update post', message: err.message });
+  }
+});
+
+// DELETE /api/news/:id
+app.delete('/api/news/:id', authenticateToken, checkPermission('research_lines', 'delete'), apiLimiter, async (req, res) => {
+  try {
+    const { error } = await supabase.from('news_posts').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.status(204).send();
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete post', message: err.message });
+  }
+});
+
 // ============ SERVER STARTUP ============
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`
