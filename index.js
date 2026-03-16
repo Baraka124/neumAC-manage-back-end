@@ -3089,7 +3089,9 @@ app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'u
     if (updates.status === 'published' && !updates.published_at) {
       updates.published_at = new Date().toISOString();
     }
+    // Strip joined/virtual fields that come back from GET but aren't real columns
     delete updates.id; delete updates.created_at;
+    delete updates.author; delete updates.research_line;
     const { data, error } = await supabase.from('news_posts').update(updates).eq('id', id).select().single();
     if (error) throw error;
     res.json({ data });
