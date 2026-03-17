@@ -3061,7 +3061,7 @@ app.post('/api/news', authenticateToken, checkPermission('research_lines', 'crea
             status, expires_at, featured_image_url, journal_name, authors_text, doi, word_count } = req.body;
     if (!title) return res.status(400).json({ error: 'Title is required' });
     const payload = {
-      title, post_type: post_type || 'update', body: body || null,
+      title, post_type: ['update','article','publication','photo_story'].includes(post_type) ? post_type : 'update', body: body || null,
       author_id: author_id || null, research_line_id: research_line_id || null,
       is_public: is_public === true || is_public === 'true',
       status: status || 'draft',
