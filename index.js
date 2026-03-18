@@ -1276,10 +1276,12 @@ app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
     if (end_date) query = query.lte('end_date', end_date);
     const { data, error, count } = await query.order('start_date', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
+    // Filter out orphan rotations where the resident record no longer exists
+    const cleanData = (data || []).filter(item => item.resident !== null);
     res.json({
-      data: (data || []).map(item => ({
+      data: cleanData.map(item => ({
         ...item,
-        resident: item.resident ? { full_name: item.resident.full_name, professional_email: item.resident.professional_email, staff_type: item.resident.staff_type } : null,
+        resident: { full_name: item.resident.full_name, professional_email: item.resident.professional_email, staff_type: item.resident.staff_type },
         supervising_attending: item.supervising_attending ? { full_name: item.supervising_attending.full_name } : null,
         training_unit: item.training_unit ? { unit_name: item.training_unit.unit_name, unit_code: item.training_unit.unit_code } : null
       })),
