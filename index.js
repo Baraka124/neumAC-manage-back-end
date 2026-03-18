@@ -348,10 +348,11 @@ const schemas = {
   department: Joi.object({
     name: Joi.string().required(),
     code: Joi.string().required(),
-    description: Joi.string().optional(),
-    head_of_department_id: Joi.string().uuid().optional(),
-    contact_email: Joi.string().email().optional(),
-    contact_phone: Joi.string().optional(),
+    description: Joi.string().optional().allow('', null),
+    head_of_department_id: Joi.string().uuid().optional().allow(null, ''),
+    hospital_id: Joi.string().uuid().optional().allow(null, ''),
+    contact_email: Joi.string().email().optional().allow('', null),
+    contact_phone: Joi.string().optional().allow('', null),
     status: Joi.string().valid('active', 'inactive').default('active')
   }),
 
@@ -976,7 +977,7 @@ app.get('/api/departments', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { include_inactive } = req.query;
     let query = supabase.from('departments')
-      .select('*, medical_staff!departments_head_of_department_id_fkey(full_name, professional_email)')
+      .select('*, medical_staff!departments_head_of_department_id_fkey(full_name, professional_email), hospital:hospitals!departments_hospital_id_fkey(id, name, code, parent_complex)')
       .order('name');
     // Default: active only. Pass ?include_inactive=true for name-resolution lookups
     if (!include_inactive || include_inactive !== 'true') {
