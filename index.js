@@ -639,6 +639,21 @@ app.post('/api/auth/logout', authenticateToken, apiLimiter, async (req, res) => 
   res.json({ message: 'Logged out successfully', timestamp: new Date().toISOString() });
 });
 
+// Token validation endpoint — called on mount to verify session is still valid
+// Used to block QR/shared-session access with expired tokens
+app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('app_users')
+      .select('id, email, full_name, user_role, account_status, department_id')
+      .eq('id', req.user.userId)
+      .single()
+    if (error || !data) return res.status(401).json({ error: 'User not found' })
+    if (data.account_status !== 'active') return res.status(401).json({ error: 'Account suspended or inactive' })
+    res.json(data)
+  } catch { res.status(401).json({ error: 'Session validation failed' }) }
+});
+
 app.post('/api/auth/register', authenticateToken, checkPermission('users', 'create'), validate(schemas.register), async (req, res) => {
   try {
     const { email, password, ...userData } = req.validatedData || req.body;
