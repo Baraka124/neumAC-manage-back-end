@@ -360,12 +360,14 @@ const schemas = {
     unit_name: Joi.string().required(),
     unit_code: Joi.string().required(),
     department_id: Joi.string().uuid().required(),
-    supervising_attending_id: Joi.string().uuid().optional(),
+    supervising_attending_id: Joi.string().uuid().optional().allow(null, ''),
     maximum_residents: Joi.number().integer().min(1).default(5),
-    unit_status: Joi.string().valid('active', 'inactive').default('active'),
-    specialty: Joi.string().optional(),
-    location_building: Joi.string().optional(),
-    location_floor: Joi.string().optional()
+    unit_status: Joi.string().valid('active', 'inactive', 'under_renovation').default('active'),
+    unit_type: Joi.string().valid('training_unit', 'clinical_unit', 'icu', 'outpatient', 'surgical', 'research').default('training_unit'),
+    unit_description: Joi.string().optional().allow('', null),
+    specialty: Joi.string().optional().allow('', null),
+    location_building: Joi.string().optional().allow('', null),
+    location_floor: Joi.string().optional().allow('', null)
   }),
 
   notification: Joi.object({
@@ -1152,6 +1154,7 @@ app.get('/api/training-units', authenticateToken, apiLimiter, async (req, res) =
     if (error) throw error;
     res.json((data || []).map(item => ({
       ...item,
+      unit_type: item.unit_type || 'training_unit',
       department: item.departments ? { name: item.departments.name, code: item.departments.code } : null,
       supervisor: { full_name: item.medical_staff?.full_name || null, professional_email: item.medical_staff?.professional_email || null }
     })));
@@ -1190,8 +1193,9 @@ app.post('/api/training-units', authenticateToken, checkPermission('training_uni
       default_supervisor_id: dataSource.supervising_attending_id || null,
       supervisor_id: dataSource.supervising_attending_id || null,
       unit_status: dataSource.unit_status || 'active',
+      unit_type: dataSource.unit_type || 'training_unit',
       specialty: dataSource.specialty || null,
-      unit_description: dataSource.specialty || null,
+      unit_description: dataSource.unit_description || dataSource.specialty || null,
       location_building: dataSource.location_building || null,
       location_floor: dataSource.location_floor || null
     };
@@ -2667,23 +2671,28 @@ app.put('/api/hospitals/:id', authenticateToken, checkPermission('departments', 
 });
 
 // ===== 26. CLINICAL UNITS =====
+// /api/clinical-units → redirected to training_units (merged tables)
 app.get('/api/clinical-units', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { department_id, status } = req.query;
-    let query = supabase.from('clinical_units')
-      .select('*, departments!clinical_units_department_id_fkey(name, code)')
-      .order('name');
+    let query = supabase.from('training_units')
+      .select('*, departments!training_units_department_id_fkey(name, code)')
+      .order('unit_name');
     if (department_id) query = query.eq('department_id', department_id);
-    if (status) query = query.eq('status', status);
-    else query = query.eq('status', 'active');
+    if (status) query = query.eq('unit_status', status);
+    else query = query.neq('unit_status', 'inactive');
     const { data, error } = await query;
     if (error) throw error;
+    // Return in clinical_units shape for backwards compatibility
     res.json({ success: true, data: (data || []).map(u => ({
-      ...u,
+      id: u.id, name: u.unit_name, code: u.unit_code,
+      department_id: u.department_id, unit_type: u.unit_type || 'training_unit',
+      status: u.unit_status, description: u.unit_description,
+      supervisor_id: u.supervisor_id,
       department: u.departments ? { name: u.departments.name, code: u.departments.code } : null
     }))});
   } catch (error) {
-    res.json({ success: true, data: [], message: 'No clinical units found' });
+    res.json({ success: true, data: [], message: 'No units found' });
   }
 });
 
