@@ -1392,13 +1392,11 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
 
 app.delete('/api/rotations/:id', authenticateToken, checkPermission('resident_rotations', 'delete'), apiLimiter, async (req, res) => {
   try {
-    const { error } = await supabase.from('resident_rotations')
-      // DB CHECK: scheduled|active|completed|extended|terminated_early — 'cancelled' not in constraint
-      .update({ rotation_status: 'terminated_early', updated_at: new Date().toISOString() }).eq('id', req.params.id);
+    const { error } = await supabase.from('resident_rotations').delete().eq('id', req.params.id);
     if (error) throw error;
-    res.json({ message: 'Rotation cancelled successfully' });
+    res.json({ message: 'Rotation deleted successfully' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to cancel rotation', message: error.message });
+    res.status(500).json({ error: 'Failed to delete rotation', message: error.message });
   }
 });
 
