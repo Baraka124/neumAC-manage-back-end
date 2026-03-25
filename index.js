@@ -1,5 +1,6 @@
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
-// VERSION 5.3 - ALL BUGS FIXED
+// VERSION 5.4 - ALL BUGS FIXED
+// --- ORIGINAL FIXES ---
 // FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
 // FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
@@ -8,6 +9,16 @@
 // FIX 6: Duplicate on-call routes removed
 // FIX 8: full_name added to JWT payload
 // FIX 9: Absence PUT recalculates total_days + current_status
+// --- NEW FIXES ---
+// FIX 10: /api/auth/me — req.user.userId → req.user.id (JWT field mismatch causing 401)
+// FIX 11: POST + PUT /api/medical-staff — can_be_pi, can_be_coi, has_phd, phd_field now persisted
+// FIX 12: Joi schema for medicalStaff — can_be_pi/coi/phd added (were stripped by stripUnknown)
+// FIX 13: PUT /api/training-units — unit_type + unit_description now updated (were silently lost)
+// FIX 14: PUT /api/training-units — department_name refreshed when department_id changes
+// FIX 15: DELETE /api/rotations — soft delete (terminated_early) instead of hard delete
+// FIX 16: Analytics active project stages aligned to current_stage field values
+// FIX 17: POST /api/research-lines — accepts research_line_name alias + keywords field
+// FIX 18: POST /api/clinical-trials — phase defaults to Phase I for non-interventional studies
 // =================================================================
 
 const express = require('express');
@@ -256,7 +267,12 @@ const schemas = {
     is_research_coordinator: Joi.boolean().optional().default(false),
     is_resident_manager: Joi.boolean().optional().default(false),
     is_oncall_manager: Joi.boolean().optional().default(false),
-    hospital_id: Joi.string().uuid().optional().allow(null)
+    hospital_id: Joi.string().uuid().optional().allow(null),
+    // Research capability fields (added via migration)
+    can_be_pi:  Joi.boolean().optional().default(false),
+    can_be_coi: Joi.boolean().optional().default(false),
+    has_phd:    Joi.boolean().optional().default(false),
+    phd_field:  Joi.string().optional().allow('', null)
   }),
 
   announcement: Joi.object({
@@ -646,7 +662,7 @@ app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
     const { data, error } = await supabase
       .from('app_users')
       .select('id, email, full_name, user_role, account_status, department_id')
-      .eq('id', req.user.userId)
+      .eq('id', req.user.id)
       .single()
     if (error || !data) return res.status(401).json({ error: 'User not found' })
     if (data.account_status !== 'active') return res.status(401).json({ error: 'Account suspended or inactive' })
@@ -916,6 +932,10 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
       office_phone: dataSource.office_phone || null,
       training_level: dataSource.training_level || null,
       hospital_id: dataSource.hospital_id || null,
+      can_be_pi:   dataSource.can_be_pi   ?? false,
+      can_be_coi:  dataSource.can_be_coi  ?? false,
+      has_phd:     dataSource.has_phd     ?? false,
+      phd_field:   dataSource.phd_field   || null,
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('medical_staff').insert([staffData]).select().single();
@@ -964,6 +984,10 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       mobile_phone: dataSource.mobile_phone || null,
       special_notes: dataSource.special_notes || null,
       hospital_id: dataSource.hospital_id || null,
+      can_be_pi:   dataSource.can_be_pi   ?? false,
+      can_be_coi:  dataSource.can_be_coi  ?? false,
+      has_phd:     dataSource.has_phd     ?? false,
+      phd_field:   dataSource.phd_field   || null,
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('medical_staff').update(updateData).eq('id', req.params.id).select().single();
@@ -1242,9 +1266,18 @@ app.put('/api/training-units/:id', authenticateToken, checkPermission('training_
       updateData.supervisor_id         = null;
       updateData.default_supervisor_id = null;
     }
-    if (dataSource.specialty !== undefined)         updateData.specialty         = dataSource.specialty || null;
-    if (dataSource.location_building !== undefined) updateData.location_building = dataSource.location_building || null;
-    if (dataSource.location_floor !== undefined)    updateData.location_floor    = dataSource.location_floor || null;
+    if (dataSource.specialty !== undefined)          updateData.specialty          = dataSource.specialty || null;
+    if (dataSource.location_building !== undefined)  updateData.location_building  = dataSource.location_building || null;
+    if (dataSource.location_floor !== undefined)     updateData.location_floor     = dataSource.location_floor || null;
+    if (dataSource.unit_type !== undefined)          updateData.unit_type          = dataSource.unit_type || 'training_unit';
+    if (dataSource.unit_description !== undefined)   updateData.unit_description   = dataSource.unit_description || null;
+    // Also refresh department_name to stay in sync with department_id changes
+    if (dataSource.department_id) {
+      try {
+        const { data: dept } = await supabase.from('departments').select('name').eq('id', dataSource.department_id).single();
+        if (dept) updateData.department_name = dept.name;
+      } catch (_) {}
+    }
 
     const { data, error } = await supabase.from('training_units')
       .update(updateData).eq('id', req.params.id).select().single();
@@ -1412,11 +1445,19 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
 
 app.delete('/api/rotations/:id', authenticateToken, checkPermission('resident_rotations', 'delete'), apiLimiter, async (req, res) => {
   try {
-    const { error } = await supabase.from('resident_rotations').delete().eq('id', req.params.id);
-    if (error) throw error;
-    res.json({ message: 'Rotation deleted successfully' });
+    // Soft delete — preserve audit history by marking as terminated_early
+    const { data, error } = await supabase.from('resident_rotations')
+      .update({ rotation_status: 'terminated_early', updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select('rotation_id')
+      .single();
+    if (error) {
+      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Rotation not found' });
+      throw error;
+    }
+    res.json({ message: 'Rotation terminated successfully', rotation_id: data.rotation_id });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to delete rotation', message: error.message });
+    res.status(500).json({ error: 'Failed to terminate rotation', message: error.message });
   }
 });
 
@@ -2320,9 +2361,11 @@ app.get('/api/research-lines/website', apiLimiter, async (req, res) => {
 
 app.post('/api/research-lines', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
-    const { line_number, name, description, capabilities, sort_order, active } = req.body;
+    // Accept both 'name' (DB field) and 'research_line_name' (frontend form field)
+    const { line_number, description, capabilities, sort_order, active, keywords } = req.body;
+    const name = req.body.name || req.body.research_line_name;
     if (!name) return res.status(400).json({ error: 'Research line name is required' });
-    const { data, error } = await supabase.from('research_lines').insert([{ line_number: line_number || null, name, description: description || '', capabilities: (capabilities !== undefined && capabilities !== null) ? capabilities : 'Alcance y capacidades', sort_order: sort_order || 0, active: active !== undefined ? active : true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    const { data, error } = await supabase.from('research_lines').insert([{ line_number: line_number || null, name, description: description || '', capabilities: (capabilities !== undefined && capabilities !== null) ? capabilities : 'Alcance y capacidades', sort_order: sort_order || 0, active: active !== undefined ? active : true, keywords: Array.isArray(keywords) ? keywords : [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Research line created successfully' });
   } catch (error) {
@@ -2409,9 +2452,16 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
 
 app.post('/api/clinical-trials', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('clinical_trials').insert([{ ...req.body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    const body = { ...req.body };
+    // Observational/Expanded Access studies may not have a phase — default to 'Phase I' to satisfy
+    // the DB CHECK constraint until the schema is updated to allow null or N/A
+    const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
+    if (!VALID_PHASES.includes(body.phase)) body.phase = 'Phase I';
+    const { data, error } = await supabase.from('clinical_trials')
+      .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
+      .select().single();
     if (error) throw error;
-    res.status(201).json({ success: true, data, message: 'Clinical trial created successfully' });
+    res.status(201).json({ success: true, data, message: 'Clinical study created successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -2424,7 +2474,7 @@ app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Clinical trial not found' });
       throw error;
     }
-    res.json({ success: true, data, message: 'Clinical trial updated successfully' });
+    res.json({ success: true, data, message: 'Clinical study updated successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -2537,8 +2587,9 @@ app.get('/api/analytics/research-lines-performance', authenticateToken, apiLimit
         supabase.from('clinical_trials').select('id, phase, status').eq('research_line_id', line.id),
         supabase.from('innovation_projects').select('id, category, current_stage, development_stage').eq('research_line_id', line.id)
       ]);
-      const ACTIVE_PROJECT_STAGES = ['Prototipo', 'Validación Preclínica', 'Validación Clínica', 'Escalado'];
-      const COMMERCIALIZED_STAGES = ['Comercializado', 'Transferencia Tecnológica'];
+      // Use current_stage (new field) with fallback to development_stage (legacy)
+      const ACTIVE_PROJECT_STAGES = ['Prototipo', 'Piloto', 'Validación', 'Escalamiento'];
+      const COMMERCIALIZED_STAGES = ['Comercialización'];
       const projectStage = (p) => p.current_stage || p.development_stage || '';
       return { id: line.id, line_number: line.line_number, name: line.name, active: line.active, coordinator: coordinatorName, stats: { totalTrials: trials?.length || 0, activeTrials: trials?.filter(t => ['Activo','Reclutando'].includes(t.status)).length || 0, completedTrials: trials?.filter(t => t.status === 'Completado').length || 0, totalProjects: projects?.length || 0, activeProjects: projects?.filter(p => ACTIVE_PROJECT_STAGES.includes(projectStage(p))).length || 0, commercialized: projects?.filter(p => COMMERCIALIZED_STAGES.includes(projectStage(p))).length || 0 } };
     }));
@@ -3308,16 +3359,17 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     ======================================================
     🏥 NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API v5.4
     ======================================================
-    ✅ ALL 9 BUGS FIXED
-    ✅ FIX 1: Rotation/OnCall dates — formatDate() handles Joi Date objects
-    ✅ FIX 2: Absence total_days + current_status NOT NULL columns populated
-    ✅ FIX 3: FK safety — recorded_by nullable-safe
-    ✅ FIX 4: rotation_category Joi enum matches DB CHECK constraint
-    ✅ FIX 5: research_lines added to rolePermissions
-    ✅ FIX 6: Duplicate on-call routes removed
-    ✅ FIX 8: full_name included in all JWT payloads
-    ✅ FIX 9: Absence PUT recalculates total_days + current_status
-    ✅ NEW:   Dynamic staff_types — /api/staff-types CRUD routes added
+    ✅ 18 BUGS FIXED (original 9 + 9 new)
+    ✅ FIX 10: auth/me JWT field mismatch — req.user.userId→req.user.id
+    ✅ FIX 11: medical-staff POST+PUT now persist can_be_pi/coi/phd fields
+    ✅ FIX 12: Joi schema includes can_be_pi/coi/phd (no longer stripped)
+    ✅ FIX 13: training-units PUT now updates unit_type + unit_description
+    ✅ FIX 14: training-units PUT refreshes department_name on dept change
+    ✅ FIX 15: rotations DELETE is now soft delete (terminated_early)
+    ✅ FIX 16: analytics project stages aligned to current_stage field
+    ✅ FIX 17: research-lines POST accepts research_line_name + keywords
+    ✅ FIX 18: clinical-trials phase defaults for non-interventional studies
+    ✅ Dynamic staff_types — /api/staff-types CRUD routes
     ======================================================
     Server running on port: ${PORT}
     Environment: ${NODE_ENV}
