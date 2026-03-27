@@ -2417,7 +2417,7 @@ app.put('/api/research-lines/:id/coordinator', authenticateToken, async (req, re
   }
 });
 
-// ===== 22. CLINICAL TRIALS =====
+// ===== 22. CLINICAL STUDIES =====
 app.get('/api/clinical-trials/website', apiLimiter, async (req, res) => {
   try {
     const { line, phase, status, search } = req.query;
@@ -2426,7 +2426,7 @@ app.get('/api/clinical-trials/website', apiLimiter, async (req, res) => {
     if (phase && phase !== 'All Phases') query = query.eq('phase', phase);
     if (status && status !== 'All Status') query = query.eq('status', status);
     if (search) query = query.or(`title.ilike.%${search}%,protocol_id.ilike.%${search}%`);
-    const { data, error } = await query.limit(10);
+    const { data, error } = await query.limit(50);
     if (error) throw error;
     res.json({ success: true, data: data || [] });
   } catch (error) {
@@ -2876,7 +2876,22 @@ app.get('/api/partners', authenticateToken, apiLimiter, async (req, res) => {
     res.json({ success: true, data: [] });
   }
 });
-
+// POST /api/contact — PUBLIC, no auth required
+app.post('/api/contact', apiLimiter, async (req, res) => {
+  try {
+    const { name, organisation, email, area_of_interest, message } = req.body;
+    if (!name || !email) {
+      return res.status(400).json({ error: 'Name and email are required' });
+    }
+    const { error } = await supabase
+      .from('contact_submissions')
+      .insert([{ name, organisation, email, area_of_interest, message }]);
+    if (error) throw error;
+    res.json({ success: true, message: 'Message received' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 app.post('/api/partners', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
     const { name, type, website, main_contact_name, main_contact_email, main_contact_phone, address, logo_url } = req.body;
