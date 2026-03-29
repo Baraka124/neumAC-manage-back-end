@@ -238,7 +238,7 @@ const schemas = {
     staff_type: Joi.string().min(1).max(80).required(), // dynamic — validated against staff_types table at runtime
     staff_id: Joi.string().optional(),
     employment_status: Joi.string().valid('active', 'on_leave', 'inactive').default('active'),
-    professional_email: Joi.string().email().required(),
+    professional_email: Joi.string().email().optional().allow('', null), // FIX: email is not always available (residents, external staff)
     department_id: Joi.string().uuid().optional().allow(null),
     academic_degree: Joi.string().optional().allow('', null),       // legacy free-text, kept for backcompat
     academic_degree_id: Joi.string().uuid().optional().allow(null), // new FK to academic_degrees table
