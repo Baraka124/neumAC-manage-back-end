@@ -3060,6 +3060,96 @@ app.delete('/api/innovation-projects/:projectId/partners/:partnerId', authentica
   }
 });
 
+
+// ============================================================================
+// ========================== ROTATION SERVICES ================================
+// ============================================================================
+// Wraps the departments table filtered by service_type.
+// 'home_department' = Neumología (read-only, not shown in rotation services list)
+// 'rotation_service' = external services residents rotate through
+// 'external_institution' = fully external institutions
+
+app.get('/api/rotation-services', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { include_home } = req.query
+    let query = supabase.from('departments')
+      .select('id, name, code, service_type, contact_name, contact_email, contact_phone, status')
+      .order('name')
+    if (include_home !== 'true') {
+      query = query.eq('service_type', 'rotation_service')
+    } else {
+      query = query.in('service_type', ['rotation_service', 'home_department'])
+    }
+    const { data, error } = await query
+    if (error) throw error
+    res.json({ success: true, data: data || [] })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch rotation services', message: err.message })
+  }
+})
+
+app.post('/api/rotation-services', authenticateToken, checkPermission('system_settings', 'create'), async (req, res) => {
+  try {
+    const { name, service_type, contact_name, contact_email, contact_phone } = req.body
+    if (!name?.trim()) return res.status(400).json({ error: 'Name is required' })
+    const code = name.trim().toUpperCase().replace(/[^A-Z0-9]/g, '-').replace(/-+/g, '-').slice(0, 20)
+    const { data, error } = await supabase.from('departments').insert([{
+      name: name.trim(),
+      code: `${code}-${Date.now().toString(36).slice(-4).toUpperCase()}`,
+      service_type: service_type || 'rotation_service',
+      contact_name: contact_name || null,
+      contact_email: contact_email || null,
+      contact_phone: contact_phone || null,
+      status: 'active',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }]).select().single()
+    if (error) throw error
+    res.status(201).json({ success: true, data })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create rotation service', message: err.message })
+  }
+})
+
+app.put('/api/rotation-services/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
+  try {
+    const { name, contact_name, contact_email, contact_phone, status } = req.body
+    const { data, error } = await supabase.from('departments')
+      .update({ name, contact_name, contact_email, contact_phone, status, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .neq('service_type', 'home_department') // never allow editing the home dept via this route
+      .select().single()
+    if (error) throw error
+    if (!data) return res.status(404).json({ error: 'Rotation service not found' })
+    res.json({ success: true, data })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update rotation service', message: err.message })
+  }
+})
+
+app.delete('/api/rotation-services/:id', authenticateToken, checkPermission('system_settings', 'delete'), async (req, res) => {
+  try {
+    // Check if any medical_staff references this service
+    const { count } = await supabase.from('medical_staff')
+      .select('*', { count: 'exact', head: true })
+      .eq('home_department_id', req.params.id)
+    if (count > 0) {
+      // Soft delete — deactivate so existing staff records remain valid
+      const { data, error } = await supabase.from('departments')
+        .update({ status: 'inactive', updated_at: new Date().toISOString() })
+        .eq('id', req.params.id).neq('service_type', 'home_department').select().single()
+      if (error) throw error
+      return res.json({ success: true, action: 'deactivated', message: `Service deactivated — ${count} staff member(s) still reference it.`, data })
+    }
+    const { error } = await supabase.from('departments')
+      .delete().eq('id', req.params.id).neq('service_type', 'home_department')
+    if (error) throw error
+    res.json({ success: true, action: 'deleted', message: 'Rotation service deleted.' })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete rotation service', message: err.message })
+  }
+})
+
 // ============ STAFF TYPES ROUTES ============
 // These routes serve the dynamic staff_types table — replacing hardcoded enums everywhere.
 
