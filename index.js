@@ -45,7 +45,7 @@ const PORT = process.env.PORT || 3000;
 const {
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY,
-  JWT_SECRET = process.env.JWT_SECRET || 'sb_secret_ah53o9afyZzuAfccFM2HNA_rEmi6-iJ',
+  JWT_SECRET = process.env.JWT_SECRET,
   NODE_ENV = 'production',
   ALLOWED_ORIGINS: ENV_ALLOWED_ORIGINS
 } = process.env;
@@ -55,6 +55,11 @@ const allowedOrigins = ALLOWED_ORIGINS_STRING.split(',').map(origin => origin.tr
 
 console.log('🌐 CORS Configuration:', { allowedOrigins, nodeEnv: NODE_ENV });
 
+// B11 FIX: Never fall back to a hardcoded JWT secret — fail fast at startup
+if (!JWT_SECRET) {
+  console.error('❌ JWT_SECRET environment variable is required and must not be empty');
+  process.exit(1);
+}
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('❌ Missing required environment variables');
   process.exit(1);
@@ -254,8 +259,8 @@ const schemas = {
     certificate_status: Joi.string().optional().allow('', null),
     special_notes: Joi.string().optional().allow('', null),
     can_supervise_residents: Joi.boolean().optional().default(false),
-    can_be_pi: Joi.boolean().optional().default(false),
-    can_be_coi: Joi.boolean().optional().default(false),
+    // B5 FIX: Removed duplicate can_be_pi / can_be_coi declarations (were defined twice;
+    // the second definition at lines ~272 silently overwrote these)
     resident_category: Joi.string().valid('department_internal', 'rotating_other_dept', 'external_resident').optional().allow(null),
     home_department: Joi.string().optional().allow('', null),
     home_department_id: Joi.string().uuid().optional().allow(null),
@@ -506,7 +511,7 @@ const auditLog = async (action, resource, resource_id = '', details = {}) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'NeumoCare Hospital Management System API',
-    version: '5.3.0',
+    version: '5.4.0',
     status: 'operational',
     environment: NODE_ENV,
     timestamp: new Date().toISOString(),
@@ -518,7 +523,7 @@ app.get('/health', apiLimiter, (req, res) => {
   res.json({
     status: 'healthy',
     service: 'NeumoCare Hospital Management System API',
-    version: '5.3.0',
+    version: '5.4.0',
     timestamp: new Date().toISOString(),
     environment: NODE_ENV,
     cors: { allowed_origins: allowedOrigins, your_origin: req.headers.origin || 'not-specified' },
@@ -581,70 +586,38 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const { email, password } = req.body;
     console.log('🔐 Login attempt for:', email);
 
-    // Hardcoded admin bypass
-    if (email === 'admin@neumocare.org' && password === 'password123') {
-      // FIX 8: full_name now included in JWT payload
-      const token = jwt.sign(
-        { id: '11111111-1111-1111-1111-111111111111', email: 'admin@neumocare.org', role: 'system_admin', full_name: 'System Administrator' },
-        JWT_SECRET, { expiresIn: '24h' }
-      );
-      return res.json({
-        token,
-        user: { id: '11111111-1111-1111-1111-111111111111', email: 'admin@neumocare.org', full_name: 'System Administrator', user_role: 'system_admin' }
-      });
-    }
+    // B2 FIX: Removed hardcoded admin bypass (was: admin@neumocare.org / password123)
+    // B2 FIX: Removed unauthenticated fallback — unknown users must exist in DB
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Validation failed', message: 'Email and password are required' });
     }
 
-    try {
-      const { data: user, error } = await supabase
-        .from('app_users')
-        .select('id, email, full_name, user_role, department_id, password_hash, account_status')
-        .eq('email', email.toLowerCase()).single();
+    const { data: user, error } = await supabase
+      .from('app_users')
+      .select('id, email, full_name, user_role, department_id, password_hash, account_status')
+      .eq('email', email.toLowerCase()).single();
 
-      if (error || !user) {
-        // FIX 8: full_name in fallback JWT
-        const mockToken = jwt.sign(
-          { id: 'test-' + Date.now(), email, role: 'medical_resident', full_name: email.split('@')[0] },
-          JWT_SECRET, { expiresIn: '24h' }
-        );
-        return res.json({
-          token: mockToken,
-          user: { id: 'test-' + Date.now(), email, full_name: email.split('@')[0], user_role: 'medical_resident' }
-        });
-      }
-
-      if (user.account_status !== 'active') {
-        return res.status(403).json({ error: 'Account disabled', message: 'Your account has been deactivated' });
-      }
-
-      const validPassword = await bcrypt.compare(password, user.password_hash || '');
-      if (!validPassword) {
-        return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
-      }
-
-      // FIX 8: full_name in JWT
-      const token = jwt.sign(
-        { id: user.id, email: user.email, role: user.user_role, full_name: user.full_name },
-        JWT_SECRET, { expiresIn: '24h' }
-      );
-      const { password_hash, ...userWithoutPassword } = user;
-      res.json({ token, user: userWithoutPassword, expires_in: '24h' });
-
-    } catch (dbError) {
-      console.error('Database error during login:', dbError);
-      // FIX 8: full_name in temp JWT
-      const tempToken = jwt.sign(
-        { id: 'temp-' + Date.now(), email, role: 'medical_resident', full_name: email.split('@')[0] },
-        JWT_SECRET, { expiresIn: '24h' }
-      );
-      res.json({
-        token: tempToken,
-        user: { id: 'temp-' + Date.now(), email, full_name: email.split('@')[0], user_role: 'medical_resident' }
-      });
+    if (error || !user) {
+      return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
     }
+
+    if (user.account_status !== 'active') {
+      return res.status(403).json({ error: 'Account disabled', message: 'Your account has been deactivated' });
+    }
+
+    const validPassword = await bcrypt.compare(password, user.password_hash || '');
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.user_role, full_name: user.full_name },
+      JWT_SECRET, { expiresIn: '24h' }
+    );
+    const { password_hash, ...userWithoutPassword } = user;
+    res.json({ token, user: userWithoutPassword, expires_in: '24h' });
+
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
@@ -732,6 +705,50 @@ app.get('/api/users', authenticateToken, checkPermission('users', 'read'), apiLi
   }
 });
 
+// B1 FIX: Static sub-routes must come BEFORE /:id — otherwise Express matches 'change-password'
+// and 'profile' as the :id parameter, making these endpoints unreachable.
+
+// ===== 4. USER PROFILE =====
+app.get('/api/users/profile', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('app_users')
+      .select('id, email, full_name, user_role, department_id, phone_number, notifications_enabled, absence_notifications, announcement_notifications, created_at, updated_at')
+      .eq('id', req.user.id).single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch user profile', message: error.message });
+  }
+});
+
+app.put('/api/users/profile', authenticateToken, validate(schemas.userProfile), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('app_users')
+      .update({ ...(req.validatedData || req.body), updated_at: new Date().toISOString() })
+      .eq('id', req.user.id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update profile', message: error.message });
+  }
+});
+
+app.put('/api/users/change-password', authenticateToken, validate(schemas.changePassword), async (req, res) => {
+  try {
+    const { current_password, new_password } = req.validatedData || req.body;
+    const { data: user, error: fetchError } = await supabase.from('app_users').select('password_hash').eq('id', req.user.id).single();
+    if (fetchError) throw fetchError;
+    const validPassword = await bcrypt.compare(current_password, user.password_hash || '');
+    if (!validPassword) return res.status(401).json({ error: 'Current password is incorrect' });
+    const passwordHash = await bcrypt.hash(new_password, 10);
+    const { error } = await supabase.from('app_users').update({ password_hash: passwordHash, updated_at: new Date().toISOString() }).eq('id', req.user.id);
+    if (error) throw error;
+    res.json({ message: 'Password changed successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to change password', message: error.message });
+  }
+});
+
 app.get('/api/users/:id', authenticateToken, checkPermission('users', 'read'), apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('app_users')
@@ -810,46 +827,7 @@ app.put('/api/users/:id/deactivate', authenticateToken, checkPermission('users',
   }
 });
 
-app.put('/api/users/change-password', authenticateToken, validate(schemas.changePassword), async (req, res) => {
-  try {
-    const { current_password, new_password } = req.validatedData || req.body;
-    const { data: user, error: fetchError } = await supabase.from('app_users').select('password_hash').eq('id', req.user.id).single();
-    if (fetchError) throw fetchError;
-    const validPassword = await bcrypt.compare(current_password, user.password_hash || '');
-    if (!validPassword) return res.status(401).json({ error: 'Current password is incorrect' });
-    const passwordHash = await bcrypt.hash(new_password, 10);
-    const { error } = await supabase.from('app_users').update({ password_hash: passwordHash, updated_at: new Date().toISOString() }).eq('id', req.user.id);
-    if (error) throw error;
-    res.json({ message: 'Password changed successfully' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to change password', message: error.message });
-  }
-});
 
-// ===== 4. USER PROFILE =====
-app.get('/api/users/profile', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('app_users')
-      .select('id, email, full_name, user_role, department_id, phone_number, notifications_enabled, absence_notifications, announcement_notifications, created_at, updated_at')
-      .eq('id', req.user.id).single();
-    if (error) throw error;
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch user profile', message: error.message });
-  }
-});
-
-app.put('/api/users/profile', authenticateToken, validate(schemas.userProfile), async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('app_users')
-      .update({ ...(req.validatedData || req.body), updated_at: new Date().toISOString() })
-      .eq('id', req.user.id).select().single();
-    if (error) throw error;
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update profile', message: error.message });
-  }
-});
 
 // ===== 5. MEDICAL STAFF =====
 app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff', 'read'), apiLimiter, async (req, res) => {
@@ -1627,6 +1605,42 @@ app.get('/api/absence-records/upcoming', authenticateToken, apiLimiter, async (r
   }
 });
 
+// B4 FIX: Static sub-routes must come before /:id to avoid Express matching
+// 'staff', 'dashboard' etc. as the :id param
+app.get('/api/absence-records/staff/:staffId', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { limit = 20, page = 1 } = req.query;
+    const offset = (page - 1) * limit;
+    const { data, error, count } = await supabase.from('staff_absence_records').select('*', { count: 'exact' })
+      .eq('staff_member_id', req.params.staffId).order('start_date', { ascending: false }).range(offset, offset + limit - 1);
+    if (error) throw error;
+    res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch staff absence history', message: error.message });
+  }
+});
+
+app.get('/api/absence-records/dashboard/stats', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const today = formatDate(new Date());
+    const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
+    const [total, current, upcoming, withoutCoverage, byType, byReason] = await Promise.all([
+      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }),
+      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'currently_absent'),
+      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek),
+      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('coverage_arranged', false).eq('current_status', 'currently_absent'),
+      supabase.from('staff_absence_records').select('absence_type'),
+      supabase.from('staff_absence_records').select('absence_reason')
+    ]);
+    const typeCounts = {}, reasonCounts = {};
+    byType.data?.forEach(i => { typeCounts[i.absence_type] = (typeCounts[i.absence_type] || 0) + 1; });
+    byReason.data?.forEach(i => { reasonCounts[i.absence_reason] = (reasonCounts[i.absence_reason] || 0) + 1; });
+    res.json({ success: true, data: { total: total.count || 0, currently_absent: current.count || 0, upcoming: upcoming.count || 0, without_coverage: withoutCoverage.count || 0, by_type: typeCounts, by_reason: reasonCounts, coverage_rate: total.count ? Math.round(((total.count - withoutCoverage.count) / total.count) * 100) : 100 } });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch absence stats', message: error.message });
+  }
+});
+
 app.get('/api/absence-records/:id', authenticateToken, checkPermission('staff_absence', 'read'), apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('staff_absence_records').select(`
@@ -1856,40 +1870,6 @@ app.delete('/api/absence-records/:id/purge', authenticateToken, checkPermission(
   }
 });
 
-app.get('/api/absence-records/staff/:staffId', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { limit = 20, page = 1 } = req.query;
-    const offset = (page - 1) * limit;
-    const { data, error, count } = await supabase.from('staff_absence_records').select('*', { count: 'exact' })
-      .eq('staff_member_id', req.params.staffId).order('start_date', { ascending: false }).range(offset, offset + limit - 1);
-    if (error) throw error;
-    res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch staff absence history', message: error.message });
-  }
-});
-
-app.get('/api/absence-records/dashboard/stats', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const today = formatDate(new Date());
-    const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
-    const [total, current, upcoming, withoutCoverage, byType, byReason] = await Promise.all([
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }),
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'currently_absent'),
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek),
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('coverage_arranged', false).eq('current_status', 'currently_absent'),
-      supabase.from('staff_absence_records').select('absence_type'),
-      supabase.from('staff_absence_records').select('absence_reason')
-    ]);
-    const typeCounts = {}, reasonCounts = {};
-    byType.data?.forEach(i => { typeCounts[i.absence_type] = (typeCounts[i.absence_type] || 0) + 1; });
-    byReason.data?.forEach(i => { reasonCounts[i.absence_reason] = (reasonCounts[i.absence_reason] || 0) + 1; });
-    res.json({ success: true, data: { total: total.count || 0, currently_absent: current.count || 0, upcoming: upcoming.count || 0, without_coverage: withoutCoverage.count || 0, by_type: typeCounts, by_reason: reasonCounts, coverage_rate: total.count ? Math.round(((total.count - withoutCoverage.count) / total.count) * 100) : 100 } });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch absence stats', message: error.message });
-  }
-});
-
 app.get('/api/absence-records/:id/audit-log', authenticateToken, checkPermission('staff_absence', 'read'), apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('absence_audit_log').select(`*, changed_by_user:app_users!absence_audit_log_changed_by_fkey(id, full_name, email)`).eq('absence_record_id', req.params.id).order('changed_at', { ascending: false });
@@ -2007,7 +1987,7 @@ app.get('/api/live-status/history', authenticateToken, apiLimiter, async (req, r
   }
 });
 
-app.put('/api/live-status/:id', authenticateToken, apiLimiter, async (req, res) => {
+app.put('/api/live-status/:id', authenticateToken, checkPermission('communications', 'update'), apiLimiter, async (req, res) => { // B7 FIX: added checkPermission — was accessible to all authenticated users
   try {
     const { data, error } = await supabase.from('clinical_status_updates').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
     if (error) throw error;
@@ -2375,7 +2355,18 @@ app.post('/api/research-lines', authenticateToken, checkPermission('research_lin
 
 app.put('/api/research-lines/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('research_lines').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    // B6 FIX: Whitelist updatable fields — do not pass req.body directly to prevent
+    // clients from overwriting id, created_at, line_number (unique) or injecting garbage fields
+    const { name, description, capabilities, sort_order, active, keywords, coordinator_id } = req.body;
+    const updatePayload = { updated_at: new Date().toISOString() };
+    if (name !== undefined)           updatePayload.name           = name;
+    if (description !== undefined)    updatePayload.description    = description;
+    if (capabilities !== undefined)   updatePayload.capabilities   = capabilities;
+    if (sort_order !== undefined)     updatePayload.sort_order     = sort_order;
+    if (active !== undefined)         updatePayload.active         = active;
+    if (keywords !== undefined)       updatePayload.keywords       = Array.isArray(keywords) ? keywords : [];
+    if (coordinator_id !== undefined) updatePayload.coordinator_id = coordinator_id || null;
+    const { data, error } = await supabase.from('research_lines').update(updatePayload).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Research line not found' });
       throw error;
@@ -2469,7 +2460,31 @@ app.post('/api/clinical-trials', authenticateToken, checkPermission('research_li
 
 app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('clinical_trials').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    // B6 FIX: Whitelist updatable fields
+    const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
+    const VALID_STATUSES = ['Reclutando','Activo','Completado','En preparación'];
+    const b = req.body;
+    const updatePayload = {
+      updated_at: new Date().toISOString(),
+      ...(b.title              !== undefined && { title: b.title }),
+      ...(b.research_line_id   !== undefined && { research_line_id: b.research_line_id || null }),
+      ...(b.phase              !== undefined && { phase: VALID_PHASES.includes(b.phase) ? b.phase : 'Phase I' }),
+      ...(b.status             !== undefined && { status: VALID_STATUSES.includes(b.status) ? b.status : 'En preparación' }),
+      ...(b.description        !== undefined && { description: b.description }),
+      ...(b.inclusion_criteria !== undefined && { inclusion_criteria: b.inclusion_criteria }),
+      ...(b.exclusion_criteria !== undefined && { exclusion_criteria: b.exclusion_criteria }),
+      ...(b.principal_investigator_id !== undefined && { principal_investigator_id: b.principal_investigator_id || null }),
+      ...(b.co_investigators   !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
+      ...(b.sub_investigators  !== undefined && { sub_investigators: Array.isArray(b.sub_investigators) ? b.sub_investigators : [] }),
+      ...(b.contact_email      !== undefined && { contact_email: b.contact_email }),
+      ...(b.featured_in_website!== undefined && { featured_in_website: b.featured_in_website }),
+      ...(b.display_order      !== undefined && { display_order: b.display_order }),
+      ...(b.start_date         !== undefined && { start_date: b.start_date || null }),
+      ...(b.end_date           !== undefined && { end_date: b.end_date || null }),
+      ...(b.sponsor_name       !== undefined && { sponsor_name: b.sponsor_name }),
+      ...(b.tags               !== undefined && { tags: Array.isArray(b.tags) ? b.tags : [] }),
+    };
+    const { data, error } = await supabase.from('clinical_trials').update(updatePayload).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Clinical trial not found' });
       throw error;
@@ -2528,7 +2543,30 @@ app.post('/api/innovation-projects', authenticateToken, checkPermission('researc
 
 app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('innovation_projects').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    // B6 FIX: Whitelist updatable fields
+    const VALID_STAGES = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
+    const b = req.body;
+    const updatePayload = {
+      updated_at: new Date().toISOString(),
+      ...(b.title               !== undefined && { title: b.title }),
+      ...(b.category            !== undefined && { category: b.category }),
+      ...(b.current_stage       !== undefined && { current_stage: VALID_STAGES.includes(b.current_stage) ? b.current_stage : null }),
+      ...(b.description         !== undefined && { description: b.description }),
+      ...(b.clinical_rationale  !== undefined && { clinical_rationale: b.clinical_rationale }),
+      ...(b.research_line_id    !== undefined && { research_line_id: b.research_line_id || null }),
+      ...(b.lead_investigator_id!== undefined && { lead_investigator_id: b.lead_investigator_id || null }),
+      ...(b.co_investigators    !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
+      ...(b.partner_needs       !== undefined && { partner_needs: Array.isArray(b.partner_needs) ? b.partner_needs : [] }),
+      ...(b.partner_found       !== undefined && { partner_found: b.partner_found }),
+      ...(b.partner_name        !== undefined && { partner_name: b.partner_name || null }),
+      ...(b.funding_status      !== undefined && { funding_status: b.funding_status }),
+      ...(b.keywords            !== undefined && { keywords: Array.isArray(b.keywords) ? b.keywords : [] }),
+      ...(b.featured_in_website !== undefined && { featured_in_website: b.featured_in_website }),
+      ...(b.display_order       !== undefined && { display_order: b.display_order }),
+      ...(b.start_date          !== undefined && { start_date: b.start_date || null }),
+      ...(b.estimated_end_date  !== undefined && { estimated_end_date: b.estimated_end_date || null }),
+    };
+    const { data, error } = await supabase.from('innovation_projects').update(updatePayload).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Innovation project not found' });
       throw error;
@@ -2576,23 +2614,42 @@ app.get('/api/analytics/research-dashboard', authenticateToken, apiLimiter, asyn
 
 app.get('/api/analytics/research-lines-performance', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { data: researchLines } = await supabase.from('research_lines').select('id, line_number, name, coordinator_id, active');
-    const performance = await Promise.all((researchLines || []).map(async (line) => {
-      let coordinatorName = null;
-      if (line.coordinator_id) {
-        const { data: staff } = await supabase.from('medical_staff').select('full_name').eq('id', line.coordinator_id).single();
-        coordinatorName = staff?.full_name || null;
-      }
-      const [{ data: trials }, { data: projects }] = await Promise.all([
-        supabase.from('clinical_trials').select('id, phase, status').eq('research_line_id', line.id),
-        supabase.from('innovation_projects').select('id, category, current_stage, development_stage').eq('research_line_id', line.id)
-      ]);
-      // Use current_stage (new field) with fallback to development_stage (legacy)
-      const ACTIVE_PROJECT_STAGES = ['Prototipo', 'Piloto', 'Validación', 'Escalamiento'];
-      const COMMERCIALIZED_STAGES = ['Comercialización'];
-      const projectStage = (p) => p.current_stage || p.development_stage || '';
-      return { id: line.id, line_number: line.line_number, name: line.name, active: line.active, coordinator: coordinatorName, stats: { totalTrials: trials?.length || 0, activeTrials: trials?.filter(t => ['Activo','Reclutando'].includes(t.status)).length || 0, completedTrials: trials?.filter(t => t.status === 'Completado').length || 0, totalProjects: projects?.length || 0, activeProjects: projects?.filter(p => ACTIVE_PROJECT_STAGES.includes(projectStage(p))).length || 0, commercialized: projects?.filter(p => COMMERCIALIZED_STAGES.includes(projectStage(p))).length || 0 } };
-    }));
+    // B8 FIX: Was N+1 — one query per research line for trials, projects, and coordinator.
+    // Now fetches everything in 3 bulk queries and groups in memory.
+    const [
+      { data: researchLines },
+      { data: allTrials },
+      { data: allProjects },
+      { data: allStaff }
+    ] = await Promise.all([
+      supabase.from('research_lines').select('id, line_number, name, coordinator_id, active'),
+      supabase.from('clinical_trials').select('id, phase, status, research_line_id'),
+      supabase.from('innovation_projects').select('id, category, current_stage, development_stage, research_line_id'),
+      supabase.from('medical_staff').select('id, full_name')
+    ]);
+
+    const staffMap = Object.fromEntries((allStaff || []).map(s => [s.id, s.full_name]));
+    const ACTIVE_PROJECT_STAGES = ['Prototipo', 'Piloto', 'Validación', 'Escalamiento'];
+    const COMMERCIALIZED_STAGES = ['Comercialización'];
+    const projectStage = (p) => p.current_stage || p.development_stage || '';
+
+    const performance = (researchLines || []).map(line => {
+      const trials   = (allTrials   || []).filter(t => t.research_line_id === line.id);
+      const projects = (allProjects || []).filter(p => p.research_line_id === line.id);
+      return {
+        id: line.id, line_number: line.line_number, name: line.name, active: line.active,
+        coordinator: line.coordinator_id ? (staffMap[line.coordinator_id] || null) : null,
+        stats: {
+          totalTrials:      trials.length,
+          activeTrials:     trials.filter(t => ['Activo','Reclutando'].includes(t.status)).length,
+          completedTrials:  trials.filter(t => t.status === 'Completado').length,
+          totalProjects:    projects.length,
+          activeProjects:   projects.filter(p => ACTIVE_PROJECT_STAGES.includes(projectStage(p))).length,
+          commercialized:   projects.filter(p => COMMERCIALIZED_STAGES.includes(projectStage(p))).length
+        }
+      };
+    });
+
     performance.sort((a, b) => (a.line_number || 999) - (b.line_number || 999));
     res.json({ success: true, data: performance });
   } catch (error) {
