@@ -3538,7 +3538,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     ✅ FIX 13: training-units PUT now updates unit_type + unit_description
     ✅ FIX 14: training-units PUT refreshes department_name on dept change
     ✅ FIX 15: rotations DELETE is now soft delete (terminated_early)
-    ✅ FIX 16: analytics project stages aligned to current_stage field   
+    ✅ FIX 16: analytics project stages aligned to current_stage field
     ✅ FIX 17: research-lines POST accepts research_line_name + keywords
     ✅ FIX 18: clinical-trials phase defaults for non-interventional studies
     ✅ Dynamic staff_types — /api/staff-types CRUD routes
