@@ -175,7 +175,7 @@ app.use(helmet({
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', authenticateToken, express.static(path.join(__dirname, 'uploads')));
 
 app.use((req, res, next) => {
   console.log(`📡 [${new Date().toISOString()}] ${req.method} ${req.url} - Origin: ${req.headers.origin || 'no-origin'}`);
@@ -474,7 +474,7 @@ const checkPermission = (resource, action) => {
       audit_logs:           ['system_admin'],
       notifications:        ['system_admin', 'department_head', 'resident_manager'],
       attachments:          ['system_admin', 'department_head', 'resident_manager'],
-      research_lines:       ['system_admin', 'department_head'],   // ← FIX 5
+      research_lines:       ['system_admin', 'department_head', 'resident_manager'],  // ← FIX: resident_manager added
       staff_types:          ['system_admin', 'department_head'],   // ← dynamic staff type management
     };
 
@@ -664,9 +664,12 @@ app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPasswo
   try {
     const { email } = req.validatedData || req.body;
     const { data: user } = await supabase.from('app_users').select('id, email, full_name').eq('email', email.toLowerCase()).single();
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    const resetToken = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
-    res.json({ message: 'Password reset link sent to email' });
+    // Always return 200 — never reveal whether the email exists (prevents enumeration)
+    if (user) {
+      // Token generated but not stored — email sending not yet implemented (B-SEC1)
+      jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+    }
+    res.json({ message: 'If an account with that email exists, a reset link has been sent.' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to process password reset', message: error.message });
   }
@@ -959,6 +962,8 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       external_contact_phone: dataSource.external_contact_phone || null,
       can_supervise_residents: dataSource.can_supervise_residents || false,
       is_research_coordinator: dataSource.is_research_coordinator || false,
+      is_resident_manager:     dataSource.is_resident_manager     || false,
+      is_oncall_manager:       dataSource.is_oncall_manager       || false,
       mobile_phone: dataSource.mobile_phone || null,
       special_notes: dataSource.special_notes || null,
       hospital_id: dataSource.hospital_id || null,
@@ -2393,7 +2398,7 @@ app.delete('/api/research-lines/:id', authenticateToken, checkPermission('resear
   }
 });
 
-app.put('/api/research-lines/:id/coordinator', authenticateToken, async (req, res) => {
+app.put('/api/research-lines/:id/coordinator', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
     const { coordinator_id } = req.body;
     if (coordinator_id) {
@@ -3254,11 +3259,13 @@ app.delete('/api/staff-types/:id', authenticateToken, checkPermission('staff_typ
 // GET /api/news — authenticated, returns all posts (incl. internal)
 app.get('/api/news', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { status, type, is_public } = req.query;
+    const { status, type, is_public, page = 1, limit = 100 } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
     let query = supabase
       .from('news_posts')
       .select(`*, author:medical_staff!news_posts_author_id_fkey(id, full_name, staff_type), research_line:research_lines!news_posts_research_line_id_fkey(id, line_number, name)`)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .range(offset, offset + parseInt(limit) - 1);
     if (status) query = query.eq('status', status);
     if (type)   query = query.eq('post_type', type);
     if (is_public !== undefined) query = query.eq('is_public', is_public === 'true');
