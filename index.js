@@ -297,11 +297,11 @@ const schemas = {
     training_unit_id: Joi.string().uuid().required(),
     start_date: Joi.date().required(),
     end_date: Joi.date().required(),
-    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'cancelled', 'extended', 'terminated_early').default('scheduled'),
+    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early').default('scheduled'),
     rotation_category: Joi.string()
       .valid('clinical_rotation', 'elective_rotation', 'research_block', 'administrative_duty')
       .default('clinical_rotation'),
-    supervising_attending_id: Joi.string().uuid().optional().allow(null),
+    supervising_attending_id: Joi.string().uuid().required(),
     rotation_id: Joi.string().optional(),
     clinical_notes: Joi.string().optional().allow(''),
     supervisor_evaluation: Joi.string().optional().allow(''),
@@ -493,16 +493,23 @@ const checkPermission = (resource, action) => {
 };
 
 // ============ AUDIT LOGGING ============
-const auditLog = async (action, resource, resource_id = '', details = {}) => {
+// req is optional — pass it when available to capture user + IP context
+const auditLog = async (action, resource, resource_id = '', details = {}, req = null) => {
   try {
-    // audit_logs.user_id FK → auth.users — omit for system ops to avoid FK violation
-    await supabase.from('audit_logs').insert({
+    const row = {
       action, resource, resource_id: resource_id || null,
-      ip_address: '', user_agent: '',
-      details: JSON.stringify(details), created_at: new Date().toISOString()
-    });
+      ip_address: req ? (req.ip || req.headers['x-forwarded-for'] || '') : '',
+      user_agent: req ? (req.headers['user-agent'] || '') : '',
+      user_name:  req?.user?.full_name || null,
+      user_role:  req?.user?.role      || null,
+      details: JSON.stringify(details),
+      created_at: new Date().toISOString()
+    }
+    // Only attach user_id when we have one — FK points to auth.users
+    if (req?.user?.id) row.user_id = req.user.id
+    await supabase.from('audit_logs').insert(row)
   } catch (error) {
-    console.error('Audit logging failed (non-fatal):', error.message);
+    console.error('Audit logging failed (non-fatal):', error.message)
   }
 };
 
@@ -838,7 +845,7 @@ app.put('/api/users/:id/deactivate', authenticateToken, checkPermission('users',
 // ===== 5. MEDICAL STAFF =====
 app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff', 'read'), apiLimiter, async (req, res) => {
   try {
-    const { search, staff_type, employment_status, department_id, page = 1, limit = 100 } = req.query;
+    const { search, staff_type, employment_status, department_id, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('medical_staff')
       .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)', { count: 'exact' });
@@ -967,6 +974,7 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       is_research_coordinator: dataSource.is_research_coordinator || false,
       is_resident_manager:     dataSource.is_resident_manager     || false,
       is_oncall_manager:       dataSource.is_oncall_manager       || false,
+      is_chief_of_department:  dataSource.is_chief_of_department  || false,
       mobile_phone: dataSource.mobile_phone || null,
       special_notes: dataSource.special_notes || null,
       hospital_id: dataSource.hospital_id || null,
@@ -1296,7 +1304,7 @@ app.delete('/api/training-units/:id', authenticateToken, checkPermission('traini
 // ===== 8. RESIDENT ROTATIONS =====
 app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { resident_id, rotation_status, training_unit_id, start_date, end_date, page = 1, limit = 100 } = req.query;
+    const { resident_id, rotation_status, training_unit_id, start_date, end_date, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('resident_rotations').select(`
         *, resident:medical_staff!resident_rotations_resident_id_fkey(full_name, professional_email, staff_type),
@@ -1555,7 +1563,7 @@ app.delete('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedul
 // ===== 10. STAFF ABSENCE RECORDS =====
 app.get('/api/absence-records', authenticateToken, checkPermission('staff_absence', 'read'), apiLimiter, async (req, res) => {
   try {
-    const { staff_member_id, absence_type, current_status, start_date, end_date, coverage_arranged, absence_reason, page = 1, limit = 100 } = req.query;
+    const { staff_member_id, absence_type, current_status, start_date, end_date, coverage_arranged, absence_reason, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, professional_email, staff_type, department_id),
@@ -1997,7 +2005,12 @@ app.get('/api/live-status/history', authenticateToken, apiLimiter, async (req, r
 
 app.put('/api/live-status/:id', authenticateToken, checkPermission('communications', 'update'), apiLimiter, async (req, res) => { // B7 FIX: added checkPermission — was accessible to all authenticated users
   try {
-    const { data, error } = await supabase.from('clinical_status_updates').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    const { status_text, expires_at, is_active } = req.body
+    const updatePayload = { updated_at: new Date().toISOString() }
+    if (status_text !== undefined) updatePayload.status_text = status_text
+    if (expires_at  !== undefined) updatePayload.expires_at  = expires_at
+    if (is_active   !== undefined) updatePayload.is_active   = is_active
+    const { data, error } = await supabase.from('clinical_status_updates').update(updatePayload).eq('id', req.params.id).select().single();
     if (error) throw error;
     res.json({ success: true, data });
   } catch (error) {
@@ -2477,7 +2490,10 @@ app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research
       ...(b.title              !== undefined && { title: b.title }),
       ...(b.research_line_id   !== undefined && { research_line_id: b.research_line_id || null }),
       ...(b.phase              !== undefined && { phase: VALID_PHASES.includes(b.phase) ? b.phase : 'Phase I' }),
-      ...(b.status             !== undefined && { status: VALID_STATUSES.includes(b.status) ? b.status : 'En preparación' }),
+      ...(b.status             !== undefined && (() => {
+        if (!VALID_STATUSES.includes(b.status)) return {};  // unknown status — skip field, keep current DB value
+        return { status: b.status };
+      })()),
       ...(b.description        !== undefined && { description: b.description }),
       ...(b.inclusion_criteria !== undefined && { inclusion_criteria: b.inclusion_criteria }),
       ...(b.exclusion_criteria !== undefined && { exclusion_criteria: b.exclusion_criteria }),
@@ -2541,7 +2557,12 @@ app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, r
 
 app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('innovation_projects').insert([{ ...req.body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    const body = { ...req.body };
+    // Always write development_stage (NOT NULL) in sync with current_stage
+    const STAGE_MAP = { 'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica' };
+    if (body.current_stage) body.development_stage = STAGE_MAP[body.current_stage] || 'En Desarrollo';
+    if (!body.development_stage) body.development_stage = 'En Desarrollo';
+    const { data, error } = await supabase.from('innovation_projects').insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Innovation project created successfully' });
   } catch (error) {
@@ -2558,7 +2579,12 @@ app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('rese
       updated_at: new Date().toISOString(),
       ...(b.title               !== undefined && { title: b.title }),
       ...(b.category            !== undefined && { category: b.category }),
-      ...(b.current_stage       !== undefined && { current_stage: VALID_STAGES.includes(b.current_stage) ? b.current_stage : null }),
+      ...(b.current_stage !== undefined && (() => {
+        const VALID = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
+        if (!VALID.includes(b.current_stage)) return {};
+        const MAP = {'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica'};
+        return { current_stage: b.current_stage, development_stage: MAP[b.current_stage] || 'En Desarrollo' };
+      })()),
       ...(b.description         !== undefined && { description: b.description }),
       ...(b.clinical_rationale  !== undefined && { clinical_rationale: b.clinical_rationale }),
       ...(b.research_line_id    !== undefined && { research_line_id: b.research_line_id || null }),
