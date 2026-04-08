@@ -3385,20 +3385,6 @@ app.delete('/api/news/:id', authenticateToken, checkPermission('research_lines',
   }
 });
 
-// ===== 404 HANDLER =====
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
-});
-
-// ===== GLOBAL ERROR HANDLER =====
-app.use((err, req, res, next) => {
-  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} - Error:`, err.message);
-  if (err.message?.includes('CORS')) return res.status(403).json({ error: 'CORS error', message: 'Request blocked by CORS policy', your_origin: req.headers.origin, allowed_origins: allowedOrigins });
-  if (err.message?.includes('JWT') || err.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Authentication error', message: 'Invalid or expired authentication token' });
-  res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'An unexpected error occurred', timestamp: new Date().toISOString() });
-});
-
-
 // ============================================================================
 // ========================== ACADEMIC DEGREES ================================
 // ============================================================================
@@ -3550,6 +3536,21 @@ app.delete('/api/medical-staff/:staffId/certificates/:certId', authenticateToken
     res.status(500).json({ error: 'Failed to delete certificate', message: err.message });
   }
 });
+
+
+// ===== 404 HANDLER =====
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
+});
+
+// ===== GLOBAL ERROR HANDLER =====
+app.use((err, req, res, next) => {
+  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} - Error:`, err.message);
+  if (err.message?.includes('CORS')) return res.status(403).json({ error: 'CORS error', message: 'Request blocked by CORS policy', your_origin: req.headers.origin, allowed_origins: allowedOrigins });
+  if (err.message?.includes('JWT') || err.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Authentication error', message: 'Invalid or expired authentication token' });
+  res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'An unexpected error occurred', timestamp: new Date().toISOString() });
+});
+
 
 // ============ SERVER STARTUP ============
 const server = app.listen(PORT, '0.0.0.0', () => {
