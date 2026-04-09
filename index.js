@@ -454,6 +454,27 @@ const authenticateToken = (req, res, next) => {
 // B-SEC5: /uploads served only to authenticated users — must be after authenticateToken is defined
 app.use('/uploads', authenticateToken, express.static(path.join(__dirname, 'uploads')));
 
+// ============ MAINTENANCE MODE MIDDLEWARE ============
+// Reads maintenance_mode from DB on each /api request (cached 30s) and returns 503 if enabled.
+// Exempt: /api/auth/* (login must always work), /api/settings (so admin can disable it), GET /api/settings
+let _maintenanceCache = { value: false, at: 0 }
+const maintenanceCheck = async (req, res, next) => {
+  // Always allow auth + settings routes so admin can log in and toggle it off
+  if (req.path.startsWith('/api/auth') || req.path === '/api/settings') return next()
+  const now = Date.now()
+  if (now - _maintenanceCache.at > 30000) {
+    try {
+      const { data } = await supabase.from('system_settings').select('maintenance_mode').limit(1).single()
+      _maintenanceCache = { value: data?.maintenance_mode === true, at: now }
+    } catch { _maintenanceCache.at = now }
+  }
+  if (_maintenanceCache.value) {
+    return res.status(503).json({ error: 'maintenance', message: 'System is under scheduled maintenance. Please try again shortly.' })
+  }
+  next()
+}
+app.use('/api', maintenanceCheck)
+
 // ============ PERMISSION MIDDLEWARE ============
 const checkPermission = (resource, action) => {
   return (req, res, next) => {
