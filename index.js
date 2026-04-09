@@ -3538,6 +3538,117 @@ app.delete('/api/medical-staff/:staffId/certificates/:certId', authenticateToken
 });
 
 
+
+
+// ============================================================================
+// ======================== EMERGENCY CALLOUTS (DUTY LOG) =====================
+// ============================================================================
+
+// GET — list callouts, filterable by staff_id, month, year
+app.get('/api/emergency-callouts', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { staff_id, month, year, limit = 100 } = req.query
+    let query = supabase
+      .from('emergency_callouts')
+      .select('*, staff:medical_staff!emergency_callouts_staff_id_fkey(id,full_name,staff_type)', { count: 'exact' })
+      .order('called_at', { ascending: false })
+      .limit(Number(limit))
+    if (staff_id) query = query.eq('staff_id', staff_id)
+    if (year)  query = query.gte('called_at', `${year}-01-01`).lte('called_at', `${year}-12-31T23:59:59`)
+    if (month && year) {
+      const pad = String(month).padStart(2,'0')
+      const last = new Date(year, month, 0).getDate()
+      query = query.gte('called_at', `${year}-${pad}-01`).lte('called_at', `${year}-${pad}-${last}T23:59:59`)
+    }
+    const { data, error, count } = await query
+    if (error) throw error
+    res.json({ data: data || [], count: count || 0 })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch callouts', message: err.message })
+  }
+})
+
+// POST — log a new callout
+app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_schedule', 'create'), async (req, res) => {
+  try {
+    const { staff_id, called_at, end_time, reason_category, notes, time_type } = req.body
+    if (!staff_id) return res.status(400).json({ error: 'staff_id is required' })
+    if (!called_at) return res.status(400).json({ error: 'called_at is required' })
+    const { data, error } = await supabase
+      .from('emergency_callouts')
+      .insert([{
+        staff_id,
+        called_at,
+        end_time: end_time || null,
+        reason_category: reason_category || 'unspecified',
+        notes: notes || null,
+        time_type: time_type || 'night',
+        created_by: req.user.id,
+        created_at: new Date().toISOString()
+      }])
+      .select('*, staff:medical_staff!emergency_callouts_staff_id_fkey(id,full_name,staff_type)')
+      .single()
+    if (error) throw error
+    res.status(201).json(data)
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to log callout', message: err.message })
+  }
+})
+
+// PUT — edit a callout
+app.put('/api/emergency-callouts/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), async (req, res) => {
+  try {
+    const { called_at, end_time, reason_category, notes, time_type } = req.body
+    const { data, error } = await supabase
+      .from('emergency_callouts')
+      .update({ called_at, end_time, reason_category, notes, time_type, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id).select().single()
+    if (error) throw error
+    res.json(data)
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update callout', message: err.message })
+  }
+})
+
+// DELETE — remove a callout
+app.delete('/api/emergency-callouts/:id', authenticateToken, checkPermission('oncall_schedule', 'delete'), async (req, res) => {
+  try {
+    const { error } = await supabase.from('emergency_callouts').delete().eq('id', req.params.id)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete callout', message: err.message })
+  }
+})
+
+// GET summary — aggregated per staff for a period
+app.get('/api/emergency-callouts/summary', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { year = new Date().getFullYear(), month } = req.query
+    let from = `${year}-01-01`, to = `${year}-12-31T23:59:59`
+    if (month) {
+      const pad = String(month).padStart(2,'0')
+      const last = new Date(year, month, 0).getDate()
+      from = `${year}-${pad}-01`; to = `${year}-${pad}-${last}T23:59:59`
+    }
+    const { data, error } = await supabase
+      .from('emergency_callouts')
+      .select('staff_id, time_type, called_at')
+      .gte('called_at', from).lte('called_at', to)
+    if (error) throw error
+    // Aggregate per staff
+    const summary = {}
+    for (const row of (data || [])) {
+      if (!summary[row.staff_id]) summary[row.staff_id] = { staff_id: row.staff_id, total: 0, night: 0, weekend: 0, daytime: 0, holiday: 0 }
+      summary[row.staff_id].total++
+      summary[row.staff_id][row.time_type || 'night']++
+    }
+    res.json(Object.values(summary))
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch summary', message: err.message })
+  }
+})
+
 // ===== 404 HANDLER =====
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
