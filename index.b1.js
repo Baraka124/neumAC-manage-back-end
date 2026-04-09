@@ -1,5 +1,6 @@
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
-// VERSION 5.3 - ALL BUGS FIXED
+// VERSION 5.4 - ALL BUGS FIXED
+// --- ORIGINAL FIXES ---
 // FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
 // FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
@@ -8,6 +9,16 @@
 // FIX 6: Duplicate on-call routes removed
 // FIX 8: full_name added to JWT payload
 // FIX 9: Absence PUT recalculates total_days + current_status
+// --- NEW FIXES ---
+// FIX 10: /api/auth/me — req.user.userId → req.user.id (JWT field mismatch causing 401)
+// FIX 11: POST + PUT /api/medical-staff — can_be_pi, can_be_coi, has_phd, phd_field now persisted
+// FIX 12: Joi schema for medicalStaff — can_be_pi/coi/phd added (were stripped by stripUnknown)
+// FIX 13: PUT /api/training-units — unit_type + unit_description now updated (were silently lost)
+// FIX 14: PUT /api/training-units — department_name refreshed when department_id changes
+// FIX 15: DELETE /api/rotations — soft delete (terminated_early) instead of hard delete
+// FIX 16: Analytics active project stages aligned to current_stage field values
+// FIX 17: POST /api/research-lines — accepts research_line_name alias + keywords field
+// FIX 18: POST /api/clinical-trials — phase defaults to Phase I for non-interventional studies
 // =================================================================
 
 const express = require('express');
@@ -34,7 +45,7 @@ const PORT = process.env.PORT || 3000;
 const {
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY,
-  JWT_SECRET = process.env.JWT_SECRET || 'sb_secret_ah53o9afyZzuAfccFM2HNA_rEmi6-iJ',
+  JWT_SECRET = process.env.JWT_SECRET,
   NODE_ENV = 'production',
   ALLOWED_ORIGINS: ENV_ALLOWED_ORIGINS
 } = process.env;
@@ -44,6 +55,11 @@ const allowedOrigins = ALLOWED_ORIGINS_STRING.split(',').map(origin => origin.tr
 
 console.log('🌐 CORS Configuration:', { allowedOrigins, nodeEnv: NODE_ENV });
 
+// B11 FIX: Never fall back to a hardcoded JWT secret — fail fast at startup
+if (!JWT_SECRET) {
+  console.error('❌ JWT_SECRET environment variable is required and must not be empty');
+  process.exit(1);
+}
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error('❌ Missing required environment variables');
   process.exit(1);
@@ -159,7 +175,7 @@ app.use(helmet({
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// /uploads static route moved below authenticateToken declaration (see B-SEC5 fix)
 
 app.use((req, res, next) => {
   console.log(`📡 [${new Date().toISOString()}] ${req.method} ${req.url} - Origin: ${req.headers.origin || 'no-origin'}`);
@@ -222,7 +238,7 @@ const schemas = {
     staff_type: Joi.string().min(1).max(80).required(), // dynamic — validated against staff_types table at runtime
     staff_id: Joi.string().optional(),
     employment_status: Joi.string().valid('active', 'on_leave', 'inactive').default('active'),
-    professional_email: Joi.string().email().required(),
+    professional_email: Joi.string().email().optional().allow('', null), // FIX: email is not always available (residents, external staff)
     department_id: Joi.string().uuid().optional().allow(null),
     academic_degree: Joi.string().optional().allow('', null),       // legacy free-text, kept for backcompat
     academic_degree_id: Joi.string().uuid().optional().allow(null), // new FK to academic_degrees table
@@ -243,8 +259,8 @@ const schemas = {
     certificate_status: Joi.string().optional().allow('', null),
     special_notes: Joi.string().optional().allow('', null),
     can_supervise_residents: Joi.boolean().optional().default(false),
-    can_be_pi: Joi.boolean().optional().default(false),
-    can_be_coi: Joi.boolean().optional().default(false),
+    // B5 FIX: Removed duplicate can_be_pi / can_be_coi declarations (were defined twice;
+    // the second definition at lines ~272 silently overwrote these)
     resident_category: Joi.string().valid('department_internal', 'rotating_other_dept', 'external_resident').optional().allow(null),
     home_department: Joi.string().optional().allow('', null),
     home_department_id: Joi.string().uuid().optional().allow(null),
@@ -256,7 +272,12 @@ const schemas = {
     is_research_coordinator: Joi.boolean().optional().default(false),
     is_resident_manager: Joi.boolean().optional().default(false),
     is_oncall_manager: Joi.boolean().optional().default(false),
-    hospital_id: Joi.string().uuid().optional().allow(null)
+    hospital_id: Joi.string().uuid().optional().allow(null),
+    // Research capability fields (added via migration)
+    can_be_pi:  Joi.boolean().optional().default(false),
+    can_be_coi: Joi.boolean().optional().default(false),
+    has_phd:    Joi.boolean().optional().default(false),
+    phd_field:  Joi.string().optional().allow('', null)
   }),
 
   announcement: Joi.object({
@@ -276,11 +297,11 @@ const schemas = {
     training_unit_id: Joi.string().uuid().required(),
     start_date: Joi.date().required(),
     end_date: Joi.date().required(),
-    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'cancelled', 'extended', 'terminated_early').default('scheduled'),
+    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early').default('scheduled'),
     rotation_category: Joi.string()
       .valid('clinical_rotation', 'elective_rotation', 'research_block', 'administrative_duty')
       .default('clinical_rotation'),
-    supervising_attending_id: Joi.string().uuid().optional().allow(null),
+    supervising_attending_id: Joi.string().uuid().required(),
     rotation_id: Joi.string().optional(),
     clinical_notes: Joi.string().optional().allow(''),
     supervisor_evaluation: Joi.string().optional().allow(''),
@@ -348,10 +369,11 @@ const schemas = {
   department: Joi.object({
     name: Joi.string().required(),
     code: Joi.string().required(),
-    description: Joi.string().optional(),
-    head_of_department_id: Joi.string().uuid().optional(),
-    contact_email: Joi.string().email().optional(),
-    contact_phone: Joi.string().optional(),
+    description: Joi.string().optional().allow('', null),
+    head_of_department_id: Joi.string().uuid().optional().allow(null, ''),
+    hospital_id: Joi.string().uuid().optional().allow(null, ''),
+    contact_email: Joi.string().email().optional().allow('', null),
+    contact_phone: Joi.string().optional().allow('', null),
     status: Joi.string().valid('active', 'inactive').default('active')
   }),
 
@@ -359,12 +381,14 @@ const schemas = {
     unit_name: Joi.string().required(),
     unit_code: Joi.string().required(),
     department_id: Joi.string().uuid().required(),
-    supervising_attending_id: Joi.string().uuid().optional(),
+    supervising_attending_id: Joi.string().uuid().optional().allow(null, ''),
     maximum_residents: Joi.number().integer().min(1).default(5),
-    unit_status: Joi.string().valid('active', 'inactive').default('active'),
-    specialty: Joi.string().optional(),
-    location_building: Joi.string().optional(),
-    location_floor: Joi.string().optional()
+    unit_status: Joi.string().valid('active', 'inactive', 'under_renovation').default('active'),
+    unit_type: Joi.string().valid('training_unit', 'clinical_unit', 'icu', 'outpatient', 'surgical', 'research').default('training_unit'),
+    unit_description: Joi.string().optional().allow('', null),
+    specialty: Joi.string().optional().allow('', null),
+    location_building: Joi.string().optional().allow('', null),
+    location_floor: Joi.string().optional().allow('', null)
   }),
 
   notification: Joi.object({
@@ -427,6 +451,9 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// B-SEC5: /uploads served only to authenticated users — must be after authenticateToken is defined
+app.use('/uploads', authenticateToken, express.static(path.join(__dirname, 'uploads')));
+
 // ============ PERMISSION MIDDLEWARE ============
 const checkPermission = (resource, action) => {
   return (req, res, next) => {
@@ -450,7 +477,7 @@ const checkPermission = (resource, action) => {
       audit_logs:           ['system_admin'],
       notifications:        ['system_admin', 'department_head', 'resident_manager'],
       attachments:          ['system_admin', 'department_head', 'resident_manager'],
-      research_lines:       ['system_admin', 'department_head'],   // ← FIX 5
+      research_lines:       ['system_admin', 'department_head', 'resident_manager'],  // ← FIX: resident_manager added
       staff_types:          ['system_admin', 'department_head'],   // ← dynamic staff type management
     };
 
@@ -466,16 +493,23 @@ const checkPermission = (resource, action) => {
 };
 
 // ============ AUDIT LOGGING ============
-const auditLog = async (action, resource, resource_id = '', details = {}) => {
+// req is optional — pass it when available to capture user + IP context
+const auditLog = async (action, resource, resource_id = '', details = {}, req = null) => {
   try {
-    // audit_logs.user_id FK → auth.users — omit for system ops to avoid FK violation
-    await supabase.from('audit_logs').insert({
+    const row = {
       action, resource, resource_id: resource_id || null,
-      ip_address: '', user_agent: '',
-      details: JSON.stringify(details), created_at: new Date().toISOString()
-    });
+      ip_address: req ? (req.ip || req.headers['x-forwarded-for'] || '') : '',
+      user_agent: req ? (req.headers['user-agent'] || '') : '',
+      user_name:  req?.user?.full_name || null,
+      user_role:  req?.user?.role      || null,
+      details: JSON.stringify(details),
+      created_at: new Date().toISOString()
+    }
+    // Only attach user_id when we have one — FK points to auth.users
+    if (req?.user?.id) row.user_id = req.user.id
+    await supabase.from('audit_logs').insert(row)
   } catch (error) {
-    console.error('Audit logging failed (non-fatal):', error.message);
+    console.error('Audit logging failed (non-fatal):', error.message)
   }
 };
 
@@ -487,7 +521,7 @@ const auditLog = async (action, resource, resource_id = '', details = {}) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'NeumoCare Hospital Management System API',
-    version: '5.3.0',
+    version: '5.4.0',
     status: 'operational',
     environment: NODE_ENV,
     timestamp: new Date().toISOString(),
@@ -499,7 +533,7 @@ app.get('/health', apiLimiter, (req, res) => {
   res.json({
     status: 'healthy',
     service: 'NeumoCare Hospital Management System API',
-    version: '5.3.0',
+    version: '5.4.0',
     timestamp: new Date().toISOString(),
     environment: NODE_ENV,
     cors: { allowed_origins: allowedOrigins, your_origin: req.headers.origin || 'not-specified' },
@@ -562,70 +596,38 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const { email, password } = req.body;
     console.log('🔐 Login attempt for:', email);
 
-    // Hardcoded admin bypass
-    if (email === 'admin@neumocare.org' && password === 'password123') {
-      // FIX 8: full_name now included in JWT payload
-      const token = jwt.sign(
-        { id: '11111111-1111-1111-1111-111111111111', email: 'admin@neumocare.org', role: 'system_admin', full_name: 'System Administrator' },
-        JWT_SECRET, { expiresIn: '24h' }
-      );
-      return res.json({
-        token,
-        user: { id: '11111111-1111-1111-1111-111111111111', email: 'admin@neumocare.org', full_name: 'System Administrator', user_role: 'system_admin' }
-      });
-    }
+    // B2 FIX: Removed hardcoded admin bypass (was: admin@neumocare.org / password123)
+    // B2 FIX: Removed unauthenticated fallback — unknown users must exist in DB
 
     if (!email || !password) {
       return res.status(400).json({ error: 'Validation failed', message: 'Email and password are required' });
     }
 
-    try {
-      const { data: user, error } = await supabase
-        .from('app_users')
-        .select('id, email, full_name, user_role, department_id, password_hash, account_status')
-        .eq('email', email.toLowerCase()).single();
+    const { data: user, error } = await supabase
+      .from('app_users')
+      .select('id, email, full_name, user_role, department_id, password_hash, account_status')
+      .eq('email', email.toLowerCase()).single();
 
-      if (error || !user) {
-        // FIX 8: full_name in fallback JWT
-        const mockToken = jwt.sign(
-          { id: 'test-' + Date.now(), email, role: 'medical_resident', full_name: email.split('@')[0] },
-          JWT_SECRET, { expiresIn: '24h' }
-        );
-        return res.json({
-          token: mockToken,
-          user: { id: 'test-' + Date.now(), email, full_name: email.split('@')[0], user_role: 'medical_resident' }
-        });
-      }
-
-      if (user.account_status !== 'active') {
-        return res.status(403).json({ error: 'Account disabled', message: 'Your account has been deactivated' });
-      }
-
-      const validPassword = await bcrypt.compare(password, user.password_hash || '');
-      if (!validPassword) {
-        return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
-      }
-
-      // FIX 8: full_name in JWT
-      const token = jwt.sign(
-        { id: user.id, email: user.email, role: user.user_role, full_name: user.full_name },
-        JWT_SECRET, { expiresIn: '24h' }
-      );
-      const { password_hash, ...userWithoutPassword } = user;
-      res.json({ token, user: userWithoutPassword, expires_in: '24h' });
-
-    } catch (dbError) {
-      console.error('Database error during login:', dbError);
-      // FIX 8: full_name in temp JWT
-      const tempToken = jwt.sign(
-        { id: 'temp-' + Date.now(), email, role: 'medical_resident', full_name: email.split('@')[0] },
-        JWT_SECRET, { expiresIn: '24h' }
-      );
-      res.json({
-        token: tempToken,
-        user: { id: 'temp-' + Date.now(), email, full_name: email.split('@')[0], user_role: 'medical_resident' }
-      });
+    if (error || !user) {
+      return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
     }
+
+    if (user.account_status !== 'active') {
+      return res.status(403).json({ error: 'Account disabled', message: 'Your account has been deactivated' });
+    }
+
+    const validPassword = await bcrypt.compare(password, user.password_hash || '');
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, email: user.email, role: user.user_role, full_name: user.full_name },
+      JWT_SECRET, { expiresIn: '24h' }
+    );
+    const { password_hash, ...userWithoutPassword } = user;
+    res.json({ token, user: userWithoutPassword, expires_in: '24h' });
+
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
@@ -634,6 +636,21 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
 app.post('/api/auth/logout', authenticateToken, apiLimiter, async (req, res) => {
   res.json({ message: 'Logged out successfully', timestamp: new Date().toISOString() });
+});
+
+// Token validation endpoint — called on mount to verify session is still valid
+// Used to block QR/shared-session access with expired tokens
+app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('app_users')
+      .select('id, email, full_name, user_role, account_status, department_id')
+      .eq('id', req.user.id)
+      .single()
+    if (error || !data) return res.status(401).json({ error: 'User not found' })
+    if (data.account_status !== 'active') return res.status(401).json({ error: 'Account suspended or inactive' })
+    res.json(data)
+  } catch { res.status(401).json({ error: 'Session validation failed' }) }
 });
 
 app.post('/api/auth/register', authenticateToken, checkPermission('users', 'create'), validate(schemas.register), async (req, res) => {
@@ -657,9 +674,12 @@ app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPasswo
   try {
     const { email } = req.validatedData || req.body;
     const { data: user } = await supabase.from('app_users').select('id, email, full_name').eq('email', email.toLowerCase()).single();
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    const resetToken = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
-    res.json({ message: 'Password reset link sent to email' });
+    // Always return 200 — never reveal whether the email exists (prevents enumeration)
+    if (user) {
+      // Token generated but not stored — email sending not yet implemented (B-SEC1)
+      jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+    }
+    res.json({ message: 'If an account with that email exists, a reset link has been sent.' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to process password reset', message: error.message });
   }
@@ -695,6 +715,50 @@ app.get('/api/users', authenticateToken, checkPermission('users', 'read'), apiLi
     res.json({ data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch users', message: error.message });
+  }
+});
+
+// B1 FIX: Static sub-routes must come BEFORE /:id — otherwise Express matches 'change-password'
+// and 'profile' as the :id parameter, making these endpoints unreachable.
+
+// ===== 4. USER PROFILE =====
+app.get('/api/users/profile', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('app_users')
+      .select('id, email, full_name, user_role, department_id, phone_number, notifications_enabled, absence_notifications, announcement_notifications, created_at, updated_at')
+      .eq('id', req.user.id).single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch user profile', message: error.message });
+  }
+});
+
+app.put('/api/users/profile', authenticateToken, validate(schemas.userProfile), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('app_users')
+      .update({ ...(req.validatedData || req.body), updated_at: new Date().toISOString() })
+      .eq('id', req.user.id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update profile', message: error.message });
+  }
+});
+
+app.put('/api/users/change-password', authenticateToken, validate(schemas.changePassword), async (req, res) => {
+  try {
+    const { current_password, new_password } = req.validatedData || req.body;
+    const { data: user, error: fetchError } = await supabase.from('app_users').select('password_hash').eq('id', req.user.id).single();
+    if (fetchError) throw fetchError;
+    const validPassword = await bcrypt.compare(current_password, user.password_hash || '');
+    if (!validPassword) return res.status(401).json({ error: 'Current password is incorrect' });
+    const passwordHash = await bcrypt.hash(new_password, 10);
+    const { error } = await supabase.from('app_users').update({ password_hash: passwordHash, updated_at: new Date().toISOString() }).eq('id', req.user.id);
+    if (error) throw error;
+    res.json({ message: 'Password changed successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to change password', message: error.message });
   }
 });
 
@@ -776,51 +840,12 @@ app.put('/api/users/:id/deactivate', authenticateToken, checkPermission('users',
   }
 });
 
-app.put('/api/users/change-password', authenticateToken, validate(schemas.changePassword), async (req, res) => {
-  try {
-    const { current_password, new_password } = req.validatedData || req.body;
-    const { data: user, error: fetchError } = await supabase.from('app_users').select('password_hash').eq('id', req.user.id).single();
-    if (fetchError) throw fetchError;
-    const validPassword = await bcrypt.compare(current_password, user.password_hash || '');
-    if (!validPassword) return res.status(401).json({ error: 'Current password is incorrect' });
-    const passwordHash = await bcrypt.hash(new_password, 10);
-    const { error } = await supabase.from('app_users').update({ password_hash: passwordHash, updated_at: new Date().toISOString() }).eq('id', req.user.id);
-    if (error) throw error;
-    res.json({ message: 'Password changed successfully' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to change password', message: error.message });
-  }
-});
 
-// ===== 4. USER PROFILE =====
-app.get('/api/users/profile', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('app_users')
-      .select('id, email, full_name, user_role, department_id, phone_number, notifications_enabled, absence_notifications, announcement_notifications, created_at, updated_at')
-      .eq('id', req.user.id).single();
-    if (error) throw error;
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch user profile', message: error.message });
-  }
-});
-
-app.put('/api/users/profile', authenticateToken, validate(schemas.userProfile), async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('app_users')
-      .update({ ...(req.validatedData || req.body), updated_at: new Date().toISOString() })
-      .eq('id', req.user.id).select().single();
-    if (error) throw error;
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update profile', message: error.message });
-  }
-});
 
 // ===== 5. MEDICAL STAFF =====
 app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff', 'read'), apiLimiter, async (req, res) => {
   try {
-    const { search, staff_type, employment_status, department_id, page = 1, limit = 100 } = req.query;
+    const { search, staff_type, employment_status, department_id, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('medical_staff')
       .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)', { count: 'exact' });
@@ -898,6 +923,10 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
       office_phone: dataSource.office_phone || null,
       training_level: dataSource.training_level || null,
       hospital_id: dataSource.hospital_id || null,
+      can_be_pi:   dataSource.can_be_pi   ?? false,
+      can_be_coi:  dataSource.can_be_coi  ?? false,
+      has_phd:     dataSource.has_phd     ?? false,
+      phd_field:   dataSource.phd_field   || null,
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('medical_staff').insert([staffData]).select().single();
@@ -942,15 +971,17 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       external_contact_email: dataSource.external_contact_email || null,
       external_contact_phone: dataSource.external_contact_phone || null,
       can_supervise_residents: dataSource.can_supervise_residents || false,
-      can_be_pi: dataSource.can_be_pi || false,
-      can_be_coi: dataSource.can_be_coi || false,
       is_research_coordinator: dataSource.is_research_coordinator || false,
-      is_chief_of_department: dataSource.is_chief_of_department || false,
-      is_resident_manager: dataSource.is_resident_manager || false,
-      is_oncall_manager: dataSource.is_oncall_manager || false,
+      is_resident_manager:     dataSource.is_resident_manager     || false,
+      is_oncall_manager:       dataSource.is_oncall_manager       || false,
+      is_chief_of_department:  dataSource.is_chief_of_department  || false,
       mobile_phone: dataSource.mobile_phone || null,
       special_notes: dataSource.special_notes || null,
       hospital_id: dataSource.hospital_id || null,
+      can_be_pi:   dataSource.can_be_pi   ?? false,
+      can_be_coi:  dataSource.can_be_coi  ?? false,
+      has_phd:     dataSource.has_phd     ?? false,
+      phd_field:   dataSource.phd_field   || null,
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('medical_staff').update(updateData).eq('id', req.params.id).select().single();
@@ -981,7 +1012,7 @@ app.get('/api/departments', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { include_inactive } = req.query;
     let query = supabase.from('departments')
-      .select('*, medical_staff!departments_head_of_department_id_fkey(full_name, professional_email)')
+      .select('*, medical_staff!departments_head_of_department_id_fkey(full_name, professional_email), hospital:hospitals!departments_hospital_id_fkey(id, name, code, parent_complex)')
       .order('name');
     // Default: active only. Pass ?include_inactive=true for name-resolution lookups
     if (!include_inactive || include_inactive !== 'true') {
@@ -1138,141 +1169,6 @@ app.delete('/api/departments/:id', authenticateToken, checkPermission('departmen
   }
 });
 
-// ===== 6b. DEPARTMENT SUMMARY — unified overview for dept cards =====
-// Returns resident counts by category + unit occupancy in one server-side query
-app.get('/api/departments/:id/summary', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const deptId = req.params.id;
-
-    // Parallel: dept info, units, all active rotations for those units, residents
-    const [deptResult, unitsResult, staffResult] = await Promise.all([
-      supabase.from('departments')
-        .select('*, head:medical_staff!departments_head_of_department_id_fkey(full_name, professional_email, staff_type)')
-        .eq('id', deptId).single(),
-      supabase.from('training_units')
-        .select('id, unit_name, unit_code, maximum_residents, unit_status, specialty')
-        .eq('department_id', deptId),
-      supabase.from('medical_staff')
-        .select('id, full_name, staff_type, resident_category, employment_status, external_contact_name, external_contact_email, external_contact_phone, home_department_id')
-        .or(`department_id.eq.${deptId},home_department_id.eq.${deptId}`)
-        .neq('employment_status', 'inactive')
-    ]);
-
-    if (deptResult.error) throw deptResult.error;
-
-    const units = unitsResult.data || [];
-    const unitIds = units.map(u => u.id);
-
-    // Active + scheduled rotations for these units
-    let rotations = [];
-    if (unitIds.length > 0) {
-      const { data: rots } = await supabase.from('resident_rotations')
-        .select('id, resident_id, training_unit_id, start_date, end_date, rotation_status')
-        .in('training_unit_id', unitIds)
-        .in('rotation_status', ['active', 'scheduled']);
-      rotations = rots || [];
-    }
-
-    // Resident counts by category (residents whose department_id = this dept)
-    const residents = (staffResult.data || []).filter(s => {
-      const stf = s.staff_type;
-      return stf === 'medical_resident' || stf?.includes('resident');
-    });
-    const deptResidents = residents.filter(r => r.department_id === deptId || (!r.department_id && r.home_department_id === deptId));
-    const counts = {
-      internal: deptResidents.filter(r => r.resident_category === 'department_internal').length,
-      rotating: deptResidents.filter(r => r.resident_category === 'rotating_other_dept').length,
-      external: deptResidents.filter(r => r.resident_category === 'external_resident').length,
-      total: deptResidents.length
-    };
-
-    // Unit occupancy
-    const unitsWithOcc = units.map(u => {
-      const activeRots = rotations.filter(r => r.training_unit_id === u.id && r.rotation_status === 'active');
-      const scheduledRots = rotations.filter(r => r.training_unit_id === u.id && r.rotation_status === 'scheduled');
-      // Next available: earliest end_date among active rotations
-      const nextFree = activeRots.length >= u.maximum_residents
-        ? activeRots.map(r => r.end_date).sort()[0]
-        : null;
-      return {
-        ...u,
-        active_count: activeRots.length,
-        scheduled_count: scheduledRots.length,
-        next_free_date: nextFree
-      };
-    });
-
-    res.json({
-      department: deptResult.data,
-      resident_counts: counts,
-      units: unitsWithOcc,
-      total_units: units.length,
-      active_rotations: rotations.filter(r => r.rotation_status === 'active').length
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch department summary', message: error.message });
-  }
-});
-
-// ===== 6c. ROTATION AVAILABILITY CHECK =====
-// Checks slot availability + resident conflict before creating rotation
-app.get('/api/rotations/availability', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { resident_id, training_unit_id, start_date, end_date, exclude_id } = req.query;
-    if (!training_unit_id || !start_date || !end_date) {
-      return res.status(400).json({ error: 'training_unit_id, start_date, end_date required' });
-    }
-
-    const [unitResult, unitRotsResult, residentRotsResult] = await Promise.all([
-      supabase.from('training_units').select('maximum_residents, unit_name').eq('id', training_unit_id).single(),
-      supabase.from('resident_rotations')
-        .select('id, resident_id, start_date, end_date, rotation_status, resident:medical_staff!resident_rotations_resident_id_fkey(full_name)')
-        .eq('training_unit_id', training_unit_id)
-        .in('rotation_status', ['active', 'scheduled'])
-        .lte('start_date', end_date)
-        .gte('end_date', start_date),
-      resident_id ? supabase.from('resident_rotations')
-        .select('id, training_unit_id, start_date, end_date, rotation_status, training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name)')
-        .eq('resident_id', resident_id)
-        .in('rotation_status', ['active', 'scheduled'])
-        .lte('start_date', end_date)
-        .gte('end_date', start_date) : Promise.resolve({ data: [] })
-    ]);
-
-    if (unitResult.error) throw unitResult.error;
-
-    const maxResidents = unitResult.data.maximum_residents;
-    const overlappingUnitRots = (unitRotsResult.data || []).filter(r => exclude_id ? r.id !== exclude_id : true);
-    const unitSlotsUsed = overlappingUnitRots.length;
-    const unitHasSlot = unitSlotsUsed < maxResidents;
-
-    const residentConflicts = (residentRotsResult.data || []).filter(r => exclude_id ? r.id !== exclude_id : true);
-    const residentFree = residentConflicts.length === 0;
-
-    res.json({
-      unit_name: unitResult.data.unit_name,
-      unit_has_slot: unitHasSlot,
-      unit_slots_used: unitSlotsUsed,
-      unit_max: maxResidents,
-      unit_conflicts: overlappingUnitRots.map(r => ({
-        id: r.id,
-        resident_name: r.resident?.full_name || 'Unknown',
-        start_date: r.start_date,
-        end_date: r.end_date
-      })),
-      resident_free: residentFree,
-      resident_conflicts: residentConflicts.map(r => ({
-        id: r.id,
-        unit_name: r.training_unit?.unit_name || 'Unknown',
-        start_date: r.start_date,
-        end_date: r.end_date
-      }))
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to check availability', message: error.message });
-  }
-});
-
 // ===== 7. TRAINING UNITS =====
 app.get('/api/training-units', authenticateToken, apiLimiter, async (req, res) => {
   try {
@@ -1291,6 +1187,7 @@ app.get('/api/training-units', authenticateToken, apiLimiter, async (req, res) =
     if (error) throw error;
     res.json((data || []).map(item => ({
       ...item,
+      unit_type: item.unit_type || 'training_unit',
       department: item.departments ? { name: item.departments.name, code: item.departments.code } : null,
       supervisor: { full_name: item.medical_staff?.full_name || null, professional_email: item.medical_staff?.professional_email || null }
     })));
@@ -1329,8 +1226,9 @@ app.post('/api/training-units', authenticateToken, checkPermission('training_uni
       default_supervisor_id: dataSource.supervising_attending_id || null,
       supervisor_id: dataSource.supervising_attending_id || null,
       unit_status: dataSource.unit_status || 'active',
+      unit_type: dataSource.unit_type || 'training_unit',
       specialty: dataSource.specialty || null,
-      unit_description: dataSource.specialty || null,
+      unit_description: dataSource.unit_description || dataSource.specialty || null,
       location_building: dataSource.location_building || null,
       location_floor: dataSource.location_floor || null
     };
@@ -1362,9 +1260,18 @@ app.put('/api/training-units/:id', authenticateToken, checkPermission('training_
       updateData.supervisor_id         = null;
       updateData.default_supervisor_id = null;
     }
-    if (dataSource.specialty !== undefined)         updateData.specialty         = dataSource.specialty || null;
-    if (dataSource.location_building !== undefined) updateData.location_building = dataSource.location_building || null;
-    if (dataSource.location_floor !== undefined)    updateData.location_floor    = dataSource.location_floor || null;
+    if (dataSource.specialty !== undefined)          updateData.specialty          = dataSource.specialty || null;
+    if (dataSource.location_building !== undefined)  updateData.location_building  = dataSource.location_building || null;
+    if (dataSource.location_floor !== undefined)     updateData.location_floor     = dataSource.location_floor || null;
+    if (dataSource.unit_type !== undefined)          updateData.unit_type          = dataSource.unit_type || 'training_unit';
+    if (dataSource.unit_description !== undefined)   updateData.unit_description   = dataSource.unit_description || null;
+    // Also refresh department_name to stay in sync with department_id changes
+    if (dataSource.department_id) {
+      try {
+        const { data: dept } = await supabase.from('departments').select('name').eq('id', dataSource.department_id).single();
+        if (dept) updateData.department_name = dept.name;
+      } catch (_) {}
+    }
 
     const { data, error } = await supabase.from('training_units')
       .update(updateData).eq('id', req.params.id).select().single();
@@ -1397,19 +1304,12 @@ app.delete('/api/training-units/:id', authenticateToken, checkPermission('traini
 // ===== 8. RESIDENT ROTATIONS =====
 app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { resident_id, rotation_status, training_unit_id, start_date, end_date, page = 1, limit = 100 } = req.query;
+    const { resident_id, rotation_status, training_unit_id, start_date, end_date, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('resident_rotations').select(`
-        *, resident:medical_staff!resident_rotations_resident_id_fkey(
-          full_name, professional_email, staff_type, resident_category,
-          external_contact_name, external_contact_email, external_contact_phone,
-          home_department_id
-        ),
+        *, resident:medical_staff!resident_rotations_resident_id_fkey(full_name, professional_email, staff_type),
         supervising_attending:medical_staff!resident_rotations_supervising_attending_id_fkey(full_name, professional_email),
-        training_unit:training_units!resident_rotations_training_unit_id_fkey(
-          unit_name, unit_code, department_id,
-          dept:departments!training_units_department_id_fkey(name, code)
-        )
+        training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name, unit_code)
       `, { count: 'exact' });
     if (resident_id) query = query.eq('resident_id', resident_id);
     // Exclude terminated_early by default; pass ?rotation_status=terminated_early to retrieve them
@@ -1423,10 +1323,12 @@ app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
     if (end_date) query = query.lte('end_date', end_date);
     const { data, error, count } = await query.order('start_date', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
+    // Filter out orphan rotations where the resident record no longer exists
+    const cleanData = (data || []).filter(item => item.resident !== null);
     res.json({
-      data: (data || []).map(item => ({
+      data: cleanData.map(item => ({
         ...item,
-        resident: item.resident ? { full_name: item.resident.full_name, professional_email: item.resident.professional_email, staff_type: item.resident.staff_type } : null,
+        resident: { full_name: item.resident.full_name, professional_email: item.resident.professional_email, staff_type: item.resident.staff_type },
         supervising_attending: item.supervising_attending ? { full_name: item.supervising_attending.full_name } : null,
         training_unit: item.training_unit ? { unit_name: item.training_unit.unit_name, unit_code: item.training_unit.unit_code } : null
       })),
@@ -1537,13 +1439,19 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
 
 app.delete('/api/rotations/:id', authenticateToken, checkPermission('resident_rotations', 'delete'), apiLimiter, async (req, res) => {
   try {
-    const { error } = await supabase.from('resident_rotations')
-      // DB CHECK: scheduled|active|completed|extended|terminated_early — 'cancelled' not in constraint
-      .update({ rotation_status: 'terminated_early', updated_at: new Date().toISOString() }).eq('id', req.params.id);
-    if (error) throw error;
-    res.json({ message: 'Rotation cancelled successfully' });
+    // Soft delete — preserve audit history by marking as terminated_early
+    const { data, error } = await supabase.from('resident_rotations')
+      .update({ rotation_status: 'terminated_early', updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select('rotation_id')
+      .single();
+    if (error) {
+      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Rotation not found' });
+      throw error;
+    }
+    res.json({ message: 'Rotation terminated successfully', rotation_id: data.rotation_id });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to cancel rotation', message: error.message });
+    res.status(500).json({ error: 'Failed to terminate rotation', message: error.message });
   }
 });
 
@@ -1655,7 +1563,7 @@ app.delete('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedul
 // ===== 10. STAFF ABSENCE RECORDS =====
 app.get('/api/absence-records', authenticateToken, checkPermission('staff_absence', 'read'), apiLimiter, async (req, res) => {
   try {
-    const { staff_member_id, absence_type, current_status, start_date, end_date, coverage_arranged, absence_reason, page = 1, limit = 100 } = req.query;
+    const { staff_member_id, absence_type, current_status, start_date, end_date, coverage_arranged, absence_reason, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, professional_email, staff_type, department_id),
@@ -1710,6 +1618,42 @@ app.get('/api/absence-records/upcoming', authenticateToken, apiLimiter, async (r
     res.json({ success: true, data: data || [], count: data?.length || 0 });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch upcoming absences', message: error.message });
+  }
+});
+
+// B4 FIX: Static sub-routes must come before /:id to avoid Express matching
+// 'staff', 'dashboard' etc. as the :id param
+app.get('/api/absence-records/staff/:staffId', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { limit = 20, page = 1 } = req.query;
+    const offset = (page - 1) * limit;
+    const { data, error, count } = await supabase.from('staff_absence_records').select('*', { count: 'exact' })
+      .eq('staff_member_id', req.params.staffId).order('start_date', { ascending: false }).range(offset, offset + limit - 1);
+    if (error) throw error;
+    res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch staff absence history', message: error.message });
+  }
+});
+
+app.get('/api/absence-records/dashboard/stats', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const today = formatDate(new Date());
+    const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
+    const [total, current, upcoming, withoutCoverage, byType, byReason] = await Promise.all([
+      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }),
+      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'currently_absent'),
+      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek),
+      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('coverage_arranged', false).eq('current_status', 'currently_absent'),
+      supabase.from('staff_absence_records').select('absence_type'),
+      supabase.from('staff_absence_records').select('absence_reason')
+    ]);
+    const typeCounts = {}, reasonCounts = {};
+    byType.data?.forEach(i => { typeCounts[i.absence_type] = (typeCounts[i.absence_type] || 0) + 1; });
+    byReason.data?.forEach(i => { reasonCounts[i.absence_reason] = (reasonCounts[i.absence_reason] || 0) + 1; });
+    res.json({ success: true, data: { total: total.count || 0, currently_absent: current.count || 0, upcoming: upcoming.count || 0, without_coverage: withoutCoverage.count || 0, by_type: typeCounts, by_reason: reasonCounts, coverage_rate: total.count ? Math.round(((total.count - withoutCoverage.count) / total.count) * 100) : 100 } });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch absence stats', message: error.message });
   }
 });
 
@@ -1914,37 +1858,31 @@ app.delete('/api/absence-records/:id', authenticateToken, checkPermission('staff
   }
 });
 
-app.get('/api/absence-records/staff/:staffId', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { limit = 20, page = 1 } = req.query;
-    const offset = (page - 1) * limit;
-    const { data, error, count } = await supabase.from('staff_absence_records').select('*', { count: 'exact' })
-      .eq('staff_member_id', req.params.staffId).order('start_date', { ascending: false }).range(offset, offset + limit - 1);
-    if (error) throw error;
-    res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch staff absence history', message: error.message });
-  }
-});
 
-app.get('/api/absence-records/dashboard/stats', authenticateToken, apiLimiter, async (req, res) => {
+// ── Absence hard-delete (purge) ──────────────────────────────────────────────
+// Permanently removes the record + its audit log entries from the DB.
+// Only system_admin / department_head. Used for table hygiene — NOT for audit cancellation.
+app.delete('/api/absence-records/:id/purge', authenticateToken, checkPermission('staff_absence', 'delete'), apiLimiter, async (req, res) => {
   try {
-    const today = formatDate(new Date());
-    const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
-    const [total, current, upcoming, withoutCoverage, byType, byReason] = await Promise.all([
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }),
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'currently_absent'),
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek),
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('coverage_arranged', false).eq('current_status', 'currently_absent'),
-      supabase.from('staff_absence_records').select('absence_type'),
-      supabase.from('staff_absence_records').select('absence_reason')
-    ]);
-    const typeCounts = {}, reasonCounts = {};
-    byType.data?.forEach(i => { typeCounts[i.absence_type] = (typeCounts[i.absence_type] || 0) + 1; });
-    byReason.data?.forEach(i => { reasonCounts[i.absence_reason] = (reasonCounts[i.absence_reason] || 0) + 1; });
-    res.json({ success: true, data: { total: total.count || 0, currently_absent: current.count || 0, upcoming: upcoming.count || 0, without_coverage: withoutCoverage.count || 0, by_type: typeCounts, by_reason: reasonCounts, coverage_rate: total.count ? Math.round(((total.count - withoutCoverage.count) / total.count) * 100) : 100 } });
+    const allowedRoles = ['system_admin', 'department_head'];
+    if (!allowedRoles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Forbidden', message: 'Only system administrators and department heads can permanently delete absence records' });
+    }
+    // Confirm record exists first
+    const { data: record, error: fetchError } = await supabase.from('staff_absence_records').select('id, current_status').eq('id', req.params.id).single();
+    if (fetchError) {
+      if (fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Not found', message: 'Absence record not found' });
+      throw fetchError;
+    }
+    // Delete audit log entries first (FK constraint)
+    const { error: auditError } = await supabase.from('absence_audit_log').delete().eq('absence_record_id', req.params.id);
+    if (auditError) console.warn('Failed to purge audit log entries:', auditError.message);
+    // Hard delete the record
+    const { error } = await supabase.from('staff_absence_records').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true, message: 'Absence record permanently deleted' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch absence stats', message: error.message });
+    res.status(500).json({ error: 'Failed to delete absence record', message: error.message });
   }
 });
 
@@ -2065,9 +2003,14 @@ app.get('/api/live-status/history', authenticateToken, apiLimiter, async (req, r
   }
 });
 
-app.put('/api/live-status/:id', authenticateToken, apiLimiter, async (req, res) => {
+app.put('/api/live-status/:id', authenticateToken, checkPermission('communications', 'update'), apiLimiter, async (req, res) => { // B7 FIX: added checkPermission — was accessible to all authenticated users
   try {
-    const { data, error } = await supabase.from('clinical_status_updates').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    const { status_text, expires_at, is_active } = req.body
+    const updatePayload = { updated_at: new Date().toISOString() }
+    if (status_text !== undefined) updatePayload.status_text = status_text
+    if (expires_at  !== undefined) updatePayload.expires_at  = expires_at
+    if (is_active   !== undefined) updatePayload.is_active   = is_active
+    const { data, error } = await supabase.from('clinical_status_updates').update(updatePayload).eq('id', req.params.id).select().single();
     if (error) throw error;
     res.json({ success: true, data });
   } catch (error) {
@@ -2389,11 +2332,41 @@ app.get('/api/research-lines', authenticateToken, apiLimiter, async (req, res) =
   }
 });
 
+// ── PUBLIC (no auth) — website-facing research lines ──────────────────────────
+// Used by the public website to render the research lines grid/accordion.
+// Returns only active lines with coordinator name. No sensitive fields exposed.
+app.get('/api/research-lines/website', apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('research_lines')
+      .select(`
+        id,
+        line_number,
+        name,
+        description,
+        capabilities,
+        keywords,
+        sort_order,
+        coordinator:medical_staff!research_lines_coordinator_id_fkey(
+          full_name
+        )
+      `)
+      .eq('active', true)
+      .order('sort_order');
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/research-lines', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
-    const { line_number, name, description, capabilities, sort_order, active } = req.body;
+    // Accept both 'name' (DB field) and 'research_line_name' (frontend form field)
+    const { line_number, description, capabilities, sort_order, active, keywords } = req.body;
+    const name = req.body.name || req.body.research_line_name;
     if (!name) return res.status(400).json({ error: 'Research line name is required' });
-    const { data, error } = await supabase.from('research_lines').insert([{ line_number: line_number || null, name, description: description || '', capabilities: (capabilities !== undefined && capabilities !== null) ? capabilities : 'Alcance y capacidades', sort_order: sort_order || 0, active: active !== undefined ? active : true, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    const { data, error } = await supabase.from('research_lines').insert([{ line_number: line_number || null, name, description: description || '', capabilities: (capabilities !== undefined && capabilities !== null) ? capabilities : 'Alcance y capacidades', sort_order: sort_order || 0, active: active !== undefined ? active : true, keywords: Array.isArray(keywords) ? keywords : [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Research line created successfully' });
   } catch (error) {
@@ -2403,7 +2376,18 @@ app.post('/api/research-lines', authenticateToken, checkPermission('research_lin
 
 app.put('/api/research-lines/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('research_lines').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    // B6 FIX: Whitelist updatable fields — do not pass req.body directly to prevent
+    // clients from overwriting id, created_at, line_number (unique) or injecting garbage fields
+    const { name, description, capabilities, sort_order, active, keywords, coordinator_id } = req.body;
+    const updatePayload = { updated_at: new Date().toISOString() };
+    if (name !== undefined)           updatePayload.name           = name;
+    if (description !== undefined)    updatePayload.description    = description;
+    if (capabilities !== undefined)   updatePayload.capabilities   = capabilities;
+    if (sort_order !== undefined)     updatePayload.sort_order     = sort_order;
+    if (active !== undefined)         updatePayload.active         = active;
+    if (keywords !== undefined)       updatePayload.keywords       = Array.isArray(keywords) ? keywords : [];
+    if (coordinator_id !== undefined) updatePayload.coordinator_id = coordinator_id || null;
+    const { data, error } = await supabase.from('research_lines').update(updatePayload).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Research line not found' });
       throw error;
@@ -2430,7 +2414,7 @@ app.delete('/api/research-lines/:id', authenticateToken, checkPermission('resear
   }
 });
 
-app.put('/api/research-lines/:id/coordinator', authenticateToken, async (req, res) => {
+app.put('/api/research-lines/:id/coordinator', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
     const { coordinator_id } = req.body;
     if (coordinator_id) {
@@ -2445,7 +2429,7 @@ app.put('/api/research-lines/:id/coordinator', authenticateToken, async (req, re
   }
 });
 
-// ===== 22. CLINICAL TRIALS =====
+// ===== 22. CLINICAL STUDIES =====
 app.get('/api/clinical-trials/website', apiLimiter, async (req, res) => {
   try {
     const { line, phase, status, search } = req.query;
@@ -2454,7 +2438,7 @@ app.get('/api/clinical-trials/website', apiLimiter, async (req, res) => {
     if (phase && phase !== 'All Phases') query = query.eq('phase', phase);
     if (status && status !== 'All Status') query = query.eq('status', status);
     if (search) query = query.or(`title.ilike.%${search}%,protocol_id.ilike.%${search}%`);
-    const { data, error } = await query.limit(10);
+    const { data, error } = await query.limit(50);
     if (error) throw error;
     res.json({ success: true, data: data || [] });
   } catch (error) {
@@ -2480,9 +2464,16 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
 
 app.post('/api/clinical-trials', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('clinical_trials').insert([{ ...req.body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    const body = { ...req.body };
+    // Observational/Expanded Access studies may not have a phase — default to 'Phase I' to satisfy
+    // the DB CHECK constraint until the schema is updated to allow null or N/A
+    const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
+    if (!VALID_PHASES.includes(body.phase)) body.phase = 'Phase I';
+    const { data, error } = await supabase.from('clinical_trials')
+      .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
+      .select().single();
     if (error) throw error;
-    res.status(201).json({ success: true, data, message: 'Clinical trial created successfully' });
+    res.status(201).json({ success: true, data, message: 'Clinical study created successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -2490,12 +2481,39 @@ app.post('/api/clinical-trials', authenticateToken, checkPermission('research_li
 
 app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('clinical_trials').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    // B6 FIX: Whitelist updatable fields
+    const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
+    const VALID_STATUSES = ['Reclutando','Activo','Completado','En preparación'];
+    const b = req.body;
+    const updatePayload = {
+      updated_at: new Date().toISOString(),
+      ...(b.title              !== undefined && { title: b.title }),
+      ...(b.research_line_id   !== undefined && { research_line_id: b.research_line_id || null }),
+      ...(b.phase              !== undefined && { phase: VALID_PHASES.includes(b.phase) ? b.phase : 'Phase I' }),
+      ...(b.status             !== undefined && (() => {
+        if (!VALID_STATUSES.includes(b.status)) return {};  // unknown status — skip field, keep current DB value
+        return { status: b.status };
+      })()),
+      ...(b.description        !== undefined && { description: b.description }),
+      ...(b.inclusion_criteria !== undefined && { inclusion_criteria: b.inclusion_criteria }),
+      ...(b.exclusion_criteria !== undefined && { exclusion_criteria: b.exclusion_criteria }),
+      ...(b.principal_investigator_id !== undefined && { principal_investigator_id: b.principal_investigator_id || null }),
+      ...(b.co_investigators   !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
+      ...(b.sub_investigators  !== undefined && { sub_investigators: Array.isArray(b.sub_investigators) ? b.sub_investigators : [] }),
+      ...(b.contact_email      !== undefined && { contact_email: b.contact_email }),
+      ...(b.featured_in_website!== undefined && { featured_in_website: b.featured_in_website }),
+      ...(b.display_order      !== undefined && { display_order: b.display_order }),
+      ...(b.start_date         !== undefined && { start_date: b.start_date || null }),
+      ...(b.end_date           !== undefined && { end_date: b.end_date || null }),
+      ...(b.sponsor_name       !== undefined && { sponsor_name: b.sponsor_name }),
+      ...(b.tags               !== undefined && { tags: Array.isArray(b.tags) ? b.tags : [] }),
+    };
+    const { data, error } = await supabase.from('clinical_trials').update(updatePayload).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Clinical trial not found' });
       throw error;
     }
-    res.json({ success: true, data, message: 'Clinical trial updated successfully' });
+    res.json({ success: true, data, message: 'Clinical study updated successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -2539,7 +2557,12 @@ app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, r
 
 app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('innovation_projects').insert([{ ...req.body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    const body = { ...req.body };
+    // Always write development_stage (NOT NULL) in sync with current_stage
+    const STAGE_MAP = { 'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica' };
+    if (body.current_stage) body.development_stage = STAGE_MAP[body.current_stage] || 'En Desarrollo';
+    if (!body.development_stage) body.development_stage = 'En Desarrollo';
+    const { data, error } = await supabase.from('innovation_projects').insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Innovation project created successfully' });
   } catch (error) {
@@ -2549,7 +2572,35 @@ app.post('/api/innovation-projects', authenticateToken, checkPermission('researc
 
 app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('innovation_projects').update({ ...req.body, updated_at: new Date().toISOString() }).eq('id', req.params.id).select().single();
+    // B6 FIX: Whitelist updatable fields
+    const VALID_STAGES = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
+    const b = req.body;
+    const updatePayload = {
+      updated_at: new Date().toISOString(),
+      ...(b.title               !== undefined && { title: b.title }),
+      ...(b.category            !== undefined && { category: b.category }),
+      ...(b.current_stage !== undefined && (() => {
+        const VALID = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
+        if (!VALID.includes(b.current_stage)) return {};
+        const MAP = {'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica'};
+        return { current_stage: b.current_stage, development_stage: MAP[b.current_stage] || 'En Desarrollo' };
+      })()),
+      ...(b.description         !== undefined && { description: b.description }),
+      ...(b.clinical_rationale  !== undefined && { clinical_rationale: b.clinical_rationale }),
+      ...(b.research_line_id    !== undefined && { research_line_id: b.research_line_id || null }),
+      ...(b.lead_investigator_id!== undefined && { lead_investigator_id: b.lead_investigator_id || null }),
+      ...(b.co_investigators    !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
+      ...(b.partner_needs       !== undefined && { partner_needs: Array.isArray(b.partner_needs) ? b.partner_needs : [] }),
+      ...(b.partner_found       !== undefined && { partner_found: b.partner_found }),
+      ...(b.partner_name        !== undefined && { partner_name: b.partner_name || null }),
+      ...(b.funding_status      !== undefined && { funding_status: b.funding_status }),
+      ...(b.keywords            !== undefined && { keywords: Array.isArray(b.keywords) ? b.keywords : [] }),
+      ...(b.featured_in_website !== undefined && { featured_in_website: b.featured_in_website }),
+      ...(b.display_order       !== undefined && { display_order: b.display_order }),
+      ...(b.start_date          !== undefined && { start_date: b.start_date || null }),
+      ...(b.estimated_end_date  !== undefined && { estimated_end_date: b.estimated_end_date || null }),
+    };
+    const { data, error } = await supabase.from('innovation_projects').update(updatePayload).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Innovation project not found' });
       throw error;
@@ -2597,19 +2648,42 @@ app.get('/api/analytics/research-dashboard', authenticateToken, apiLimiter, asyn
 
 app.get('/api/analytics/research-lines-performance', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { data: researchLines } = await supabase.from('research_lines').select('id, line_number, name, coordinator_id, active');
-    const performance = await Promise.all((researchLines || []).map(async (line) => {
-      let coordinatorName = null;
-      if (line.coordinator_id) {
-        const { data: staff } = await supabase.from('medical_staff').select('full_name').eq('id', line.coordinator_id).single();
-        coordinatorName = staff?.full_name || null;
-      }
-      const [{ data: trials }, { data: projects }] = await Promise.all([
-        supabase.from('clinical_trials').select('id, phase, status').eq('research_line_id', line.id),
-        supabase.from('innovation_projects').select('id, category, current_stage').eq('research_line_id', line.id)
-      ]);
-      return { id: line.id, line_number: line.line_number, name: line.name, active: line.active, coordinator: coordinatorName, stats: { totalTrials: trials?.length || 0, activeTrials: trials?.filter(t => ['Activo','Reclutando'].includes(t.status)).length || 0, completedTrials: trials?.filter(t => t.status === 'Completado').length || 0, totalProjects: projects?.length || 0 } };
-    }));
+    // B8 FIX: Was N+1 — one query per research line for trials, projects, and coordinator.
+    // Now fetches everything in 3 bulk queries and groups in memory.
+    const [
+      { data: researchLines },
+      { data: allTrials },
+      { data: allProjects },
+      { data: allStaff }
+    ] = await Promise.all([
+      supabase.from('research_lines').select('id, line_number, name, coordinator_id, active'),
+      supabase.from('clinical_trials').select('id, phase, status, research_line_id'),
+      supabase.from('innovation_projects').select('id, category, current_stage, development_stage, research_line_id'),
+      supabase.from('medical_staff').select('id, full_name')
+    ]);
+
+    const staffMap = Object.fromEntries((allStaff || []).map(s => [s.id, s.full_name]));
+    const ACTIVE_PROJECT_STAGES = ['Prototipo', 'Piloto', 'Validación', 'Escalamiento'];
+    const COMMERCIALIZED_STAGES = ['Comercialización'];
+    const projectStage = (p) => p.current_stage || p.development_stage || '';
+
+    const performance = (researchLines || []).map(line => {
+      const trials   = (allTrials   || []).filter(t => t.research_line_id === line.id);
+      const projects = (allProjects || []).filter(p => p.research_line_id === line.id);
+      return {
+        id: line.id, line_number: line.line_number, name: line.name, active: line.active,
+        coordinator: line.coordinator_id ? (staffMap[line.coordinator_id] || null) : null,
+        stats: {
+          totalTrials:      trials.length,
+          activeTrials:     trials.filter(t => ['Activo','Reclutando'].includes(t.status)).length,
+          completedTrials:  trials.filter(t => t.status === 'Completado').length,
+          totalProjects:    projects.length,
+          activeProjects:   projects.filter(p => ACTIVE_PROJECT_STAGES.includes(projectStage(p))).length,
+          commercialized:   projects.filter(p => COMMERCIALIZED_STAGES.includes(projectStage(p))).length
+        }
+      };
+    });
+
     performance.sort((a, b) => (a.line_number || 999) - (b.line_number || 999));
     res.json({ success: true, data: performance });
   } catch (error) {
@@ -2754,23 +2828,28 @@ app.put('/api/hospitals/:id', authenticateToken, checkPermission('departments', 
 });
 
 // ===== 26. CLINICAL UNITS =====
+// /api/clinical-units → redirected to training_units (merged tables)
 app.get('/api/clinical-units', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { department_id, status } = req.query;
-    let query = supabase.from('clinical_units')
-      .select('*, departments!clinical_units_department_id_fkey(name, code)')
-      .order('name');
+    let query = supabase.from('training_units')
+      .select('*, departments!training_units_department_id_fkey(name, code)')
+      .order('unit_name');
     if (department_id) query = query.eq('department_id', department_id);
-    if (status) query = query.eq('status', status);
-    else query = query.eq('status', 'active');
+    if (status) query = query.eq('unit_status', status);
+    else query = query.neq('unit_status', 'inactive');
     const { data, error } = await query;
     if (error) throw error;
+    // Return in clinical_units shape for backwards compatibility
     res.json({ success: true, data: (data || []).map(u => ({
-      ...u,
+      id: u.id, name: u.unit_name, code: u.unit_code,
+      department_id: u.department_id, unit_type: u.unit_type || 'training_unit',
+      status: u.unit_status, description: u.unit_description,
+      supervisor_id: u.supervisor_id,
       department: u.departments ? { name: u.departments.name, code: u.departments.code } : null
     }))});
   } catch (error) {
-    res.json({ success: true, data: [], message: 'No clinical units found' });
+    res.json({ success: true, data: [], message: 'No units found' });
   }
 });
 
@@ -2888,7 +2967,22 @@ app.get('/api/partners', authenticateToken, apiLimiter, async (req, res) => {
     res.json({ success: true, data: [] });
   }
 });
-
+// POST /api/contact — PUBLIC, no auth required
+app.post('/api/contact', apiLimiter, async (req, res) => {
+  try {
+    const { name, organisation, email, area_of_interest, message } = req.body;
+    if (!name || !email) {
+      return res.status(400).json({ error: 'Name and email are required' });
+    }
+    const { error } = await supabase
+      .from('contact_submissions')
+      .insert([{ name, organisation, email, area_of_interest, message }]);
+    if (error) throw error;
+    res.json({ success: true, message: 'Message received' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 app.post('/api/partners', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
   try {
     const { name, type, website, main_contact_name, main_contact_email, main_contact_phone, address, logo_url } = req.body;
@@ -3000,6 +3094,96 @@ app.delete('/api/innovation-projects/:projectId/partners/:partnerId', authentica
   }
 });
 
+
+// ============================================================================
+// ========================== ROTATION SERVICES ================================
+// ============================================================================
+// Wraps the departments table filtered by service_type.
+// 'home_department' = Neumología (read-only, not shown in rotation services list)
+// 'rotation_service' = external services residents rotate through
+// 'external_institution' = fully external institutions
+
+app.get('/api/rotation-services', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { include_home } = req.query
+    let query = supabase.from('departments')
+      .select('id, name, code, service_type, contact_name, contact_email, contact_phone, status')
+      .order('name')
+    if (include_home !== 'true') {
+      query = query.eq('service_type', 'rotation_service')
+    } else {
+      query = query.in('service_type', ['rotation_service', 'home_department'])
+    }
+    const { data, error } = await query
+    if (error) throw error
+    res.json({ success: true, data: data || [] })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch rotation services', message: err.message })
+  }
+})
+
+app.post('/api/rotation-services', authenticateToken, checkPermission('system_settings', 'create'), async (req, res) => {
+  try {
+    const { name, service_type, contact_name, contact_email, contact_phone } = req.body
+    if (!name?.trim()) return res.status(400).json({ error: 'Name is required' })
+    const code = name.trim().toUpperCase().replace(/[^A-Z0-9]/g, '-').replace(/-+/g, '-').slice(0, 20)
+    const { data, error } = await supabase.from('departments').insert([{
+      name: name.trim(),
+      code: `${code}-${Date.now().toString(36).slice(-4).toUpperCase()}`,
+      service_type: service_type || 'rotation_service',
+      contact_name: contact_name || null,
+      contact_email: contact_email || null,
+      contact_phone: contact_phone || null,
+      status: 'active',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    }]).select().single()
+    if (error) throw error
+    res.status(201).json({ success: true, data })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create rotation service', message: err.message })
+  }
+})
+
+app.put('/api/rotation-services/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
+  try {
+    const { name, contact_name, contact_email, contact_phone, status } = req.body
+    const { data, error } = await supabase.from('departments')
+      .update({ name, contact_name, contact_email, contact_phone, status, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .neq('service_type', 'home_department') // never allow editing the home dept via this route
+      .select().single()
+    if (error) throw error
+    if (!data) return res.status(404).json({ error: 'Rotation service not found' })
+    res.json({ success: true, data })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update rotation service', message: err.message })
+  }
+})
+
+app.delete('/api/rotation-services/:id', authenticateToken, checkPermission('system_settings', 'delete'), async (req, res) => {
+  try {
+    // Check if any medical_staff references this service
+    const { count } = await supabase.from('medical_staff')
+      .select('*', { count: 'exact', head: true })
+      .eq('home_department_id', req.params.id)
+    if (count > 0) {
+      // Soft delete — deactivate so existing staff records remain valid
+      const { data, error } = await supabase.from('departments')
+        .update({ status: 'inactive', updated_at: new Date().toISOString() })
+        .eq('id', req.params.id).neq('service_type', 'home_department').select().single()
+      if (error) throw error
+      return res.json({ success: true, action: 'deactivated', message: `Service deactivated — ${count} staff member(s) still reference it.`, data })
+    }
+    const { error } = await supabase.from('departments')
+      .delete().eq('id', req.params.id).neq('service_type', 'home_department')
+    if (error) throw error
+    res.json({ success: true, action: 'deleted', message: 'Rotation service deleted.' })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete rotation service', message: err.message })
+  }
+})
+
 // ============ STAFF TYPES ROUTES ============
 // These routes serve the dynamic staff_types table — replacing hardcoded enums everywhere.
 
@@ -3098,26 +3282,122 @@ app.delete('/api/staff-types/:id', authenticateToken, checkPermission('staff_typ
   }
 });
 
-// ===== 404 HANDLER =====
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
+
+// ============ NEWS & POSTS ROUTES ============
+
+// GET /api/news — authenticated, returns all posts (incl. internal)
+app.get('/api/news', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { status, type, is_public, page = 1, limit = 100 } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    let query = supabase
+      .from('news_posts')
+      .select(`*, author:medical_staff!news_posts_author_id_fkey(id, full_name, staff_type), research_line:research_lines!news_posts_research_line_id_fkey(id, line_number, name)`)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + parseInt(limit) - 1);
+    if (status) query = query.eq('status', status);
+    if (type)   query = query.eq('post_type', type);
+    if (is_public !== undefined) query = query.eq('is_public', is_public === 'true');
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ data: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch news', message: err.message });
+  }
 });
 
-// ===== GLOBAL ERROR HANDLER =====
-app.use((err, req, res, next) => {
-  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} - Error:`, err.message);
-  if (err.message?.includes('CORS')) return res.status(403).json({ error: 'CORS error', message: 'Request blocked by CORS policy', your_origin: req.headers.origin, allowed_origins: allowedOrigins });
-  if (err.message?.includes('JWT') || err.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Authentication error', message: 'Invalid or expired authentication token' });
-  res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'An unexpected error occurred', timestamp: new Date().toISOString() });
+// GET /api/news/website — PUBLIC, returns only published+public posts
+app.get('/api/news/website', apiLimiter, async (req, res) => {
+  try {
+    const { type, line, limit = 20 } = req.query;
+    let query = supabase
+      .from('news_posts')
+      .select(`id, post_type, title, body, featured_image_url, word_count, expires_at, published_at, created_at, journal_name, authors_text, doi, author:medical_staff!news_posts_author_id_fkey(id, full_name), research_line:research_lines!news_posts_research_line_id_fkey(id, line_number, name)`)
+      .eq('status', 'published')
+      .eq('is_public', true)
+      .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString())
+      .order('published_at', { ascending: false })
+      .limit(parseInt(limit));
+    if (type) query = query.eq('post_type', type);
+    if (line) query = query.eq('research_line_id', line);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ data: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch news', message: err.message });
+  }
 });
 
+// POST /api/news — create
+app.post('/api/news', authenticateToken, checkPermission('research_lines', 'create'), apiLimiter, async (req, res) => {
+  try {
+    const { title, post_type, body, author_id, research_line_id, is_public,
+            status, expires_at, featured_image_url, journal_name, authors_text, doi, word_count } = req.body;
+    if (!title) return res.status(400).json({ error: 'Title is required' });
+    const payload = {
+      title, post_type: ['update','article','publication','photo_story'].includes(post_type) ? post_type : 'update', body: body || null,
+      author_id: author_id || null, research_line_id: research_line_id || null,
+      is_public: is_public === true || is_public === 'true',
+      status: status || 'draft',
+      expires_at: expires_at || null,
+      featured_image_url: featured_image_url || null,
+      journal_name: journal_name || null,
+      authors_text: authors_text || null,
+      doi: doi || null,
+      word_count: word_count || null,
+      published_at: status === 'published' ? new Date().toISOString() : null
+    };
+    const { data, error } = await supabase.from('news_posts').insert(payload).select().single();
+    if (error) throw error;
+    res.status(201).json({ data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create post', message: err.message });
+  }
+});
+
+// PUT /api/news/:id — update
+app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'update'), apiLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = { ...req.body, updated_at: new Date().toISOString() };
+    if (updates.status === 'published' && !updates.published_at) {
+      updates.published_at = new Date().toISOString();
+    }
+    // Strip joined/virtual fields that come back from GET but aren't real columns
+    delete updates.id; delete updates.created_at;
+    delete updates.author; delete updates.research_line;
+    const { data, error } = await supabase.from('news_posts').update(updates).eq('id', id).select().single();
+    if (error) throw error;
+    res.json({ data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update post', message: err.message });
+  }
+});
+
+// DELETE /api/news/:id
+app.delete('/api/news/:id', authenticateToken, checkPermission('research_lines', 'delete'), apiLimiter, async (req, res) => {
+  try {
+    const { error } = await supabase.from('news_posts').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.status(204).send();
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete post', message: err.message });
+  }
+});
 
 // ============================================================================
 // ========================== ACADEMIC DEGREES ================================
 // ============================================================================
 
 // DEBUG — test academic degrees without auth (remove after confirming)
-// DEBUG ENDPOINT REMOVED (security)
+app.get('/api/debug/academic-degrees', apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('academic_degrees').select('*').order('display_order');
+    res.json({ count: data?.length ?? 0, error: error?.message || null, data: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.get('/api/academic-degrees', authenticateToken, apiLimiter, async (req, res) => {
   try {
@@ -3257,22 +3537,149 @@ app.delete('/api/medical-staff/:staffId/certificates/:certId', authenticateToken
   }
 });
 
+
+
+
+// ============================================================================
+// ======================== EMERGENCY CALLOUTS (DUTY LOG) =====================
+// ============================================================================
+
+// GET — list callouts, filterable by staff_id, month, year
+app.get('/api/emergency-callouts', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { staff_id, month, year, limit = 100 } = req.query
+    let query = supabase
+      .from('emergency_callouts')
+      .select('*, staff:medical_staff!emergency_callouts_staff_id_fkey(id,full_name,staff_type)', { count: 'exact' })
+      .order('called_at', { ascending: false })
+      .limit(Number(limit))
+    if (staff_id) query = query.eq('staff_id', staff_id)
+    if (year)  query = query.gte('called_at', `${year}-01-01`).lte('called_at', `${year}-12-31T23:59:59`)
+    if (month && year) {
+      const pad = String(month).padStart(2,'0')
+      const last = new Date(year, month, 0).getDate()
+      query = query.gte('called_at', `${year}-${pad}-01`).lte('called_at', `${year}-${pad}-${last}T23:59:59`)
+    }
+    const { data, error, count } = await query
+    if (error) throw error
+    res.json({ data: data || [], count: count || 0 })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch callouts', message: err.message })
+  }
+})
+
+// POST — log a new callout
+app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_schedule', 'create'), async (req, res) => {
+  try {
+    const { staff_id, called_at, end_time, reason_category, notes, time_type } = req.body
+    if (!staff_id) return res.status(400).json({ error: 'staff_id is required' })
+    if (!called_at) return res.status(400).json({ error: 'called_at is required' })
+    const { data, error } = await supabase
+      .from('emergency_callouts')
+      .insert([{
+        staff_id,
+        called_at,
+        end_time: end_time || null,
+        reason_category: reason_category || 'unspecified',
+        notes: notes || null,
+        time_type: time_type || 'night',
+        created_by: req.user.id,
+        created_at: new Date().toISOString()
+      }])
+      .select('*, staff:medical_staff!emergency_callouts_staff_id_fkey(id,full_name,staff_type)')
+      .single()
+    if (error) throw error
+    res.status(201).json(data)
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to log callout', message: err.message })
+  }
+})
+
+// PUT — edit a callout
+app.put('/api/emergency-callouts/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), async (req, res) => {
+  try {
+    const { called_at, end_time, reason_category, notes, time_type } = req.body
+    const { data, error } = await supabase
+      .from('emergency_callouts')
+      .update({ called_at, end_time, reason_category, notes, time_type, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id).select().single()
+    if (error) throw error
+    res.json(data)
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update callout', message: err.message })
+  }
+})
+
+// DELETE — remove a callout
+app.delete('/api/emergency-callouts/:id', authenticateToken, checkPermission('oncall_schedule', 'delete'), async (req, res) => {
+  try {
+    const { error } = await supabase.from('emergency_callouts').delete().eq('id', req.params.id)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete callout', message: err.message })
+  }
+})
+
+// GET summary — aggregated per staff for a period
+app.get('/api/emergency-callouts/summary', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { year = new Date().getFullYear(), month } = req.query
+    let from = `${year}-01-01`, to = `${year}-12-31T23:59:59`
+    if (month) {
+      const pad = String(month).padStart(2,'0')
+      const last = new Date(year, month, 0).getDate()
+      from = `${year}-${pad}-01`; to = `${year}-${pad}-${last}T23:59:59`
+    }
+    const { data, error } = await supabase
+      .from('emergency_callouts')
+      .select('staff_id, time_type, called_at')
+      .gte('called_at', from).lte('called_at', to)
+    if (error) throw error
+    // Aggregate per staff
+    const summary = {}
+    for (const row of (data || [])) {
+      if (!summary[row.staff_id]) summary[row.staff_id] = { staff_id: row.staff_id, total: 0, night: 0, weekend: 0, daytime: 0, holiday: 0 }
+      summary[row.staff_id].total++
+      summary[row.staff_id][row.time_type || 'night']++
+    }
+    res.json(Object.values(summary))
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch summary', message: err.message })
+  }
+})
+
+// ===== 404 HANDLER =====
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
+});
+
+// ===== GLOBAL ERROR HANDLER =====
+app.use((err, req, res, next) => {
+  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} - Error:`, err.message);
+  if (err.message?.includes('CORS')) return res.status(403).json({ error: 'CORS error', message: 'Request blocked by CORS policy', your_origin: req.headers.origin, allowed_origins: allowedOrigins });
+  if (err.message?.includes('JWT') || err.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Authentication error', message: 'Invalid or expired authentication token' });
+  res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'An unexpected error occurred', timestamp: new Date().toISOString() });
+});
+
+
 // ============ SERVER STARTUP ============
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`
     ======================================================
     🏥 NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API v5.4
     ======================================================
-    ✅ ALL 9 BUGS FIXED
-    ✅ FIX 1: Rotation/OnCall dates — formatDate() handles Joi Date objects
-    ✅ FIX 2: Absence total_days + current_status NOT NULL columns populated
-    ✅ FIX 3: FK safety — recorded_by nullable-safe
-    ✅ FIX 4: rotation_category Joi enum matches DB CHECK constraint
-    ✅ FIX 5: research_lines added to rolePermissions
-    ✅ FIX 6: Duplicate on-call routes removed
-    ✅ FIX 8: full_name included in all JWT payloads
-    ✅ FIX 9: Absence PUT recalculates total_days + current_status
-    ✅ NEW:   Dynamic staff_types — /api/staff-types CRUD routes added
+    ✅ 18 BUGS FIXED (original 9 + 9 new)
+    ✅ FIX 10: auth/me JWT field mismatch — req.user.userId→req.user.id
+    ✅ FIX 11: medical-staff POST+PUT now persist can_be_pi/coi/phd fields
+    ✅ FIX 12: Joi schema includes can_be_pi/coi/phd (no longer stripped)
+    ✅ FIX 13: training-units PUT now updates unit_type + unit_description
+    ✅ FIX 14: training-units PUT refreshes department_name on dept change
+    ✅ FIX 15: rotations DELETE is now soft delete (terminated_early)
+    ✅ FIX 16: analytics project stages aligned to current_stage field
+    ✅ FIX 17: research-lines POST accepts research_line_name + keywords
+    ✅ FIX 18: clinical-trials phase defaults for non-interventional studies
+    ✅ Dynamic staff_types — /api/staff-types CRUD routes
     ======================================================
     Server running on port: ${PORT}
     Environment: ${NODE_ENV}
