@@ -182,6 +182,37 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Maintenance mode middleware ──
+let _maintenanceMode = false;
+let _maintenanceLastCheck = 0;
+const MAINTENANCE_CACHE_MS = 60000;
+
+async function checkMaintenanceMode() {
+  if (Date.now() - _maintenanceLastCheck < MAINTENANCE_CACHE_MS) return _maintenanceMode;
+  try {
+    const { data } = await supabase.from('system_settings').select('maintenance_mode').limit(1).single();
+    _maintenanceMode = data?.maintenance_mode === true;
+    _maintenanceLastCheck = Date.now();
+  } catch { /* don't block on DB errors */ }
+  return _maintenanceMode;
+}
+
+app.use(async (req, res, next) => {
+  const bypass = ['/health', '/api/auth/login', '/api/auth/logout'];
+  if (bypass.some(p => req.path.startsWith(p))) return next();
+  const inMaintenance = await checkMaintenanceMode();
+  if (!inMaintenance) return next();
+  // System admins bypass maintenance
+  const token = req.headers.authorization?.split(' ')[1];
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      if (decoded?.role === 'system_admin') return next();
+    } catch {}
+  }
+  res.status(503).json({ error: 'maintenance', message: 'The system is currently under maintenance. Please try again shortly.' });
+});
+
 // ============ UTILITY FUNCTIONS ============
 const generateId = (prefix) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 9)}`;
 
@@ -3600,7 +3631,7 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
       .insert([{
         staff_id,
         called_at,
-        end_time: end_time || null,
+        end_time: end_time || null,     
         reason_category: reason_category || 'unspecified',
         notes: notes || null,
         time_type: time_type || 'night',
