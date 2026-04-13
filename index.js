@@ -3631,7 +3631,7 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
       .insert([{
         staff_id,
         called_at,
-        end_time: end_time || null,     
+        end_time: end_time || null,
         reason_category: reason_category || 'unspecified',
         notes: notes || null,
         time_type: time_type || 'night',
