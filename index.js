@@ -2412,7 +2412,7 @@ app.get('/api/research-lines/website', apiLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/research-lines', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
+app.post('/api/research-lines', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.researchLine), async (req, res) => {
   try {
     // Accept both 'name' (DB field) and 'research_line_name' (frontend form field)
     const { line_number, description, capabilities, sort_order, active, keywords } = req.body;
@@ -2426,7 +2426,7 @@ app.post('/api/research-lines', authenticateToken, checkPermission('research_lin
   }
 });
 
-app.put('/api/research-lines/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
+app.put('/api/research-lines/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.researchLine), async (req, res) => {
   try {
     // B6 FIX: Whitelist updatable fields — do not pass req.body directly to prevent
     // clients from overwriting id, created_at, line_number (unique) or injecting garbage fields
@@ -2514,7 +2514,7 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
   }
 });
 
-app.post('/api/clinical-trials', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
+app.post('/api/clinical-trials', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.clinicalTrial), async (req, res) => {
   try {
     const body = { ...req.body };
     // Observational/Expanded Access studies may not have a phase — default to 'Phase I' to satisfy
@@ -2531,7 +2531,7 @@ app.post('/api/clinical-trials', authenticateToken, checkPermission('research_li
   }
 });
 
-app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
+app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.clinicalTrial), async (req, res) => {
   try {
     // B6 FIX: Whitelist updatable fields
     const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
@@ -2607,7 +2607,7 @@ app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, r
   }
 });
 
-app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
+app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.innovationProject), async (req, res) => {
   try {
     const body = { ...req.body };
     // Always write development_stage (NOT NULL) in sync with current_stage
@@ -2622,7 +2622,7 @@ app.post('/api/innovation-projects', authenticateToken, checkPermission('researc
   }
 });
 
-app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
+app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.innovationProject), async (req, res) => {
   try {
     // B6 FIX: Whitelist updatable fields
     const VALID_STAGES = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
@@ -3174,7 +3174,7 @@ app.get('/api/rotation-services', authenticateToken, apiLimiter, async (req, res
   }
 })
 
-app.post('/api/rotation-services', authenticateToken, checkPermission('system_settings', 'create'), async (req, res) => {
+app.post('/api/rotation-services', authenticateToken, checkPermission('system_settings', 'create'), validate(schemas.rotationService), async (req, res) => {
   try {
     const { name, service_type, contact_name, contact_email, contact_phone } = req.body
     if (!name?.trim()) return res.status(400).json({ error: 'Name is required' })
@@ -3255,7 +3255,7 @@ app.get('/api/staff-types', authenticateToken, apiLimiter, async (req, res) => {
 });
 
 // POST /api/staff-types — create a new staff type (admin / dept head only)
-app.post('/api/staff-types', authenticateToken, checkPermission('staff_types', 'create'), async (req, res) => {
+app.post('/api/staff-types', authenticateToken, checkPermission('staff_types', 'create'), validate(schemas.staffType), async (req, res) => {
   try {
     const schema = Joi.object({
       type_key:        Joi.string().min(2).max(60).pattern(/^[a-z0-9_]+$/).required()
@@ -3381,7 +3381,7 @@ app.get('/api/news/website', apiLimiter, async (req, res) => {
 });
 
 // POST /api/news — create
-app.post('/api/news', authenticateToken, checkPermission('research_lines', 'create'), apiLimiter, async (req, res) => {
+app.post('/api/news', authenticateToken, checkPermission('research_lines', 'create'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
   try {
     const { title, post_type, body, author_id, research_line_id, is_public,
             status, expires_at, featured_image_url, journal_name, authors_text, doi, word_count } = req.body;
@@ -3408,7 +3408,7 @@ app.post('/api/news', authenticateToken, checkPermission('research_lines', 'crea
 });
 
 // PUT /api/news/:id — update
-app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'update'), apiLimiter, async (req, res) => {
+app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'update'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
   try {
     const { id } = req.params;
     const updates = { ...req.body, updated_at: new Date().toISOString() };
@@ -3536,7 +3536,7 @@ app.get('/api/medical-staff/:id/certificates', authenticateToken, apiLimiter, as
 });
 
 // POST — add a certificate
-app.post('/api/medical-staff/:id/certificates', authenticateToken, checkPermission('medical_staff', 'update'), async (req, res) => {
+app.post('/api/medical-staff/:id/certificates', authenticateToken, checkPermission('medical_staff', 'update'), validate(schemas.certificate), async (req, res) => {
   try {
     const { certificate_name, issued_date, renewal_months, notes } = req.body;
     if (!certificate_name?.trim()) return res.status(400).json({ error: 'certificate_name is required' });
@@ -3602,7 +3602,7 @@ app.get('/api/emergency-callouts', authenticateToken, apiLimiter, async (req, re
     const { staff_id, month, year, limit = 100 } = req.query
     let query = supabase
       .from('emergency_callouts')
-      .select('*, staff:medical_staff!emergency_callouts_staff_id_fkey(id,full_name,staff_type)', { count: 'exact' })
+      .select('*, staff:medical_staff(id,full_name,staff_type)', { count: 'exact' })
       .order('called_at', { ascending: false })
       .limit(Number(limit))
     if (staff_id) query = query.eq('staff_id', staff_id)
@@ -3621,7 +3621,7 @@ app.get('/api/emergency-callouts', authenticateToken, apiLimiter, async (req, re
 })
 
 // POST — log a new callout
-app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_schedule', 'create'), async (req, res) => {
+app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_schedule', 'create'), validate(schemas.emergencyCallout), async (req, res) => {
   try {
     const { staff_id, called_at, end_time, reason_category, notes, time_type } = req.body
     if (!staff_id) return res.status(400).json({ error: 'staff_id is required' })
@@ -3648,13 +3648,13 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
 })
 
 // PUT — edit a callout
-app.put('/api/emergency-callouts/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), async (req, res) => {
+app.put('/api/emergency-callouts/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), validate(schemas.emergencyCallout), async (req, res) => {
   try {
     const { called_at, end_time, reason_category, notes, time_type } = req.body
     const { data, error } = await supabase
       .from('emergency_callouts')
       .update({ called_at, end_time, reason_category, notes, time_type, updated_at: new Date().toISOString() })
-      .eq('id', req.params.id).select().single()
+      .eq('id', req.params.id).select('*, staff:medical_staff(id,full_name,staff_type)').single()
     if (error) throw error
     res.json(data)
   } catch (err) {
