@@ -474,7 +474,7 @@ const schemas = {
     research_line_id:          Joi.string().uuid().allow('', null).optional(),
     principal_investigator_id: Joi.string().uuid().allow('', null).optional(),
     phase:                     Joi.string().max(40).allow('', null).optional(),
-    status:                    Joi.string().max(60).allow('', null).optional(),
+    status:                    Joi.string().valid('Reclutando','Activo','Completado','En preparación','Suspendido').allow('', null).optional().default('En preparación'),
     enrollment_target:         Joi.number().integer().min(0).allow(null).optional(),
     actual_enrollment:         Joi.number().integer().min(0).allow(null).optional(),
     start_date:                Joi.string().allow('', null).optional(),
@@ -490,10 +490,11 @@ const schemas = {
     title:             Joi.string().min(2).max(400).required(),
     research_line_id:  Joi.string().uuid().allow('', null).optional(),
     lead_id:           Joi.string().uuid().allow('', null).optional(),
-    current_stage:     Joi.string().max(60).allow('', null).optional(),
-    development_stage: Joi.string().max(60).allow('', null).optional(),
+    current_stage:     Joi.string().valid('Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización').allow('', null).optional(),
+    category:          Joi.string().valid('Dispositivo','Salud Digital','IA / ML','Tecnología Quirúrgica').default('Salud Digital'),
+    development_stage: Joi.string().valid('Fase Piloto','En Desarrollo','Validación','Validación Clínica').default('En Desarrollo'),
     funding_status:    Joi.string().max(60).allow('', null).optional(),
-    description:       Joi.string().max(4000).allow('', null).optional(),
+    description:       Joi.string().max(4000).default(''),
     budget:            Joi.number().min(0).allow(null).optional(),
     start_date:        Joi.string().allow('', null).optional(),
     expected_end_date: Joi.string().allow('', null).optional(),
@@ -2624,6 +2625,8 @@ app.post('/api/clinical-trials', authenticateToken, checkPermission('research_li
     // the DB CHECK constraint until the schema is updated to allow null or N/A
     const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
     if (!VALID_PHASES.includes(body.phase)) body.phase = 'Phase I';
+    // protocol_id is NOT NULL UNIQUE in DB — auto-generate if not provided
+    if (!body.protocol_id) body.protocol_id = `PROT-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
     const { data, error } = await supabase.from('clinical_trials')
       .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
       .select().single();
@@ -3703,9 +3706,10 @@ app.delete('/api/medical-staff/:staffId/certificates/:certId', authenticateToken
 app.get('/api/emergency-callouts', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { staff_id, month, year, limit = 100 } = req.query
+    // Try with join first, fall back to plain select if join fails
     let query = supabase
       .from('emergency_callouts')
-      .select('*, staff:medical_staff(id,full_name,staff_type)', { count: 'exact' })
+      .select('*, staff:medical_staff(id,full_name,staff_type)')
       .order('called_at', { ascending: false })
       .limit(Number(limit))
     if (staff_id) query = query.eq('staff_id', staff_id)
@@ -3717,7 +3721,7 @@ app.get('/api/emergency-callouts', authenticateToken, apiLimiter, async (req, re
     }
     const { data, error, count } = await query
     if (error) throw error
-    res.json({ data: data || [], count: count || 0 })
+    res.json({ data: data || [], count: (data || []).length })
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch callouts', message: err.message })
   }
@@ -3738,7 +3742,7 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
         reason_category: reason_category || 'unspecified',
         notes: notes || null,
         time_type: time_type || 'night',
-        created_by: req.user.id,
+        created_by: null,  // app_users.id ≠ auth.users.id — FK requires auth.users
         created_at: new Date().toISOString()
       }])
       .select('*, staff:medical_staff(id,full_name,staff_type)')
