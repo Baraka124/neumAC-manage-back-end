@@ -6,7 +6,7 @@
 // FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
 // FIX 4: rotation_category Joi/DB enum mismatch corrected
 // FIX 5: research_lines added to rolePermissions
-// FIX 6: Duplicate on-call routes removed
+// FIX 6: Duplicate on-call routes removed       
 // FIX 8: full_name added to JWT payload
 // FIX 9: Absence PUT recalculates total_days + current_status
 // --- NEW FIXES ---
