@@ -5,7 +5,7 @@
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
 // FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
 // FIX 4: rotation_category Joi/DB enum mismatch corrected
-// FIX 5: research_lines added to rolePermissions   
+// FIX 5: research_lines added to rolePermissions
 // FIX 6: Duplicate on-call routes removed
 // FIX 8: full_name added to JWT payload
 // FIX 9: Absence PUT recalculates total_days + current_status
@@ -442,6 +442,109 @@ const schemas = {
     notifications_enabled: Joi.boolean().default(true),
     absence_notifications: Joi.boolean().default(true),
     announcement_notifications: Joi.boolean().default(true)
+  })
+,
+
+  // ── Emergency Callouts ──────────────────────────────────────────────
+  emergencyCallout: Joi.object({
+    staff_id:        Joi.string().uuid().required(),
+    called_at:       Joi.string().required(),
+    end_time:        Joi.string().allow('', null).optional(),
+    reason_category: Joi.string().max(80).allow('', null).optional(),
+    notes:           Joi.string().max(1000).allow('', null).optional(),
+    time_type:       Joi.string().valid('night','weekend','daytime','holiday').default('night'),
+  }),
+
+  // ── Research Line ────────────────────────────────────────────────────
+  researchLine: Joi.object({
+    research_line_name: Joi.string().min(2).max(200).required(),
+    line_number:        Joi.number().integer().min(1).optional(),
+    description:        Joi.string().max(2000).allow('', null).optional(),
+    capabilities:       Joi.string().max(2000).allow('', null).optional(),
+    keywords:           Joi.array().items(Joi.string()).optional(),
+    active:             Joi.boolean().optional(),
+    sort_order:         Joi.number().integer().optional(),
+    coordinator_id:     Joi.string().uuid().allow('', null).optional(),
+  }),
+
+  // ── Clinical Trial ───────────────────────────────────────────────────
+  clinicalTrial: Joi.object({
+    title:                     Joi.string().min(2).max(400).required(),
+    protocol_id:               Joi.string().max(100).allow('', null).optional(),
+    research_line_id:          Joi.string().uuid().allow('', null).optional(),
+    principal_investigator_id: Joi.string().uuid().allow('', null).optional(),
+    phase:                     Joi.string().max(40).allow('', null).optional(),
+    status:                    Joi.string().max(60).allow('', null).optional(),
+    enrollment_target:         Joi.number().integer().min(0).allow(null).optional(),
+    actual_enrollment:         Joi.number().integer().min(0).allow(null).optional(),
+    start_date:                Joi.string().allow('', null).optional(),
+    end_date:                  Joi.string().allow('', null).optional(),
+    description:               Joi.string().max(4000).allow('', null).optional(),
+    sponsor:                   Joi.string().max(200).allow('', null).optional(),
+    eudract_number:            Joi.string().max(100).allow('', null).optional(),
+    clinicaltrials_id:         Joi.string().max(100).allow('', null).optional(),
+  }),
+
+  // ── Innovation Project ───────────────────────────────────────────────
+  innovationProject: Joi.object({
+    title:             Joi.string().min(2).max(400).required(),
+    research_line_id:  Joi.string().uuid().allow('', null).optional(),
+    lead_id:           Joi.string().uuid().allow('', null).optional(),
+    current_stage:     Joi.string().max(60).allow('', null).optional(),
+    development_stage: Joi.string().max(60).allow('', null).optional(),
+    funding_status:    Joi.string().max(60).allow('', null).optional(),
+    description:       Joi.string().max(4000).allow('', null).optional(),
+    budget:            Joi.number().min(0).allow(null).optional(),
+    start_date:        Joi.string().allow('', null).optional(),
+    expected_end_date: Joi.string().allow('', null).optional(),
+    patent_status:     Joi.string().max(60).allow('', null).optional(),
+  }),
+
+  // ── News / Post ──────────────────────────────────────────────────────
+  newsPost: Joi.object({
+    title:              Joi.string().min(2).max(400).required(),
+    post_type:          Joi.string().valid('update','article','publication','photo_story').required(),
+    body:               Joi.string().max(20000).allow('', null).optional(),
+    author_id:          Joi.string().uuid().allow('', null).optional(),
+    research_line_id:   Joi.string().uuid().allow('', null).optional(),
+    is_public:          Joi.boolean().optional(),
+    status:             Joi.string().valid('draft','published','archived').default('draft'),
+    expires_at:         Joi.string().allow('', null).optional(),
+    featured_image_url: Joi.string().max(2000).allow('', null).optional(),
+    journal_name:       Joi.string().max(200).allow('', null).optional(),
+    authors_text:       Joi.string().max(2000).allow('', null).optional(),
+    doi:                Joi.string().max(200).allow('', null).optional(),
+    word_count:         Joi.number().integer().min(0).allow(null).optional(),
+  }),
+
+  // ── Certificate ──────────────────────────────────────────────────────
+  certificate: Joi.object({
+    certificate_name: Joi.string().min(2).max(200).required(),
+    issued_date:      Joi.string().allow('', null).optional(),
+    renewal_months:   Joi.number().integer().min(0).allow(null).optional(),
+    notes:            Joi.string().max(1000).allow('', null).optional(),
+  }),
+
+  // ── Staff Type ───────────────────────────────────────────────────────
+  staffType: Joi.object({
+    type_key:         Joi.string().min(2).max(60).pattern(/^[a-z0-9_]+$/).required(),
+    display_name:     Joi.string().min(2).max(80).required(),
+    badge_class:      Joi.string().max(60).allow('', null).optional(),
+    is_resident_type: Joi.boolean().optional(),
+    active:           Joi.boolean().optional(),
+    sort_order:       Joi.number().integer().optional(),
+    description:      Joi.string().max(500).allow('', null).optional(),
+  }),
+
+  // ── Rotation Service ─────────────────────────────────────────────────
+  rotationService: Joi.object({
+    name:          Joi.string().min(2).max(200).required(),
+    service_type:  Joi.string().max(60).allow('', null).optional(),
+    contact_name:  Joi.string().max(200).allow('', null).optional(),
+    contact_email: Joi.string().email({ tlds: false }).allow('', null).optional(),
+    contact_phone: Joi.string().max(40).allow('', null).optional(),
+    notes:         Joi.string().max(1000).allow('', null).optional(),
+    active:        Joi.boolean().optional(),
   })
 };
 
@@ -3638,7 +3741,7 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
         created_by: req.user.id,
         created_at: new Date().toISOString()
       }])
-      .select('*, staff:medical_staff!emergency_callouts_staff_id_fkey(id,full_name,staff_type)')
+      .select('*, staff:medical_staff(id,full_name,staff_type)')
       .single()
     if (error) throw error
     res.status(201).json(data)
