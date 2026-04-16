@@ -4,7 +4,7 @@
 // FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
 // FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
-// FIX 4: rotation_category Joi/DB enum mismatch corrected  
+// FIX 4: rotation_category Joi/DB enum mismatch corrected
 // FIX 5: research_lines added to rolePermissions
 // FIX 6: Duplicate on-call routes removed
 // FIX 8: full_name added to JWT payload
@@ -3805,6 +3805,76 @@ app.get('/api/emergency-callouts/summary', authenticateToken, apiLimiter, async 
     res.json(Object.values(summary))
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch summary', message: err.message })
+  }
+})
+
+
+// ===== OPS METRICS (Daily Briefing pulse tiles) =====
+
+// GET today's metrics
+app.get('/api/ops-metrics', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const date = req.query.date || new Date().toISOString().slice(0, 10)
+    const { data, error } = await supabase
+      .from('ops_metrics')
+      .select('*, posted_by_user:app_users!ops_metrics_posted_by_fkey(id,full_name)')
+      .eq('valid_for_date', date)
+      .order('posted_at', { ascending: false })
+    if (error) throw error
+    // Deduplicate — keep latest per metric_key
+    const seen = new Set()
+    const deduped = (data || []).filter(r => {
+      if (seen.has(r.metric_key)) return false
+      seen.add(r.metric_key); return true
+    })
+    res.json({ data: deduped, date })
+  } catch (err) {
+    if (err.message?.includes('does not exist') || err.code === '42P01')
+      return res.json({ data: [], date, _tableNotFound: true })
+    res.status(500).json({ error: 'Failed to fetch ops metrics', message: err.message })
+  }
+})
+
+// POST / upsert a metric (or batch of metrics from daily briefing)
+app.post('/api/ops-metrics', authenticateToken, checkPermission('communications', 'create'), async (req, res) => {
+  try {
+    const metrics = Array.isArray(req.body) ? req.body : [req.body]
+    const date = new Date().toISOString().slice(0, 10)
+    const rows = metrics
+      .filter(m => m.metric_key && m.metric_value !== undefined)
+      .map(m => ({
+        metric_key:    m.metric_key,
+        metric_value:  parseInt(m.metric_value) || 0,
+        metric_sub:    m.metric_sub || null,
+        metric_value2: m.metric_value2 != null ? parseInt(m.metric_value2) : null,
+        posted_by:     req.user.id,
+        posted_at:     new Date().toISOString(),
+        valid_for_date: date,
+        expires_at:    m.expires_at || null,
+      }))
+    if (!rows.length) return res.status(400).json({ error: 'No valid metrics in request' })
+    // Delete existing for today + these keys, then insert fresh
+    const keys = rows.map(r => r.metric_key)
+    await supabase.from('ops_metrics').delete()
+      .eq('valid_for_date', date).in('metric_key', keys)
+    const { data, error } = await supabase.from('ops_metrics').insert(rows).select()
+    if (error) throw error
+    res.status(201).json({ data, count: data.length })
+  } catch (err) {
+    if (err.message?.includes('does not exist') || err.code === '42P01')
+      return res.status(503).json({ error: 'ops_metrics table not found', message: 'Run the ops_metrics SQL migration first.' })
+    res.status(500).json({ error: 'Failed to save metrics', message: err.message })
+  }
+})
+
+// DELETE a single metric
+app.delete('/api/ops-metrics/:id', authenticateToken, checkPermission('communications', 'update'), async (req, res) => {
+  try {
+    const { error } = await supabase.from('ops_metrics').delete().eq('id', req.params.id)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete metric', message: err.message })
   }
 })
 
