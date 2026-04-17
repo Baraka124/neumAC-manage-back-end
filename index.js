@@ -1635,6 +1635,7 @@ app.get('/api/oncall', authenticateToken, apiLimiter, async (req, res) => {
       id: item.id, duty_date: item.duty_date, shift_type: item.shift_type,
       start_time: item.start_time, end_time: item.end_time,
       primary_physician_id: item.primary_physician_id, backup_physician_id: item.backup_physician_id,
+      coverage_area_id: item.coverage_area_id || null,
       coverage_area: item.coverage_area || null, coverage_notes: item.coverage_notes || '',
       schedule_id: item.schedule_id, created_at: item.created_at,
       primary_physician: item.primary_physician ? { full_name: item.primary_physician.full_name, professional_email: item.primary_physician.professional_email, mobile_phone: item.primary_physician.mobile_phone } : null,
