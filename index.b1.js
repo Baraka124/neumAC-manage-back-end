@@ -7,7 +7,7 @@
 // FIX 4: rotation_category Joi/DB enum mismatch corrected
 // FIX 5: research_lines added to rolePermissions
 // FIX 6: Duplicate on-call routes removed
-// FIX 8: full_name added to JWT payload
+// FIX 8: full_name added to JWT payload  
 // FIX 9: Absence PUT recalculates total_days + current_status
 // --- NEW FIXES ---
 // FIX 10: /api/auth/me — req.user.userId → req.user.id (JWT field mismatch causing 401)
@@ -182,6 +182,37 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Maintenance mode middleware ──
+let _maintenanceMode = false;
+let _maintenanceLastCheck = 0;
+const MAINTENANCE_CACHE_MS = 60000;
+
+async function checkMaintenanceMode() {
+  if (Date.now() - _maintenanceLastCheck < MAINTENANCE_CACHE_MS) return _maintenanceMode;
+  try {
+    const { data } = await supabase.from('system_settings').select('maintenance_mode').limit(1).single();
+    _maintenanceMode = data?.maintenance_mode === true;
+    _maintenanceLastCheck = Date.now();
+  } catch { /* don't block on DB errors */ }
+  return _maintenanceMode;
+}
+
+app.use(async (req, res, next) => {
+  const bypass = ['/health', '/api/auth/login', '/api/auth/logout'];
+  if (bypass.some(p => req.path.startsWith(p))) return next();
+  const inMaintenance = await checkMaintenanceMode();
+  if (!inMaintenance) return next();
+  // System admins bypass maintenance
+  const token = req.headers.authorization?.split(' ')[1];
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      if (decoded?.role === 'system_admin') return next();
+    } catch {}
+  }
+  res.status(503).json({ error: 'maintenance', message: 'The system is currently under maintenance. Please try again shortly.' });
+});
+
 // ============ UTILITY FUNCTIONS ============
 const generateId = (prefix) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 9)}`;
 
@@ -297,10 +328,10 @@ const schemas = {
     training_unit_id: Joi.string().uuid().required(),
     start_date: Joi.date().required(),
     end_date: Joi.date().required(),
-    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early').default('scheduled'),
+    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early').optional().default('scheduled'),
     rotation_category: Joi.string()
       .valid('clinical_rotation', 'elective_rotation', 'research_block', 'administrative_duty')
-      .default('clinical_rotation'),
+      .optional().default('clinical_rotation'),
     supervising_attending_id: Joi.string().uuid().required(),
     rotation_id: Joi.string().optional(),
     clinical_notes: Joi.string().optional().allow(''),
@@ -311,7 +342,8 @@ const schemas = {
 
   onCall: Joi.object({
     duty_date: Joi.date().required(),
-    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'weekend_coverage').default('primary_call'),
+    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician').default('primary_call'),
+    coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
     start_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
     end_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
     primary_physician_id: Joi.string().uuid().required(),
@@ -412,6 +444,110 @@ const schemas = {
     absence_notifications: Joi.boolean().default(true),
     announcement_notifications: Joi.boolean().default(true)
   })
+,
+
+  // ── Emergency Callouts ──────────────────────────────────────────────
+  emergencyCallout: Joi.object({
+    staff_id:        Joi.string().uuid().required(),
+    called_at:       Joi.string().required(),
+    end_time:        Joi.string().allow('', null).optional(),
+    reason_category: Joi.string().max(80).allow('', null).optional(),
+    notes:           Joi.string().max(1000).allow('', null).optional(),
+    time_type:       Joi.string().valid('night','weekend','daytime','holiday').default('night'),
+  }),
+
+  // ── Research Line ────────────────────────────────────────────────────
+  researchLine: Joi.object({
+    research_line_name: Joi.string().min(2).max(200).required(),
+    line_number:        Joi.number().integer().min(1).optional(),
+    description:        Joi.string().max(2000).allow('', null).optional(),
+    capabilities:       Joi.string().max(2000).allow('', null).optional(),
+    keywords:           Joi.array().items(Joi.string()).optional(),
+    active:             Joi.boolean().optional(),
+    sort_order:         Joi.number().integer().optional(),
+    coordinator_id:     Joi.string().uuid().allow('', null).optional(),
+  }),
+
+  // ── Clinical Trial ───────────────────────────────────────────────────
+  clinicalTrial: Joi.object({
+    title:                     Joi.string().min(2).max(400).required(),
+    protocol_id:               Joi.string().max(100).allow('', null).optional(),
+    research_line_id:          Joi.string().uuid().allow('', null).optional(),
+    principal_investigator_id: Joi.string().uuid().allow('', null).optional(),
+    phase:                     Joi.string().max(40).allow('', null).optional(),
+    status:                    Joi.string().valid('Reclutando','Activo','Completado','En preparación','Suspendido').allow('', null).optional().default('En preparación'),
+    enrollment_target:         Joi.number().integer().min(0).allow(null).optional(),
+    actual_enrollment:         Joi.number().integer().min(0).allow(null).optional(),
+    start_date:                Joi.string().allow('', null).optional(),
+    end_date:                  Joi.string().allow('', null).optional(),
+    description:               Joi.string().max(4000).allow('', null).optional(),
+    sponsor:                   Joi.string().max(200).allow('', null).optional(),
+    eudract_number:            Joi.string().max(100).allow('', null).optional(),
+    clinicaltrials_id:         Joi.string().max(100).allow('', null).optional(),
+  }),
+
+  // ── Innovation Project ───────────────────────────────────────────────
+  innovationProject: Joi.object({
+    title:             Joi.string().min(2).max(400).required(),
+    research_line_id:  Joi.string().uuid().allow('', null).optional(),
+    lead_id:           Joi.string().uuid().allow('', null).optional(),
+    current_stage:     Joi.string().valid('Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización').allow('', null).optional(),
+    category:          Joi.string().valid('Dispositivo','Salud Digital','IA / ML','Tecnología Quirúrgica').default('Salud Digital'),
+    development_stage: Joi.string().valid('Fase Piloto','En Desarrollo','Validación','Validación Clínica').default('En Desarrollo'),
+    funding_status:    Joi.string().max(60).allow('', null).optional(),
+    description:       Joi.string().max(4000).default(''),
+    budget:            Joi.number().min(0).allow(null).optional(),
+    start_date:        Joi.string().allow('', null).optional(),
+    expected_end_date: Joi.string().allow('', null).optional(),
+    patent_status:     Joi.string().max(60).allow('', null).optional(),
+  }),
+
+  // ── News / Post ──────────────────────────────────────────────────────
+  newsPost: Joi.object({
+    title:              Joi.string().min(2).max(400).required(),
+    post_type:          Joi.string().valid('update','article','publication','photo_story').required(),
+    body:               Joi.string().max(20000).allow('', null).optional(),
+    author_id:          Joi.string().uuid().allow('', null).optional(),
+    research_line_id:   Joi.string().uuid().allow('', null).optional(),
+    is_public:          Joi.boolean().optional(),
+    status:             Joi.string().valid('draft','published','archived').default('draft'),
+    expires_at:         Joi.string().allow('', null).optional(),
+    featured_image_url: Joi.string().max(2000).allow('', null).optional(),
+    journal_name:       Joi.string().max(200).allow('', null).optional(),
+    authors_text:       Joi.string().max(2000).allow('', null).optional(),
+    doi:                Joi.string().max(200).allow('', null).optional(),
+    word_count:         Joi.number().integer().min(0).allow(null).optional(),
+  }),
+
+  // ── Certificate ──────────────────────────────────────────────────────
+  certificate: Joi.object({
+    certificate_name: Joi.string().min(2).max(200).required(),
+    issued_date:      Joi.string().allow('', null).optional(),
+    renewal_months:   Joi.number().integer().min(0).allow(null).optional(),
+    notes:            Joi.string().max(1000).allow('', null).optional(),
+  }),
+
+  // ── Staff Type ───────────────────────────────────────────────────────
+  staffType: Joi.object({
+    type_key:         Joi.string().min(2).max(60).pattern(/^[a-z0-9_]+$/).required(),
+    display_name:     Joi.string().min(2).max(80).required(),
+    badge_class:      Joi.string().max(60).allow('', null).optional(),
+    is_resident_type: Joi.boolean().optional(),
+    active:           Joi.boolean().optional(),
+    sort_order:       Joi.number().integer().optional(),
+    description:      Joi.string().max(500).allow('', null).optional(),
+  }),
+
+  // ── Rotation Service ─────────────────────────────────────────────────
+  rotationService: Joi.object({
+    name:          Joi.string().min(2).max(200).required(),
+    service_type:  Joi.string().max(60).allow('', null).optional(),
+    contact_name:  Joi.string().max(200).allow('', null).optional(),
+    contact_email: Joi.string().email({ tlds: false }).allow('', null).optional(),
+    contact_phone: Joi.string().max(40).allow('', null).optional(),
+    notes:         Joi.string().max(1000).allow('', null).optional(),
+    active:        Joi.boolean().optional(),
+  })
 };
 
 // ============ VALIDATION MIDDLEWARE ============
@@ -453,6 +589,27 @@ const authenticateToken = (req, res, next) => {
 
 // B-SEC5: /uploads served only to authenticated users — must be after authenticateToken is defined
 app.use('/uploads', authenticateToken, express.static(path.join(__dirname, 'uploads')));
+
+// ============ MAINTENANCE MODE MIDDLEWARE ============
+// Reads maintenance_mode from DB on each /api request (cached 30s) and returns 503 if enabled.
+// Exempt: /api/auth/* (login must always work), /api/settings (so admin can disable it), GET /api/settings
+let _maintenanceCache = { value: false, at: 0 }
+const maintenanceCheck = async (req, res, next) => {
+  // Always allow auth + settings routes so admin can log in and toggle it off
+  if (req.path.startsWith('/api/auth') || req.path === '/api/settings') return next()
+  const now = Date.now()
+  if (now - _maintenanceCache.at > 30000) {
+    try {
+      const { data } = await supabase.from('system_settings').select('maintenance_mode').limit(1).single()
+      _maintenanceCache = { value: data?.maintenance_mode === true, at: now }
+    } catch { _maintenanceCache.at = now }
+  }
+  if (_maintenanceCache.value) {
+    return res.status(503).json({ error: 'maintenance', message: 'System is under scheduled maintenance. Please try again shortly.' })
+  }
+  next()
+}
+app.use('/api', maintenanceCheck)
 
 // ============ PERMISSION MIDDLEWARE ============
 const checkPermission = (resource, action) => {
@@ -853,7 +1010,11 @@ app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff'
     if (staff_type) query = query.eq('staff_type', staff_type);
     // Exclude inactive by default; pass ?employment_status=inactive to retrieve them
     if (employment_status) {
-      query = query.eq('employment_status', employment_status);
+      if (employment_status === 'all') {
+        // no filter — return everyone including inactive (used for name-resolution lookups)
+      } else {
+        query = query.eq('employment_status', employment_status);
+      }
     } else {
       query = query.neq('employment_status', 'inactive');
     }
@@ -1462,7 +1623,8 @@ app.get('/api/oncall', authenticateToken, apiLimiter, async (req, res) => {
     const { start_date, end_date, physician_id } = req.query;
     let query = supabase.from('oncall_schedule').select(`
         *, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name, professional_email, mobile_phone),
-        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(full_name, professional_email, mobile_phone)
+        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(full_name, professional_email, mobile_phone),
+        coverage_area:coverage_areas(id,name,code,color)
       `).order('duty_date');
     if (start_date) query = query.gte('duty_date', start_date);
     if (end_date) query = query.lte('duty_date', end_date);
@@ -1473,6 +1635,7 @@ app.get('/api/oncall', authenticateToken, apiLimiter, async (req, res) => {
       id: item.id, duty_date: item.duty_date, shift_type: item.shift_type,
       start_time: item.start_time, end_time: item.end_time,
       primary_physician_id: item.primary_physician_id, backup_physician_id: item.backup_physician_id,
+      coverage_area_id: item.coverage_area_id || null,
       coverage_area: item.coverage_area || null, coverage_notes: item.coverage_notes || '',
       schedule_id: item.schedule_id, created_at: item.created_at,
       primary_physician: item.primary_physician ? { full_name: item.primary_physician.full_name, professional_email: item.primary_physician.professional_email, mobile_phone: item.primary_physician.mobile_phone } : null,
@@ -2360,7 +2523,7 @@ app.get('/api/research-lines/website', apiLimiter, async (req, res) => {
   }
 });
 
-app.post('/api/research-lines', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
+app.post('/api/research-lines', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.researchLine), async (req, res) => {
   try {
     // Accept both 'name' (DB field) and 'research_line_name' (frontend form field)
     const { line_number, description, capabilities, sort_order, active, keywords } = req.body;
@@ -2374,7 +2537,7 @@ app.post('/api/research-lines', authenticateToken, checkPermission('research_lin
   }
 });
 
-app.put('/api/research-lines/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
+app.put('/api/research-lines/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.researchLine), async (req, res) => {
   try {
     // B6 FIX: Whitelist updatable fields — do not pass req.body directly to prevent
     // clients from overwriting id, created_at, line_number (unique) or injecting garbage fields
@@ -2462,13 +2625,15 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
   }
 });
 
-app.post('/api/clinical-trials', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
+app.post('/api/clinical-trials', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.clinicalTrial), async (req, res) => {
   try {
     const body = { ...req.body };
     // Observational/Expanded Access studies may not have a phase — default to 'Phase I' to satisfy
     // the DB CHECK constraint until the schema is updated to allow null or N/A
     const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
     if (!VALID_PHASES.includes(body.phase)) body.phase = 'Phase I';
+    // protocol_id is NOT NULL UNIQUE in DB — auto-generate if not provided
+    if (!body.protocol_id) body.protocol_id = `PROT-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
     const { data, error } = await supabase.from('clinical_trials')
       .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
       .select().single();
@@ -2479,7 +2644,7 @@ app.post('/api/clinical-trials', authenticateToken, checkPermission('research_li
   }
 });
 
-app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
+app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.clinicalTrial), async (req, res) => {
   try {
     // B6 FIX: Whitelist updatable fields
     const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
@@ -2555,7 +2720,7 @@ app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, r
   }
 });
 
-app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), async (req, res) => {
+app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.innovationProject), async (req, res) => {
   try {
     const body = { ...req.body };
     // Always write development_stage (NOT NULL) in sync with current_stage
@@ -2570,7 +2735,7 @@ app.post('/api/innovation-projects', authenticateToken, checkPermission('researc
   }
 });
 
-app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'update'), async (req, res) => {
+app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.innovationProject), async (req, res) => {
   try {
     // B6 FIX: Whitelist updatable fields
     const VALID_STAGES = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
@@ -2729,7 +2894,7 @@ app.get('/api/analytics/summary', authenticateToken, apiLimiter, async (req, res
       supabase.from('clinical_trials').select('*', { count: 'exact', head: true }),
       supabase.from('clinical_trials').select('*', { count: 'exact', head: true }).in('status', ['Activo','Reclutando']),
       supabase.from('innovation_projects').select('*', { count: 'exact', head: true }),
-      supabase.from('innovation_projects').select('*', { count: 'exact', head: true }).in('current_stage', ['Piloto','Validación','Escalamiento'])
+      supabase.from('innovation_projects').select('*', { count: 'exact', head: true }).in('current_stage', ['Piloto','Validación','Escalamiento','Comercialización'])
     ]);
     res.json({ success: true, data: { researchLines: totalRL || 0, clinicalTrials: { total: totalTrials || 0, active: activeTrials || 0 }, innovationProjects: { total: totalProj || 0, active: activeProj || 0 } } });
   } catch (error) {
@@ -2817,8 +2982,9 @@ app.post('/api/hospitals', authenticateToken, apiLimiter, async (req, res) => {
 
 app.put('/api/hospitals/:id', authenticateToken, checkPermission('departments', 'update'), async (req, res) => {
   try {
+    const { name, code, city, region, address, type, parent_complex, is_active } = req.body;
     const { data, error } = await supabase.from('hospitals')
-      .update({ ...req.body, updated_at: new Date().toISOString() })
+      .update({ name, code, city, region, address, type, parent_complex, is_active, updated_at: new Date().toISOString() })
       .eq('id', req.params.id).select().single();
     if (error) throw error;
     res.json({ success: true, data });
@@ -3122,7 +3288,7 @@ app.get('/api/rotation-services', authenticateToken, apiLimiter, async (req, res
   }
 })
 
-app.post('/api/rotation-services', authenticateToken, checkPermission('system_settings', 'create'), async (req, res) => {
+app.post('/api/rotation-services', authenticateToken, checkPermission('system_settings', 'create'), validate(schemas.rotationService), async (req, res) => {
   try {
     const { name, service_type, contact_name, contact_email, contact_phone } = req.body
     if (!name?.trim()) return res.status(400).json({ error: 'Name is required' })
@@ -3203,7 +3369,7 @@ app.get('/api/staff-types', authenticateToken, apiLimiter, async (req, res) => {
 });
 
 // POST /api/staff-types — create a new staff type (admin / dept head only)
-app.post('/api/staff-types', authenticateToken, checkPermission('staff_types', 'create'), async (req, res) => {
+app.post('/api/staff-types', authenticateToken, checkPermission('staff_types', 'create'), validate(schemas.staffType), async (req, res) => {
   try {
     const schema = Joi.object({
       type_key:        Joi.string().min(2).max(60).pattern(/^[a-z0-9_]+$/).required()
@@ -3329,7 +3495,7 @@ app.get('/api/news/website', apiLimiter, async (req, res) => {
 });
 
 // POST /api/news — create
-app.post('/api/news', authenticateToken, checkPermission('research_lines', 'create'), apiLimiter, async (req, res) => {
+app.post('/api/news', authenticateToken, checkPermission('research_lines', 'create'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
   try {
     const { title, post_type, body, author_id, research_line_id, is_public,
             status, expires_at, featured_image_url, journal_name, authors_text, doi, word_count } = req.body;
@@ -3356,7 +3522,7 @@ app.post('/api/news', authenticateToken, checkPermission('research_lines', 'crea
 });
 
 // PUT /api/news/:id — update
-app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'update'), apiLimiter, async (req, res) => {
+app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'update'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
   try {
     const { id } = req.params;
     const updates = { ...req.body, updated_at: new Date().toISOString() };
@@ -3388,16 +3554,6 @@ app.delete('/api/news/:id', authenticateToken, checkPermission('research_lines',
 // ============================================================================
 // ========================== ACADEMIC DEGREES ================================
 // ============================================================================
-
-// DEBUG — test academic degrees without auth (remove after confirming)
-app.get('/api/debug/academic-degrees', apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('academic_degrees').select('*').order('display_order');
-    res.json({ count: data?.length ?? 0, error: error?.message || null, data: data || [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.get('/api/academic-degrees', authenticateToken, apiLimiter, async (req, res) => {
   try {
@@ -3484,7 +3640,7 @@ app.get('/api/medical-staff/:id/certificates', authenticateToken, apiLimiter, as
 });
 
 // POST — add a certificate
-app.post('/api/medical-staff/:id/certificates', authenticateToken, checkPermission('medical_staff', 'update'), async (req, res) => {
+app.post('/api/medical-staff/:id/certificates', authenticateToken, checkPermission('medical_staff', 'update'), validate(schemas.certificate), async (req, res) => {
   try {
     const { certificate_name, issued_date, renewal_months, notes } = req.body;
     if (!certificate_name?.trim()) return res.status(400).json({ error: 'certificate_name is required' });
@@ -3548,9 +3704,10 @@ app.delete('/api/medical-staff/:staffId/certificates/:certId', authenticateToken
 app.get('/api/emergency-callouts', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { staff_id, month, year, limit = 100 } = req.query
+    // Try with join first, fall back to plain select if join fails
     let query = supabase
       .from('emergency_callouts')
-      .select('*, staff:medical_staff!emergency_callouts_staff_id_fkey(id,full_name,staff_type)', { count: 'exact' })
+      .select('*, staff:medical_staff(id,full_name,staff_type)')
       .order('called_at', { ascending: false })
       .limit(Number(limit))
     if (staff_id) query = query.eq('staff_id', staff_id)
@@ -3562,14 +3719,14 @@ app.get('/api/emergency-callouts', authenticateToken, apiLimiter, async (req, re
     }
     const { data, error, count } = await query
     if (error) throw error
-    res.json({ data: data || [], count: count || 0 })
+    res.json({ data: data || [], count: (data || []).length })
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch callouts', message: err.message })
   }
 })
 
 // POST — log a new callout
-app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_schedule', 'create'), async (req, res) => {
+app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_schedule', 'create'), validate(schemas.emergencyCallout), async (req, res) => {
   try {
     const { staff_id, called_at, end_time, reason_category, notes, time_type } = req.body
     if (!staff_id) return res.status(400).json({ error: 'staff_id is required' })
@@ -3583,10 +3740,10 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
         reason_category: reason_category || 'unspecified',
         notes: notes || null,
         time_type: time_type || 'night',
-        created_by: req.user.id,
+        created_by: null,  // app_users.id ≠ auth.users.id — FK requires auth.users
         created_at: new Date().toISOString()
       }])
-      .select('*, staff:medical_staff!emergency_callouts_staff_id_fkey(id,full_name,staff_type)')
+      .select('*, staff:medical_staff(id,full_name,staff_type)')
       .single()
     if (error) throw error
     res.status(201).json(data)
@@ -3596,13 +3753,13 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
 })
 
 // PUT — edit a callout
-app.put('/api/emergency-callouts/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), async (req, res) => {
+app.put('/api/emergency-callouts/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), validate(schemas.emergencyCallout), async (req, res) => {
   try {
     const { called_at, end_time, reason_category, notes, time_type } = req.body
     const { data, error } = await supabase
       .from('emergency_callouts')
       .update({ called_at, end_time, reason_category, notes, time_type, updated_at: new Date().toISOString() })
-      .eq('id', req.params.id).select().single()
+      .eq('id', req.params.id).select('*, staff:medical_staff(id,full_name,staff_type)').single()
     if (error) throw error
     res.json(data)
   } catch (err) {
@@ -3646,6 +3803,148 @@ app.get('/api/emergency-callouts/summary', authenticateToken, apiLimiter, async 
     res.json(Object.values(summary))
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch summary', message: err.message })
+  }
+})
+
+
+// ===== OPS METRICS (Daily Briefing pulse tiles) =====
+
+// GET today's metrics
+app.get('/api/ops-metrics', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const date = req.query.date || new Date().toISOString().slice(0, 10)
+    const { data, error } = await supabase
+      .from('ops_metrics')
+      .select('*, posted_by_user:app_users!ops_metrics_posted_by_fkey(id,full_name)')
+      .eq('valid_for_date', date)
+      .order('posted_at', { ascending: false })
+    if (error) throw error
+    // Deduplicate — keep latest per metric_key
+    const seen = new Set()
+    const deduped = (data || []).filter(r => {
+      if (seen.has(r.metric_key)) return false
+      seen.add(r.metric_key); return true
+    })
+    res.json({ data: deduped, date })
+  } catch (err) {
+    if (err.message?.includes('does not exist') || err.code === '42P01')
+      return res.json({ data: [], date, _tableNotFound: true })
+    res.status(500).json({ error: 'Failed to fetch ops metrics', message: err.message })
+  }
+})
+
+// POST / upsert a metric (or batch of metrics from daily briefing)
+app.post('/api/ops-metrics', authenticateToken, checkPermission('communications', 'create'), async (req, res) => {
+  try {
+    const metrics = Array.isArray(req.body) ? req.body : [req.body]
+    const date = new Date().toISOString().slice(0, 10)
+    const rows = metrics
+      .filter(m => m.metric_key && m.metric_value !== undefined)
+      .map(m => ({
+        metric_key:    m.metric_key,
+        metric_value:  parseInt(m.metric_value) || 0,
+        metric_sub:    m.metric_sub || null,
+        metric_value2: m.metric_value2 != null ? parseInt(m.metric_value2) : null,
+        posted_by:     req.user.id,
+        posted_at:     new Date().toISOString(),
+        valid_for_date: date,
+        expires_at:    m.expires_at || null,
+      }))
+    if (!rows.length) return res.status(400).json({ error: 'No valid metrics in request' })
+    // Delete existing for today + these keys, then insert fresh
+    const keys = rows.map(r => r.metric_key)
+    await supabase.from('ops_metrics').delete()
+      .eq('valid_for_date', date).in('metric_key', keys)
+    const { data, error } = await supabase.from('ops_metrics').insert(rows).select()
+    if (error) throw error
+    res.status(201).json({ data, count: data.length })
+  } catch (err) {
+    if (err.message?.includes('does not exist') || err.code === '42P01')
+      return res.status(503).json({ error: 'ops_metrics table not found', message: 'Run the ops_metrics SQL migration first.' })
+    res.status(500).json({ error: 'Failed to save metrics', message: err.message })
+  }
+})
+
+// DELETE a single metric
+app.delete('/api/ops-metrics/:id', authenticateToken, checkPermission('communications', 'update'), async (req, res) => {
+  try {
+    const { error } = await supabase.from('ops_metrics').delete().eq('id', req.params.id)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete metric', message: err.message })
+  }
+})
+
+// ===== COVERAGE AREAS =====
+
+app.get('/api/coverage-areas', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('coverage_areas')
+      .select('*')
+      .order('display_order', { ascending: true })
+    if (error) throw error
+    res.json({ success: true, data: data || [] })
+  } catch (err) {
+    if (err.code === '42P01') return res.json({ success: true, data: [], _tableNotFound: true })
+    res.status(500).json({ error: 'Failed to fetch coverage areas', message: err.message })
+  }
+})
+
+app.post('/api/coverage-areas', authenticateToken, checkPermission('system_settings', 'create'), async (req, res) => {
+  try {
+    const { name, code, color, applies_weekends, display_order } = req.body
+    if (!name?.trim()) return res.status(400).json({ error: 'Name is required' })
+    const row = {
+      name: name.trim(),
+      code: (code || name).trim().toUpperCase().replace(/\s+/g, '_').slice(0, 20),
+      color: color || '#00b3b3',
+      applies_weekends: applies_weekends !== false,
+      display_order: display_order || 0,
+      is_active: true
+    }
+    const { data, error } = await supabase.from('coverage_areas').insert([row]).select().single()
+    if (error) throw error
+    res.status(201).json({ success: true, data })
+  } catch (err) {
+    if (err.code === '42P01') return res.status(503).json({ error: 'coverage_areas table not found. Run migration first.' })
+    res.status(500).json({ error: 'Failed to create coverage area', message: err.message })
+  }
+})
+
+app.put('/api/coverage-areas/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
+  try {
+    const { name, color, applies_weekends, display_order, is_active } = req.body
+    const updates = { updated_at: new Date().toISOString() }
+    if (name !== undefined) updates.name = name.trim()
+    if (color !== undefined) updates.color = color
+    if (applies_weekends !== undefined) updates.applies_weekends = applies_weekends
+    if (display_order !== undefined) updates.display_order = display_order
+    if (is_active !== undefined) updates.is_active = is_active
+    const { data, error } = await supabase.from('coverage_areas').update(updates).eq('id', req.params.id).select().single()
+    if (error) throw error
+    res.json({ success: true, data })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update coverage area', message: err.message })
+  }
+})
+
+app.delete('/api/coverage-areas/:id', authenticateToken, checkPermission('system_settings', 'delete'), async (req, res) => {
+  try {
+    // Check if any schedules use this area
+    const { data: inUse } = await supabase
+      .from('oncall_schedule')
+      .select('id')
+      .eq('coverage_area_id', req.params.id)
+      .limit(1)
+    if (inUse && inUse.length > 0)
+      return res.status(409).json({ error: 'Area is in use by existing schedules. Deactivate instead.' })
+    const { error } = await supabase.from('coverage_areas').delete().eq('id', req.params.id)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete coverage area', message: err.message })
   }
 })
 
