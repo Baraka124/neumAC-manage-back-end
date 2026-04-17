@@ -454,6 +454,7 @@ const schemas = {
     reason_category: Joi.string().max(80).allow('', null).optional(),
     notes:           Joi.string().max(1000).allow('', null).optional(),
     time_type:       Joi.string().valid('night','weekend','daytime','holiday').default('night'),
+    coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
   }),
 
   // ── Research Line ────────────────────────────────────────────────────
@@ -1682,6 +1683,9 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
       ...dataSource,
       duty_date: formatDate(dataSource.duty_date),
       schedule_id: dataSource.schedule_id || generateId('SCH'),
+      // Coerce empty string to null for UUID FK columns
+      coverage_area_id: dataSource.coverage_area_id || null,
+      backup_physician_id: dataSource.backup_physician_id || null,
       created_by: req.user.id,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
@@ -1700,6 +1704,8 @@ app.put('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedule',
     const scheduleData = {
       ...dataSource,
       duty_date: formatDate(dataSource.duty_date),
+      coverage_area_id: dataSource.coverage_area_id || null,
+      backup_physician_id: dataSource.backup_physician_id || null,
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('oncall_schedule').update(scheduleData).eq('id', req.params.id).select().single();
@@ -3740,6 +3746,7 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
         reason_category: reason_category || 'unspecified',
         notes: notes || null,
         time_type: time_type || 'night',
+        coverage_area_id: coverage_area_id || null,
         created_by: null,  // app_users.id ≠ auth.users.id — FK requires auth.users
         created_at: new Date().toISOString()
       }])
@@ -3945,6 +3952,55 @@ app.delete('/api/coverage-areas/:id', authenticateToken, checkPermission('system
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete coverage area', message: err.message })
+  }
+})
+
+// ===== ONCALL BATCH INSERT =====
+app.post('/api/oncall/batch', authenticateToken, checkPermission('oncall_schedule', 'create'), async (req, res) => {
+  try {
+    const { shifts } = req.body
+    if (!Array.isArray(shifts) || shifts.length === 0)
+      return res.status(400).json({ error: 'shifts array is required' })
+    if (shifts.length > 200)
+      return res.status(400).json({ error: 'Maximum 200 shifts per batch' })
+
+    const rows = shifts.map(s => ({
+      duty_date:            formatDate(new Date(s.duty_date)),
+      shift_type:           ['primary_call','backup_call','float_physician'].includes(s.shift_type) ? s.shift_type : 'primary_call',
+      coverage_area_id:     s.coverage_area_id || null,
+      start_time:           s.start_time || '15:00',
+      end_time:             s.end_time   || '08:00',
+      primary_physician_id: s.primary_physician_id,
+      backup_physician_id:  s.backup_physician_id  || null,
+      coverage_notes:       s.coverage_notes       || null,
+      has_conflict:         s.has_conflict          || false,
+      schedule_id:          generateId('SCH'),
+      created_by:           req.user.id,
+      created_at:           new Date().toISOString(),
+      updated_at:           new Date().toISOString(),
+    }))
+
+    // Validate required fields
+    const invalid = rows.filter(r => !r.primary_physician_id || !r.duty_date)
+    if (invalid.length > 0)
+      return res.status(400).json({ error: `${invalid.length} shifts missing required fields (primary_physician_id, duty_date)` })
+
+    const { data, error } = await supabase
+      .from('oncall_schedule')
+      .insert(rows)
+      .select()
+
+    if (error) throw error
+    res.status(201).json({ success: true, count: data.length, data })
+  } catch (err) {
+    // Unique constraint violation — one primary per area per day
+    if (err.code === '23505')
+      return res.status(409).json({
+        error: 'Duplicate primary call',
+        message: 'One or more dates already have a primary call for the same area. Review conflicts and retry.',
+        detail: err.detail
+      })
+    res.status(500).json({ error: 'Batch insert failed', message: err.message })
   }
 })
 
