@@ -328,10 +328,10 @@ const schemas = {
     training_unit_id: Joi.string().uuid().required(),
     start_date: Joi.date().required(),
     end_date: Joi.date().required(),
-    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early').default('scheduled'),
+    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early').optional().default('scheduled'),
     rotation_category: Joi.string()
       .valid('clinical_rotation', 'elective_rotation', 'research_block', 'administrative_duty')
-      .default('clinical_rotation'),
+      .optional().default('clinical_rotation'),
     supervising_attending_id: Joi.string().uuid().required(),
     rotation_id: Joi.string().optional(),
     clinical_notes: Joi.string().optional().allow(''),
@@ -1009,7 +1009,11 @@ app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff'
     if (staff_type) query = query.eq('staff_type', staff_type);
     // Exclude inactive by default; pass ?employment_status=inactive to retrieve them
     if (employment_status) {
-      query = query.eq('employment_status', employment_status);
+      if (employment_status === 'all') {
+        // no filter — return everyone including inactive (used for name-resolution lookups)
+      } else {
+        query = query.eq('employment_status', employment_status);
+      }
     } else {
       query = query.neq('employment_status', 'inactive');
     }
@@ -2887,7 +2891,7 @@ app.get('/api/analytics/summary', authenticateToken, apiLimiter, async (req, res
       supabase.from('clinical_trials').select('*', { count: 'exact', head: true }),
       supabase.from('clinical_trials').select('*', { count: 'exact', head: true }).in('status', ['Activo','Reclutando']),
       supabase.from('innovation_projects').select('*', { count: 'exact', head: true }),
-      supabase.from('innovation_projects').select('*', { count: 'exact', head: true }).in('current_stage', ['Piloto','Validación','Escalamiento'])
+      supabase.from('innovation_projects').select('*', { count: 'exact', head: true }).in('current_stage', ['Piloto','Validación','Escalamiento','Comercialización'])
     ]);
     res.json({ success: true, data: { researchLines: totalRL || 0, clinicalTrials: { total: totalTrials || 0, active: activeTrials || 0 }, innovationProjects: { total: totalProj || 0, active: activeProj || 0 } } });
   } catch (error) {
@@ -2975,8 +2979,9 @@ app.post('/api/hospitals', authenticateToken, apiLimiter, async (req, res) => {
 
 app.put('/api/hospitals/:id', authenticateToken, checkPermission('departments', 'update'), async (req, res) => {
   try {
+    const { name, code, city, region, address, type, parent_complex, is_active } = req.body;
     const { data, error } = await supabase.from('hospitals')
-      .update({ ...req.body, updated_at: new Date().toISOString() })
+      .update({ name, code, city, region, address, type, parent_complex, is_active, updated_at: new Date().toISOString() })
       .eq('id', req.params.id).select().single();
     if (error) throw error;
     res.json({ success: true, data });
@@ -3546,16 +3551,6 @@ app.delete('/api/news/:id', authenticateToken, checkPermission('research_lines',
 // ============================================================================
 // ========================== ACADEMIC DEGREES ================================
 // ============================================================================
-
-// DEBUG — test academic degrees without auth (remove after confirming)
-app.get('/api/debug/academic-degrees', apiLimiter, async (req, res) => {
-  try {
-    const { data, error } = await supabase.from('academic_degrees').select('*').order('display_order');
-    res.json({ count: data?.length ?? 0, error: error?.message || null, data: data || [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.get('/api/academic-degrees', authenticateToken, apiLimiter, async (req, res) => {
   try {
