@@ -342,7 +342,8 @@ const schemas = {
 
   onCall: Joi.object({
     duty_date: Joi.date().required(),
-    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'weekend_coverage').default('primary_call'),
+    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician').default('primary_call'),
+    coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
     start_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
     end_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
     primary_physician_id: Joi.string().uuid().required(),
@@ -1622,7 +1623,8 @@ app.get('/api/oncall', authenticateToken, apiLimiter, async (req, res) => {
     const { start_date, end_date, physician_id } = req.query;
     let query = supabase.from('oncall_schedule').select(`
         *, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name, professional_email, mobile_phone),
-        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(full_name, professional_email, mobile_phone)
+        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(full_name, professional_email, mobile_phone),
+        coverage_area:coverage_areas(id,name,code,color)
       `).order('duty_date');
     if (start_date) query = query.gte('duty_date', start_date);
     if (end_date) query = query.lte('duty_date', end_date);
@@ -3870,6 +3872,78 @@ app.delete('/api/ops-metrics/:id', authenticateToken, checkPermission('communica
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete metric', message: err.message })
+  }
+})
+
+// ===== COVERAGE AREAS =====
+
+app.get('/api/coverage-areas', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('coverage_areas')
+      .select('*')
+      .order('display_order', { ascending: true })
+    if (error) throw error
+    res.json({ success: true, data: data || [] })
+  } catch (err) {
+    if (err.code === '42P01') return res.json({ success: true, data: [], _tableNotFound: true })
+    res.status(500).json({ error: 'Failed to fetch coverage areas', message: err.message })
+  }
+})
+
+app.post('/api/coverage-areas', authenticateToken, checkPermission('system_settings', 'create'), async (req, res) => {
+  try {
+    const { name, code, color, applies_weekends, display_order } = req.body
+    if (!name?.trim()) return res.status(400).json({ error: 'Name is required' })
+    const row = {
+      name: name.trim(),
+      code: (code || name).trim().toUpperCase().replace(/\s+/g, '_').slice(0, 20),
+      color: color || '#00b3b3',
+      applies_weekends: applies_weekends !== false,
+      display_order: display_order || 0,
+      is_active: true
+    }
+    const { data, error } = await supabase.from('coverage_areas').insert([row]).select().single()
+    if (error) throw error
+    res.status(201).json({ success: true, data })
+  } catch (err) {
+    if (err.code === '42P01') return res.status(503).json({ error: 'coverage_areas table not found. Run migration first.' })
+    res.status(500).json({ error: 'Failed to create coverage area', message: err.message })
+  }
+})
+
+app.put('/api/coverage-areas/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
+  try {
+    const { name, color, applies_weekends, display_order, is_active } = req.body
+    const updates = { updated_at: new Date().toISOString() }
+    if (name !== undefined) updates.name = name.trim()
+    if (color !== undefined) updates.color = color
+    if (applies_weekends !== undefined) updates.applies_weekends = applies_weekends
+    if (display_order !== undefined) updates.display_order = display_order
+    if (is_active !== undefined) updates.is_active = is_active
+    const { data, error } = await supabase.from('coverage_areas').update(updates).eq('id', req.params.id).select().single()
+    if (error) throw error
+    res.json({ success: true, data })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update coverage area', message: err.message })
+  }
+})
+
+app.delete('/api/coverage-areas/:id', authenticateToken, checkPermission('system_settings', 'delete'), async (req, res) => {
+  try {
+    // Check if any schedules use this area
+    const { data: inUse } = await supabase
+      .from('oncall_schedule')
+      .select('id')
+      .eq('coverage_area_id', req.params.id)
+      .limit(1)
+    if (inUse && inUse.length > 0)
+      return res.status(409).json({ error: 'Area is in use by existing schedules. Deactivate instead.' })
+    const { error } = await supabase.from('coverage_areas').delete().eq('id', req.params.id)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete coverage area', message: err.message })
   }
 })
 
