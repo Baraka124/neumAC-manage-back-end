@@ -3924,13 +3924,14 @@ app.get('/api/coverage-areas', authenticateToken, apiLimiter, async (req, res) =
 
 app.post('/api/coverage-areas', authenticateToken, checkPermission('system_settings', 'create'), async (req, res) => {
   try {
-    const { name, code, color, applies_weekends, display_order } = req.body
+    const { name, code, color, applies_weekends, display_order, requires_coverage } = req.body
     if (!name?.trim()) return res.status(400).json({ error: 'Name is required' })
     const row = {
       name: name.trim(),
       code: (code || name).trim().toUpperCase().replace(/\s+/g, '_').slice(0, 20),
       color: color || '#00b3b3',
       applies_weekends: applies_weekends !== false,
+      requires_coverage: requires_coverage === true,
       display_order: display_order || 0,
       is_active: true
     }
@@ -3945,11 +3946,12 @@ app.post('/api/coverage-areas', authenticateToken, checkPermission('system_setti
 
 app.put('/api/coverage-areas/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
   try {
-    const { name, color, applies_weekends, display_order, is_active } = req.body
+    const { name, color, applies_weekends, requires_coverage, display_order, is_active } = req.body
     const updates = { updated_at: new Date().toISOString() }
     if (name !== undefined) updates.name = name.trim()
     if (color !== undefined) updates.color = color
     if (applies_weekends !== undefined) updates.applies_weekends = applies_weekends
+    if (requires_coverage !== undefined) updates.requires_coverage = requires_coverage
     if (display_order !== undefined) updates.display_order = display_order
     if (is_active !== undefined) updates.is_active = is_active
     const { data, error } = await supabase.from('coverage_areas').update(updates).eq('id', req.params.id).select().single()
