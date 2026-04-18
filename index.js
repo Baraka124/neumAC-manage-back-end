@@ -1687,7 +1687,7 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
       backup_physician_id:  d.backup_physician_id  || null,
       coverage_notes:       d.coverage_notes       || null,
       coverage_area_id:     d.coverage_area_id     || null,
-      schedule_id:          d.schedule_id          || generateId('SCH'),
+      schedule_id:          generateId('SCH'),   // always server-generated — never trust client value
       created_by:           req.user.id,
       created_at:           new Date().toISOString(),
       updated_at:           new Date().toISOString()
@@ -1696,8 +1696,12 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
     if (error) throw error;
     res.status(201).json(data);
   } catch (error) {
-    if (error.code === '23505') return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date.' });
-    if (error.code === '42703') return res.status(500).json({ error: 'Schema mismatch', message: 'Run the coverage_areas migration in Supabase first. Column missing: ' + error.message });
+    if (error.code === '23505' && error.detail?.includes('coverage_area_id'))
+      return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date.' });
+    if (error.code === '23505')
+      return res.status(409).json({ error: 'Duplicate schedule', message: 'A schedule with this ID already exists. Please try again.' });
+    if (error.code === '42703')
+      return res.status(500).json({ error: 'Schema mismatch', message: 'Run the coverage_areas migration in Supabase first. Column missing: ' + error.message });
     res.status(500).json({ error: 'Failed to create on-call schedule', message: error.message });
   }
 });
