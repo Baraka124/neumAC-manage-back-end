@@ -1677,40 +1677,50 @@ app.get('/api/oncall/upcoming', authenticateToken, apiLimiter, async (req, res) 
 
 app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'create'), validate(schemas.onCall), async (req, res) => {
   try {
-    const dataSource = req.validatedData || req.body;
-    // FIX 1 applied here too: duty_date comes through Joi as Date object
+    const d = req.validatedData || req.body;
     const scheduleData = {
-      ...dataSource,
-      duty_date: formatDate(dataSource.duty_date),
-      schedule_id: dataSource.schedule_id || generateId('SCH'),
-      // Coerce empty string to null for UUID FK columns
-      coverage_area_id: dataSource.coverage_area_id || null,
-      backup_physician_id: dataSource.backup_physician_id || null,
-      created_by: req.user.id,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      duty_date:            formatDate(d.duty_date),
+      shift_type:           d.shift_type || 'primary_call',
+      start_time:           d.start_time,
+      end_time:             d.end_time,
+      primary_physician_id: d.primary_physician_id,
+      backup_physician_id:  d.backup_physician_id  || null,
+      coverage_notes:       d.coverage_notes       || null,
+      coverage_area_id:     d.coverage_area_id     || null,
+      schedule_id:          d.schedule_id          || generateId('SCH'),
+      created_by:           req.user.id,
+      created_at:           new Date().toISOString(),
+      updated_at:           new Date().toISOString()
     };
     const { data, error } = await supabase.from('oncall_schedule').insert([scheduleData]).select().single();
     if (error) throw error;
     res.status(201).json(data);
   } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date.' });
+    if (error.code === '42703') return res.status(500).json({ error: 'Schema mismatch', message: 'Run the coverage_areas migration in Supabase first. Column missing: ' + error.message });
     res.status(500).json({ error: 'Failed to create on-call schedule', message: error.message });
   }
 });
 
 app.put('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), validate(schemas.onCall), async (req, res) => {
   try {
-    const dataSource = req.validatedData || req.body;
+    const d = req.validatedData || req.body;
     const scheduleData = {
-      ...dataSource,
-      duty_date: formatDate(dataSource.duty_date),
-      coverage_area_id: dataSource.coverage_area_id || null,
-      backup_physician_id: dataSource.backup_physician_id || null,
-      updated_at: new Date().toISOString()
+      duty_date:            formatDate(d.duty_date),
+      shift_type:           d.shift_type || 'primary_call',
+      start_time:           d.start_time,
+      end_time:             d.end_time,
+      primary_physician_id: d.primary_physician_id,
+      backup_physician_id:  d.backup_physician_id  || null,
+      coverage_notes:       d.coverage_notes       || null,
+      coverage_area_id:     d.coverage_area_id     || null,
+      updated_at:           new Date().toISOString()
     };
     const { data, error } = await supabase.from('oncall_schedule').update(scheduleData).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Schedule not found' });
+      if (error.code === '23505')    return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date.' });
+      if (error.code === '42703')    return res.status(500).json({ error: 'Schema mismatch', message: 'Run the coverage_areas migration in Supabase first. Column missing: ' + error.message });
       throw error;
     }
     res.json(data);
