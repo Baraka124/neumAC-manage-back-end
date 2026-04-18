@@ -1696,10 +1696,19 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
     if (error) throw error;
     res.status(201).json(data);
   } catch (error) {
-    if (error.code === '23505' && error.detail?.includes('coverage_area_id'))
-      return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date.' });
-    if (error.code === '23505')
-      return res.status(409).json({ error: 'Duplicate schedule', message: 'A schedule with this ID already exists. Please try again.' });
+    if (error.code === '23505') {
+      // Check which unique constraint was violated
+      const isAreaDuplicate = error.constraint === 'oncall_one_primary_per_area_per_day'
+        || error.detail?.includes('coverage_area_id');
+      const isScheduleIdDuplicate = error.constraint?.includes('schedule_id')
+        || error.detail?.includes('schedule_id');
+      if (isAreaDuplicate)
+        return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date. Choose a different coverage area.' });
+      if (isScheduleIdDuplicate)
+        return res.status(409).json({ error: 'Duplicate schedule', message: 'ID collision — please try saving again.' });
+      // Unknown 23505 — log and return detail
+      return res.status(409).json({ error: 'Duplicate entry', message: error.detail || error.message });
+    }
     if (error.code === '42703')
       return res.status(500).json({ error: 'Schema mismatch', message: 'Run the coverage_areas migration in Supabase first. Column missing: ' + error.message });
     res.status(500).json({ error: 'Failed to create on-call schedule', message: error.message });
