@@ -1514,7 +1514,68 @@ app.get('/api/rotations/current', authenticateToken, apiLimiter, async (req, res
   }
 });
 
-// FIX 1: POST /api/rotations — formatDate() used on Joi-converted Date objects
+// GET /api/rotations/availability
+// Returns occupancy for a training unit over a date range so the frontend
+// can warn when capacity would be exceeded.
+// Query params: training_unit_id (required), start_date, end_date, exclude_id
+app.get('/api/rotations/availability', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { training_unit_id, start_date, end_date, exclude_id } = req.query
+    if (!training_unit_id) return res.status(400).json({ error: 'training_unit_id is required' })
+
+    // Fetch the unit to get its capacity
+    const { data: unit, error: unitErr } = await supabase
+      .from('training_units')
+      .select('id, unit_name, maximum_residents, current_resident_count')
+      .eq('id', training_unit_id)
+      .single()
+    if (unitErr) throw unitErr
+    if (!unit) return res.status(404).json({ error: 'Training unit not found' })
+
+    const capacity = unit.maximum_residents || 999
+
+    // Fetch overlapping active/scheduled rotations for this unit in the date range
+    let query = supabase
+      .from('resident_rotations')
+      .select('id, resident_id, start_date, end_date, rotation_status, resident:medical_staff!resident_rotations_resident_id_fkey(id, full_name)')
+      .eq('training_unit_id', training_unit_id)
+      .in('rotation_status', ['active', 'scheduled'])
+
+    if (start_date && end_date) {
+      // Overlapping: existing.start <= new.end AND existing.end >= new.start
+      query = query.lte('start_date', end_date).gte('end_date', start_date)
+    }
+
+    if (exclude_id) query = query.neq('id', exclude_id)
+
+    const { data: overlapping, error: rotErr } = await query.order('start_date')
+    if (rotErr) throw rotErr
+
+    const occupied = overlapping?.length || 0
+    const available = Math.max(0, capacity - occupied)
+
+    res.json({
+      unit_id:    unit.id,
+      unit_name:  unit.unit_name,
+      capacity,
+      occupied,
+      available,
+      is_full:    occupied >= capacity,
+      overlapping: (overlapping || []).map(r => ({
+        id:         r.id,
+        resident_id: r.resident_id,
+        resident_name: r.resident?.full_name || null,
+        start_date: r.start_date,
+        end_date:   r.end_date,
+        status:     r.rotation_status
+      }))
+    })
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to check rotation availability', message: error.message })
+  }
+})
+
+
 app.post('/api/rotations', authenticateToken, checkPermission('resident_rotations', 'create'), validate(schemas.rotation), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
