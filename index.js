@@ -4008,13 +4008,14 @@ app.post('/api/coverage-areas', authenticateToken, checkPermission('system_setti
 app.put('/api/coverage-areas/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
   try {
     const { name, color, applies_weekends, requires_coverage, display_order, is_active } = req.body
-    const updates = { updated_at: new Date().toISOString() }
+    const updates = {}
     if (name !== undefined) updates.name = name.trim()
     if (color !== undefined) updates.color = color
     if (applies_weekends !== undefined) updates.applies_weekends = applies_weekends
     if (requires_coverage !== undefined) updates.requires_coverage = requires_coverage
     if (display_order !== undefined) updates.display_order = display_order
     if (is_active !== undefined) updates.is_active = is_active
+    if (Object.keys(updates).length === 0) return res.json({ success: true, message: 'Nothing to update' })
     const { data, error } = await supabase.from('coverage_areas').update(updates).eq('id', req.params.id).select().single()
     if (error) throw error
     res.json({ success: true, data })
