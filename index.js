@@ -7,7 +7,7 @@
 // FIX 4: rotation_category Joi/DB enum mismatch corrected
 // FIX 5: research_lines added to rolePermissions
 // FIX 6: Duplicate on-call routes removed
-// FIX 8: full_name added to JWT payload  
+// FIX 8: full_name added to JWT payload   
 // FIX 9: Absence PUT recalculates total_days + current_status
 // --- NEW FIXES ---
 // FIX 10: /api/auth/me — req.user.userId → req.user.id (JWT field mismatch causing 401)
