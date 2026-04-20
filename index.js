@@ -7,7 +7,7 @@
 // FIX 4: rotation_category Joi/DB enum mismatch corrected
 // FIX 5: research_lines added to rolePermissions
 // FIX 6: Duplicate on-call routes removed
-// FIX 8: full_name added to JWT payload   
+// FIX 8: full_name added to JWT payload  
 // FIX 9: Absence PUT recalculates total_days + current_status
 // --- NEW FIXES ---
 // FIX 10: /api/auth/me — req.user.userId → req.user.id (JWT field mismatch causing 401)
@@ -34,6 +34,56 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 require('dotenv').config();
+
+// ── Notification system (Resend API — free, no extra npm install) ────────
+// Set RESEND_API_KEY and NOTIFY_EMAIL in Railway environment variables
+const NOTIFY_EMAIL  = process.env.NOTIFY_EMAIL  || '';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const FROM_EMAIL    = 'neumDesk <notifications@neumac.health>';
+
+async function sendNotification(subject, html, urgent = false) {
+  if (!NOTIFY_EMAIL) return;  // silently skip if not configured
+  if (!RESEND_API_KEY) {
+    // Dev mode: log to console
+    console.log(`[NOTIFY] ${subject}\n${html.replace(/<[^>]+>/g, ' ')}`);
+    return;
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: FROM_EMAIL,
+        to: [NOTIFY_EMAIL],
+        subject: urgent ? `🔴 ${subject}` : `📋 ${subject}`,
+        html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+          <div style="background:#0a1628;padding:16px 20px;border-radius:8px 8px 0 0">
+            <span style="color:#48cae4;font-weight:700;font-size:16px">neumDesk</span>
+            <span style="color:rgba(255,255,255,.4);font-size:12px;margin-left:8px">Clinical Operations</span>
+          </div>
+          <div style="background:#fff;padding:20px 24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px">
+            ${html}
+          </div>
+          <p style="color:#9ca3af;font-size:11px;margin-top:8px;text-align:center">
+            neumDesk · ${new Date().toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}
+          </p>
+        </div>`
+      })
+    });
+    if (!res.ok) console.error('[NOTIFY] Failed:', res.status, await res.text());
+  } catch (e) {
+    console.error('[NOTIFY] Error:', e.message);
+  }
+}
+
+// Helper: get physician name from DB
+async function getPhysicianName(id) {
+  if (!id) return 'Unknown';
+  try {
+    const { data } = await supabase.from('medical_staff').select('full_name').eq('id', id).single();
+    return data?.full_name || 'Unknown';
+  } catch { return 'Unknown'; }
+}
 
 // ============ INITIALIZATION ============
 const app = express();
@@ -1653,6 +1703,37 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Rotation not found' });
       throw error;
     }
+
+    // ── NOTIFICATION: Rotation ending soon with no successor scheduled ───
+    try {
+      const endDate = new Date(rotationData.end_date + 'T00:00:00');
+      const today   = new Date(); today.setHours(0,0,0,0);
+      const daysLeft = Math.round((endDate - today) / 86400000);
+      if (daysLeft >= 0 && daysLeft <= 7) {
+        // Check if a replacement rotation exists for this unit after end_date
+        const { data: nextRots } = await supabase.from('resident_rotations')
+          .select('id').eq('training_unit_id', rotationData.training_unit_id)
+          .in('rotation_status', ['scheduled','active'])
+          .gte('start_date', rotationData.end_date).limit(1);
+        if (!nextRots || nextRots.length === 0) {
+          const resName = await getPhysicianName(rotationData.resident_id);
+          const { data: unit } = await supabase.from('training_units').select('unit_name').eq('id', rotationData.training_unit_id).single();
+          const unitName = unit?.unit_name || 'Unknown unit';
+          sendNotification(
+            `Rotation ending soon — no successor: ${unitName}`,
+            `<h2 style="margin:0 0 12px;color:#0a1628">Rotation slot opening soon</h2>
+            <p style="color:#374151"><strong>${resName}</strong>'s rotation at <strong>${unitName}</strong> 
+            ends on <strong>${rotationData.end_date}</strong> (${daysLeft} day${daysLeft!==1?'s':''} from today).</p>
+            <p style="color:#f59e0b;font-weight:600">⚠ No successor has been scheduled for this unit.</p>
+            <a href="https://baraka124.github.io" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Assign rotation →</a>`,
+            daysLeft <= 3
+          );
+        }
+      }
+    } catch (notifErr) {
+      console.error('[NOTIFY] Rotation check error:', notifErr.message);
+    }
+
     res.json(data);
   } catch (error) {
     console.error('Failed to update rotation:', error);
@@ -1755,6 +1836,31 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
     };
     const { data, error } = await supabase.from('oncall_schedule').insert([scheduleData]).select().single();
     if (error) throw error;
+
+    // ── NOTIFICATION: On-call scheduled without backup ───────────────────
+    if (!scheduleData.backup_physician_id) {
+      getPhysicianName(scheduleData.primary_physician_id).then(async name => {
+        // Check if this area requires coverage
+        let areaName = 'Unknown area';
+        if (scheduleData.coverage_area_id) {
+          const { data: area } = await supabase.from('coverage_areas').select('name,requires_coverage').eq('id', scheduleData.coverage_area_id).single();
+          if (area) {
+            areaName = area.name;
+            if (!area.requires_coverage) return; // only notify for required areas
+          }
+        }
+        sendNotification(
+          `On-call without backup — ${areaName} on ${scheduleData.duty_date}`,
+          `<h2 style="margin:0 0 12px;color:#0a1628">On-call shift has no backup</h2>
+          <p style="color:#374151"><strong>${name}</strong> is scheduled for <strong>${areaName}</strong> 
+          on <strong>${scheduleData.duty_date}</strong> with no backup assigned.</p>
+          <p style="color:#f59e0b;font-weight:600">⚠ Consider assigning a backup physician.</p>
+          <a href="https://baraka124.github.io" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Open neumDesk →</a>`,
+          false
+        );
+      });
+    }
+
     res.status(201).json(data);
   } catch (error) {
     if (error.code === '23505') {
@@ -1996,6 +2102,21 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
     }
 
     console.log('✅ Absence record created:', data.id);
+    // ── NOTIFICATION: Absence without coverage ──────────────────────
+    if (!absenceData.coverage_arranged) {
+      getPhysicianName(absenceData.staff_member_id).then(name => {
+        const reason = (absenceData.absence_reason || 'absence').replace(/_/g,' ');
+        sendNotification(
+          `No coverage arranged — ${name}`,
+          `<h2 style="margin:0 0 12px;color:#0a1628">Absence recorded without coverage</h2>
+          <p style="color:#374151"><strong>${name}</strong> is absent (${reason}) 
+          from <strong>${absenceData.start_date}</strong> to <strong>${absenceData.end_date}</strong>.</p>
+          <p style="color:#ef4444;font-weight:600">⚠ No cover arranged — action required.</p>
+          <a href="https://baraka124.github.io" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Open neumDesk →</a>`,
+          true
+        );
+      });
+    }
     res.status(201).json({ success: true, data, message: 'Absence record created successfully' });
   } catch (error) {
     console.error('💥 Failed to create absence record:', error);
@@ -4127,6 +4248,27 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     Environment: ${NODE_ENV}
     ======================================================
   `);
+});
+
+// ── Test notification endpoint ───────────────────────────────────────────
+app.post('/api/notify/test', authenticateToken, async (req, res) => {
+  try {
+    await sendNotification(
+      'neumDesk notification test',
+      `<h2 style="color:#0a1628">Notifications are working</h2>
+      <p style="color:#374151">This is a test notification from neumDesk. You will receive alerts for:</p>
+      <ul style="color:#374151;padding-left:20px">
+        <li>Absences with no coverage arranged</li>
+        <li>On-call shifts with no backup assigned (required areas only)</li>
+        <li>Rotations ending within 7 days with no successor scheduled</li>
+      </ul>
+      <p style="color:#6b7280;font-size:13px">Sent to: ${NOTIFY_EMAIL || 'not configured'}</p>`,
+      false
+    );
+    res.json({ ok: true, to: NOTIFY_EMAIL || 'not configured (set NOTIFY_EMAIL env var)' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
