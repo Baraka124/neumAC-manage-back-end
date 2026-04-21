@@ -4250,6 +4250,95 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   `);
 });
 
+
+// ══════════════════════════════════════════════════════════════════════════════
+// UNIT STAFF — who works in each training unit (operational staffing)
+// GET  /api/training-units/:id/staff   → list attendings for a unit
+// POST /api/training-units/:id/staff   → add attending to unit
+// DELETE /api/training-units/:unitId/staff/:staffId → remove
+// GET  /api/staff/:id/units            → which units does this person belong to
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/training-units/:id/staff', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('unit_staff')
+      .select(`
+        id, role, assigned_from, assigned_until,
+        staff:medical_staff!unit_staff_staff_id_fkey(
+          id, full_name, staff_type, employment_status, professional_email
+        )
+      `)
+      .eq('unit_id', req.params.id)
+      .is('assigned_until', null)   // active only — no end date means current
+      .order('role')
+      .order('created_at');
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch unit staff', message: e.message });
+  }
+});
+
+app.post('/api/training-units/:id/staff', authenticateToken,
+  checkPermission('training_units', 'update'), async (req, res) => {
+  try {
+    const { staff_id, role = 'primary' } = req.body;
+    if (!staff_id) return res.status(400).json({ error: 'staff_id is required' });
+    const { data, error } = await supabase.from('unit_staff').insert([{
+      unit_id: req.params.id, staff_id, role,
+      assigned_from: formatDate(new Date()),
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    }]).select(`
+      id, role, assigned_from,
+      staff:medical_staff!unit_staff_staff_id_fkey(id, full_name, staff_type, employment_status)
+    `).single();
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'This clinician is already assigned to this unit' });
+      throw error;
+    }
+    res.status(201).json({ success: true, data });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to assign staff to unit', message: e.message });
+  }
+});
+
+app.delete('/api/training-units/:unitId/staff/:staffId', authenticateToken,
+  checkPermission('training_units', 'update'), async (req, res) => {
+  try {
+    const { error } = await supabase.from('unit_staff')
+      .update({ assigned_until: formatDate(new Date()), updated_at: new Date().toISOString() })
+      .eq('unit_id', req.params.unitId)
+      .eq('staff_id', req.params.staffId)
+      .is('assigned_until', null);
+    if (error) throw error;
+    res.json({ success: true, message: 'Clinician removed from unit' });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to remove staff from unit', message: e.message });
+  }
+});
+
+// Which units does a staff member belong to? (used in staff profile + absence impact)
+app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('unit_staff')
+      .select(`
+        id, role, assigned_from,
+        unit:training_units!unit_staff_unit_id_fkey(
+          id, unit_name, unit_code, unit_type, unit_status, department_id
+        )
+      `)
+      .eq('staff_id', req.params.id)
+      .is('assigned_until', null)
+      .order('role');
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch staff units', message: e.message });
+  }
+});
+
 // ── Test notification endpoint ───────────────────────────────────────────
 app.post('/api/notify/test', authenticateToken, async (req, res) => {
   try {
