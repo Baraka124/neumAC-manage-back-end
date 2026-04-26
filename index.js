@@ -3,7 +3,7 @@
 // --- ORIGINAL FIXES ---
 // FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
-// FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT  
+// FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
 // FIX 4: rotation_category Joi/DB enum mismatch corrected
 // FIX 5: research_lines added to rolePermissions
 // FIX 6: Duplicate on-call routes removed
@@ -1457,6 +1457,32 @@ app.put('/api/training-units/:id', authenticateToken, checkPermission('training_
     const dataSource = req.validatedData || req.body;
     // FIX: Joi field 'supervising_attending_id' must map to DB columns 'supervisor_id' + 'default_supervisor_id'
     // stripUnknown:true would drop supervising_attending_id since it's not a DB column name
+    // GAP 2 FIX: Check if reducing capacity would breach existing rotations
+    if (dataSource.maximum_residents) {
+      const { data: currentUnit } = await supabase
+        .from('training_units')
+        .select('maximum_residents')
+        .eq('id', req.params.id)
+        .single();
+      if (currentUnit && dataSource.maximum_residents < currentUnit.maximum_residents) {
+        const today = new Date().toISOString().split('T')[0];
+        const { data: activeRots } = await supabase
+          .from('resident_rotations')
+          .select('id')
+          .eq('training_unit_id', req.params.id)
+          .in('rotation_status', ['active', 'scheduled'])
+          .gte('end_date', today);
+        const occupied = activeRots?.length || 0;
+        if (occupied > dataSource.maximum_residents) {
+          return res.status(409).json({
+            error: 'Capacity conflict',
+            message: `Cannot reduce capacity to ${dataSource.maximum_residents} — unit currently has ${occupied} active/scheduled rotations`,
+            occupied, requested: dataSource.maximum_residents
+          });
+        }
+      }
+    }
+
     const updateData = {
       unit_name:         dataSource.unit_name,
       unit_code:         dataSource.unit_code,
@@ -1738,6 +1764,31 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
     if (checkError) throw checkError;
     if (existingRotations && existingRotations.length > 0) {
       return res.status(409).json({ error: 'Scheduling conflict', message: 'Resident already has a rotation during these dates', conflicts: existingRotations });
+    }
+
+    // GAP 1 FIX: Check unit capacity for the requested date range
+    const { data: unitForCap, error: unitCapErr } = await supabase
+      .from('training_units')
+      .select('id, unit_name, maximum_residents')
+      .eq('id', dataSource.training_unit_id)
+      .single();
+    if (unitCapErr) throw unitCapErr;
+    if (unitForCap) {
+      const { data: overlappingInUnit } = await supabase
+        .from('resident_rotations')
+        .select('id, resident_id, start_date, end_date')
+        .eq('training_unit_id', dataSource.training_unit_id)
+        .in('rotation_status', ['active', 'scheduled'])
+        .lte('start_date', endDate)
+        .gte('end_date', startDate);
+      const occupied = overlappingInUnit?.length || 0;
+      if (occupied >= unitForCap.maximum_residents) {
+        return res.status(409).json({
+          error: 'Unit at capacity',
+          message: `"${unitForCap.unit_name}" is full for this period (${occupied}/${unitForCap.maximum_residents} slots occupied)`,
+          occupied, capacity: unitForCap.maximum_residents
+        });
+      }
     }
 
     const rotationData = {
