@@ -3185,13 +3185,18 @@ app.get('/api/analytics/research-dashboard', authenticateToken, apiLimiter, asyn
     const projectsByStage = { 'Idea': 0, 'Prototipo': 0, 'Piloto': 0, 'Validación': 0, 'Escalamiento': 0, 'Comercialización': 0 };
     const projectsByCategory = { 'Dispositivo': 0, 'Salud Digital': 0, 'IA / ML': 0, 'Tecnología Quirúrgica': 0 };
     const partnerNeeds = {};
+    // Map legacy development_stage values → current_stage keys
+    const DEV_STAGE_MAP = { 'En Desarrollo': 'Prototipo', 'Fase Piloto': 'Piloto', 'Validación Clínica': 'Validación' };
     trials?.forEach(t => { if (trialsByPhase[t.phase] !== undefined) trialsByPhase[t.phase]++; if (trialsByStatus[t.status] !== undefined) trialsByStatus[t.status]++; });
     projects?.forEach(p => {
-      if (projectsByStage[p.current_stage] !== undefined) projectsByStage[p.current_stage]++;
+      const stage = p.current_stage || DEV_STAGE_MAP[p.development_stage] || null;
+      if (stage && projectsByStage[stage] !== undefined) projectsByStage[stage]++;
       if (projectsByCategory[p.category] !== undefined) projectsByCategory[p.category]++;
       p.partner_needs?.forEach(n => { partnerNeeds[n] = (partnerNeeds[n] || 0) + 1; });
     });
-    res.json({ success: true, data: { summary: { totalResearchLines: researchLines?.length || 0, activeResearchLines: researchLines?.filter(l => l.active !== false).length || 0, totalTrials: trials?.length || 0, activeTrials: (trialsByStatus['Activo'] || 0) + (trialsByStatus['Reclutando'] || 0), totalProjects: projects?.length || 0, activeProjects: (projectsByStage['Piloto'] || 0) + (projectsByStage['Validación'] || 0) + (projectsByStage['Escalamiento'] || 0) }, clinicalTrials: { byPhase: trialsByPhase, byStatus: trialsByStatus }, innovationProjects: { byStage: projectsByStage, byCategory: projectsByCategory, partnerNeeds: Object.entries(partnerNeeds).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count) } } });
+    const activeTrialsCount = (trialsByStatus['Activo'] || 0) + (trialsByStatus['Reclutando'] || 0);
+    const activeProjectsCount = (projectsByStage['Piloto'] || 0) + (projectsByStage['Validación'] || 0) + (projectsByStage['Escalamiento'] || 0) + (projectsByStage['Comercialización'] || 0);
+    res.json({ success: true, data: { summary: { totalResearchLines: researchLines?.length || 0, activeResearchLines: researchLines?.filter(l => l.active !== false).length || 0, totalTrials: trials?.length || 0, totalStudies: trials?.length || 0, activeTrials: activeTrialsCount, activeStudies: activeTrialsCount, totalProjects: projects?.length || 0, activeProjects: activeProjectsCount }, clinicalTrials: { byPhase: trialsByPhase, byStatus: trialsByStatus }, innovationProjects: { byStage: projectsByStage, byCategory: projectsByCategory, partnerNeeds: Object.entries(partnerNeeds).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count) } } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
