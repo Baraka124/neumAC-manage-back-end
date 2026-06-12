@@ -2,7 +2,7 @@
 // VERSION 5.4 - ALL BUGS FIXED
 // --- ORIGINAL FIXES ---
 // FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
-// FIX 2: Absence creation - total_days + current_status NOT NULL columns populated  
+// FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
 // FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
 // FIX 4: rotation_category Joi/DB enum mismatch corrected
 // FIX 5: research_lines added to rolePermissions
@@ -40,6 +40,7 @@ require('dotenv').config();
 const NOTIFY_EMAIL  = process.env.NOTIFY_EMAIL  || '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL    = 'neumDesk <notifications@neumac.health>';
+const APP_URL       = process.env.APP_URL || process.env.FRONTEND_URL || 'https://baraka124.github.io/neumAC-manage-Frontend-end';
 
 async function sendNotification(subject, html, urgent = false) {
   if (!NOTIFY_EMAIL) return;  // silently skip if not configured
@@ -232,36 +233,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Maintenance mode middleware ──
-let _maintenanceMode = false;
-let _maintenanceLastCheck = 0;
-const MAINTENANCE_CACHE_MS = 60000;
-
-async function checkMaintenanceMode() {
-  if (Date.now() - _maintenanceLastCheck < MAINTENANCE_CACHE_MS) return _maintenanceMode;
-  try {
-    const { data } = await supabase.from('system_settings').select('maintenance_mode').limit(1).single();
-    _maintenanceMode = data?.maintenance_mode === true;
-    _maintenanceLastCheck = Date.now();
-  } catch { /* don't block on DB errors */ }
-  return _maintenanceMode;
-}
-
-app.use(async (req, res, next) => {
-  const bypass = ['/health', '/api/auth/login', '/api/auth/logout'];
-  if (bypass.some(p => req.path.startsWith(p))) return next();
-  const inMaintenance = await checkMaintenanceMode();
-  if (!inMaintenance) return next();
-  // System admins bypass maintenance
-  const token = req.headers.authorization?.split(' ')[1];
-  if (token) {
-    try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      if (decoded?.role === 'system_admin') return next();
-    } catch {}
-  }
-  res.status(503).json({ error: 'maintenance', message: 'The system is currently under maintenance. Please try again shortly.' });
-});
+// ── Maintenance mode — see maintenanceCheck middleware registered on /api below ──
 
 // ============ UTILITY FUNCTIONS ============
 const generateId = (prefix) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 9)}`;
@@ -884,8 +856,23 @@ app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPasswo
     const { data: user } = await supabase.from('app_users').select('id, email, full_name').eq('email', email.toLowerCase()).single();
     // Always return 200 — never reveal whether the email exists (prevents enumeration)
     if (user) {
-      // Token generated but not stored — email sending not yet implemented (B-SEC1)
-      jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+      const resetToken = jwt.sign({ userId: user.id, email: user.email, purpose: 'password_reset' }, JWT_SECRET, { expiresIn: '1h' });
+      const tokenExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      // Store token hash in DB so it can be invalidated after use
+      await supabase.from('app_users').update({
+        reset_token: resetToken,
+        reset_token_expires_at: tokenExpiry,
+        updated_at: new Date().toISOString()
+      }).eq('id', user.id);
+      const resetLink = `${APP_URL}?reset_token=${resetToken}`;
+      await sendNotification(
+        'Password reset request — neumDesk',
+        `<h2 style="margin:0 0 12px;color:#0a1628">Password Reset</h2>
+        <p style="color:#374151">Hello <strong>${user.full_name || user.email}</strong>,</p>
+        <p style="color:#374151">A password reset was requested for your neumDesk account. Click the link below to set a new password. This link expires in <strong>1 hour</strong>.</p>
+        <a href="${resetLink}" style="display:inline-block;margin:12px 0;padding:10px 20px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px;font-weight:600">Reset my password →</a>
+        <p style="color:#9ca3af;font-size:12px;margin-top:16px">If you did not request this reset, you can safely ignore this email. Your password will not change.</p>`
+      );
     }
     res.json({ message: 'If an account with that email exists, a reset link has been sent.' });
   } catch (error) {
@@ -896,15 +883,38 @@ app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPasswo
 app.post('/api/auth/reset-password', authLimiter, validate(schemas.resetPassword), async (req, res) => {
   try {
     const { token, new_password } = req.validatedData || req.body;
-    const decoded = jwt.verify(token, JWT_SECRET);
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(400).json({ error: 'Invalid or expired token', message: 'The reset link is invalid or has expired. Please request a new one.' });
+    }
+    if (decoded.purpose !== 'password_reset') {
+      return res.status(400).json({ error: 'Invalid token', message: 'This token cannot be used for password reset.' });
+    }
+    // Verify token matches what's stored (prevents token reuse after a new reset was requested)
+    const { data: user } = await supabase.from('app_users')
+      .select('id, reset_token, reset_token_expires_at')
+      .eq('email', decoded.email).single();
+    if (!user || user.reset_token !== token) {
+      return res.status(400).json({ error: 'Token already used', message: 'This reset link has already been used or superseded. Please request a new one.' });
+    }
+    if (new Date(user.reset_token_expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Token expired', message: 'This reset link has expired. Please request a new one.' });
+    }
     const passwordHash = await bcrypt.hash(new_password, 10);
     const { error } = await supabase.from('app_users')
-      .update({ password_hash: passwordHash, updated_at: new Date().toISOString() })
+      .update({
+        password_hash: passwordHash,
+        reset_token: null,
+        reset_token_expires_at: null,
+        updated_at: new Date().toISOString()
+      })
       .eq('email', decoded.email);
     if (error) throw error;
-    res.json({ message: 'Password reset successfully' });
+    res.json({ message: 'Password reset successfully. You can now log in with your new password.' });
   } catch (error) {
-    res.status(400).json({ error: 'Invalid or expired token', message: error.message });
+    res.status(400).json({ error: 'Failed to reset password', message: error.message });
   }
 });
 
@@ -1194,6 +1204,7 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       can_be_coi:  dataSource.can_be_coi  ?? false,
       has_phd:     dataSource.has_phd     ?? false,
       phd_field:   dataSource.phd_field   || null,
+      clinical_study_certificates: Array.isArray(dataSource.clinical_study_certificates) ? dataSource.clinical_study_certificates : (dataSource.clinical_study_certificates || null),
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('medical_staff').update(updateData).eq('id', req.params.id).select().single();
@@ -1864,7 +1875,7 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
             <p style="color:#374151"><strong>${resName}</strong>'s rotation at <strong>${unitName}</strong> 
             ends on <strong>${rotationData.end_date}</strong> (${daysLeft} day${daysLeft!==1?'s':''} from today).</p>
             <p style="color:#f59e0b;font-weight:600">⚠ No successor has been scheduled for this unit.</p>
-            <a href="https://baraka124.github.io" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Assign rotation →</a>`,
+            <a href="${APP_URL}" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Assign rotation →</a>`,
             daysLeft <= 3
           );
         }
@@ -1994,7 +2005,7 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
           <p style="color:#374151"><strong>${name}</strong> is scheduled for <strong>${areaName}</strong> 
           on <strong>${scheduleData.duty_date}</strong> with no backup assigned.</p>
           <p style="color:#f59e0b;font-weight:600">⚠ Consider assigning a backup physician.</p>
-          <a href="https://baraka124.github.io" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Open neumDesk →</a>`,
+          <a href="${APP_URL}" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Open neumDesk →</a>`,
           false
         );
       });
@@ -2251,7 +2262,7 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
           <p style="color:#374151"><strong>${name}</strong> is absent (${reason}) 
           from <strong>${absenceData.start_date}</strong> to <strong>${absenceData.end_date}</strong>.</p>
           <p style="color:#ef4444;font-weight:600">⚠ No cover arranged — action required.</p>
-          <a href="https://baraka124.github.io" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Open neumDesk →</a>`,
+          <a href="${APP_URL}" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Open neumDesk →</a>`,
           true
         );
       });
@@ -2599,19 +2610,7 @@ app.get('/api/notifications/unread', authenticateToken, apiLimiter, async (req, 
   }
 });
 
-app.put('/api/notifications/:id/read', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { error } = await supabase.from('notifications')
-      .update({ read: true })
-      .eq('id', req.params.id)
-      .eq('user_id', req.user.id);
-    if (error) throw error;
-    res.json({ message: 'Notification marked as read' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update notification', message: error.message });
-  }
-});
-
+// Static route MUST come before /:id/read — otherwise Express matches 'mark-all-read' as :id
 app.put('/api/notifications/mark-all-read', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { error } = await supabase.from('notifications')
@@ -2622,6 +2621,19 @@ app.put('/api/notifications/mark-all-read', authenticateToken, apiLimiter, async
     res.json({ message: 'All notifications marked as read' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update notifications', message: error.message });
+  }
+});
+
+app.put('/api/notifications/:id/read', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { error } = await supabase.from('notifications')
+      .update({ read: true })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ message: 'Notification marked as read' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update notification', message: error.message });
   }
 });
 
@@ -2723,10 +2735,14 @@ app.delete('/api/attachments/:id', authenticateToken, checkPermission('attachmen
 app.get('/api/system-stats', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const today = formatDate(new Date());
+    // FIX 8: Use staff_types table to find resident/attending keys dynamically
+    const { data: staffTypes } = await supabase.from('staff_types').select('type_key, is_resident_type').eq('is_active', true);
+    const residentKeys  = (staffTypes || []).filter(t =>  t.is_resident_type).map(t => t.type_key);
+    const attendingKeys = (staffTypes || []).filter(t => !t.is_resident_type).map(t => t.type_key);
     const [totalStaff, activeAttending, activeResidents, todayOnCall, currentlyAbsent, activeRotations] = await Promise.all([
       supabase.from('medical_staff').select('*', { count: 'exact', head: true }),
-      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).eq('staff_type', 'attending_physician').eq('employment_status', 'active'),
-      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).eq('staff_type', 'medical_resident').eq('employment_status', 'active'),
+      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).in('staff_type', attendingKeys.length ? attendingKeys : ['__none__']).eq('employment_status', 'active'),
+      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).in('staff_type', residentKeys.length ? residentKeys : ['__none__']).eq('employment_status', 'active'),
       supabase.from('oncall_schedule').select('*', { count: 'exact', head: true }).eq('duty_date', today),
       supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'currently_absent'),
       supabase.from('resident_rotations').select('*', { count: 'exact', head: true }).eq('rotation_status', 'active')
@@ -2751,7 +2767,7 @@ app.get('/api/dashboard/upcoming-events', authenticateToken, apiLimiter, async (
     const today = formatDate(new Date());
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     const [rotations, oncall, absences] = await Promise.all([
-      supabase.from('resident_rotations').select('*, resident:medical_staff!resident_rotations_resident_id_fkey(full_name), training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name)').gte('start_date', today).lte('start_date', nextWeek).eq('rotation_status', 'upcoming').order('start_date').limit(5),
+      supabase.from('resident_rotations').select('*, resident:medical_staff!resident_rotations_resident_id_fkey(full_name), training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name)').gte('start_date', today).lte('start_date', nextWeek).eq('rotation_status', 'scheduled').order('start_date').limit(5),
       supabase.from('oncall_schedule').select('*, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name)').gte('duty_date', today).lte('duty_date', nextWeek).order('duty_date').limit(5),
       supabase.from('staff_absence_records').select('*, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(full_name)').eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek).order('start_date').limit(5)
     ]);
@@ -2774,7 +2790,19 @@ app.get('/api/settings', authenticateToken, apiLimiter, async (req, res) => {
 
 app.put('/api/settings', authenticateToken, checkPermission('system_settings', 'update'), validate(schemas.systemSettings), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('system_settings').upsert([req.validatedData || req.body]).select().single();
+    const payload = req.validatedData || req.body;
+    // Fetch existing row to get its id (avoids upsert without onConflict creating duplicates)
+    const { data: existing } = await supabase.from('system_settings').select('id').limit(1).single();
+    let data, error;
+    if (existing?.id) {
+      ({ data, error } = await supabase.from('system_settings')
+        .update({ ...payload, updated_at: new Date().toISOString() })
+        .eq('id', existing.id).select().single());
+    } else {
+      ({ data, error } = await supabase.from('system_settings')
+        .insert([{ ...payload, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
+        .select().single());
+    }
     if (error) throw error;
     res.json(data);
   } catch (error) {
@@ -2785,13 +2813,20 @@ app.put('/api/settings', authenticateToken, checkPermission('system_settings', '
 // ===== 19. SEARCH & AVAILABLE DATA =====
 app.get('/api/available-data', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const [departments, residents, attendings, trainingUnits] = await Promise.all([
+    // FIX 8: Replaced hardcoded 'medical_resident' / 'attending_physician' strings with
+    // dynamic lookup from staff_types table so renamed types still work
+    const [departments, staffTypes, allActiveStaff, trainingUnits] = await Promise.all([
       supabase.from('departments').select('id, name, code').eq('status', 'active').order('name'),
-      supabase.from('medical_staff').select('id, full_name, training_year').eq('staff_type', 'medical_resident').eq('employment_status', 'active').order('full_name'),
-      supabase.from('medical_staff').select('id, full_name, specialization').eq('staff_type', 'attending_physician').eq('employment_status', 'active').order('full_name'),
+      supabase.from('staff_types').select('type_key, is_resident_type').eq('is_active', true),
+      supabase.from('medical_staff').select('id, full_name, training_year, specialization, staff_type').eq('employment_status', 'active').order('full_name'),
       supabase.from('training_units').select('id, unit_name, unit_code, maximum_residents').eq('unit_status', 'active').order('unit_name')
     ]);
-    res.json({ success: true, data: { departments: departments.data || [], residents: residents.data || [], attendings: attendings.data || [], trainingUnits: trainingUnits.data || [] } });
+    const residentKeys = new Set((staffTypes.data || []).filter(t => t.is_resident_type).map(t => t.type_key));
+    const attendingKeys = new Set((staffTypes.data || []).filter(t => !t.is_resident_type).map(t => t.type_key));
+    const staff = allActiveStaff.data || [];
+    const residents  = staff.filter(s => residentKeys.has(s.staff_type)).map(s => ({ id: s.id, full_name: s.full_name, training_year: s.training_year }));
+    const attendings = staff.filter(s => attendingKeys.has(s.staff_type)).map(s => ({ id: s.id, full_name: s.full_name, specialization: s.specialization }));
+    res.json({ success: true, data: { departments: departments.data || [], residents, attendings, trainingUnits: trainingUnits.data || [] } });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch available data', message: error.message });
   }
@@ -2891,7 +2926,8 @@ app.put('/api/research-lines/:id', authenticateToken, checkPermission('research_
   try {
     // B6 FIX: Whitelist updatable fields — do not pass req.body directly to prevent
     // clients from overwriting id, created_at, line_number (unique) or injecting garbage fields
-    const { name, description, capabilities, sort_order, active, keywords, coordinator_id } = req.body;
+    const { description, capabilities, sort_order, active, keywords, coordinator_id } = req.body;
+    const name = req.body.name || req.body.research_line_name;
     const updatePayload = { updated_at: new Date().toISOString() };
     if (name !== undefined)           updatePayload.name           = name;
     if (description !== undefined)    updatePayload.description    = description;
@@ -3237,7 +3273,7 @@ app.get('/api/analytics/clinical-trials-timeline', authenticateToken, apiLimiter
   }
 });
 
-app.get('/api/analytics/summary', authenticateToken, apiLimiter, async (req, res) => {
+app.get('/api/analytics/summary', authenticateToken, checkPermission('research_lines', 'read'), apiLimiter, async (req, res) => {
   try {
     const [{ count: totalRL }, { count: totalTrials }, { count: activeTrials }, { count: totalProj }, { count: activeProj }] = await Promise.all([
       supabase.from('research_lines').select('*', { count: 'exact', head: true }),
@@ -3663,11 +3699,17 @@ app.post('/api/rotation-services', authenticateToken, checkPermission('system_se
 
 app.put('/api/rotation-services/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
   try {
-    const { name, contact_name, contact_email, contact_phone, status } = req.body
+    const { name, contact_name, contact_email, contact_phone, active } = req.body
+    const updates = { updated_at: new Date().toISOString() }
+    if (name         !== undefined) updates.name          = name.trim()
+    if (contact_name !== undefined) updates.contact_name  = contact_name || null
+    if (contact_email!== undefined) updates.contact_email = contact_email || null
+    if (contact_phone!== undefined) updates.contact_phone = contact_phone || null
+    if (active       !== undefined) updates.status        = active ? 'active' : 'inactive'
     const { data, error } = await supabase.from('departments')
-      .update({ name, contact_name, contact_email, contact_phone, status, updated_at: new Date().toISOString() })
+      .update(updates)
       .eq('id', req.params.id)
-      .neq('service_type', 'home_department') // never allow editing the home dept via this route
+      .eq('service_type', 'rotation_service')
       .select().single()
     if (error) throw error
     if (!data) return res.status(404).json({ error: 'Rotation service not found' })
@@ -4320,7 +4362,6 @@ app.post('/api/oncall/batch', authenticateToken, checkPermission('oncall_schedul
       primary_physician_id: s.primary_physician_id,
       backup_physician_id:  s.backup_physician_id  || null,
       coverage_notes:       s.coverage_notes       || null,
-      has_conflict:         s.has_conflict          || false,
       schedule_id:          generateId('SCH'),
       created_by:           req.user.id,
       created_at:           new Date().toISOString(),
