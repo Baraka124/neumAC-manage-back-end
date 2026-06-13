@@ -2999,11 +2999,15 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
   try {
     const { research_line_id, phase, status, page = 1, limit = 50 } = req.query;
     const offset = (page - 1) * limit;
-    let query = supabase.from('clinical_trials').select('*, research_lines(name)', { count: 'exact' });
+    let query = supabase.from('clinical_trials').select(`
+      *, research_lines(name, line_number),
+      pi:medical_staff!clinical_trials_principal_investigator_id_fkey(id, full_name, professional_email),
+      dm:medical_staff!clinical_trials_data_manager_id_fkey(id, full_name)
+    `, { count: 'exact' });
     if (research_line_id) query = query.eq('research_line_id', research_line_id);
     if (phase) query = query.eq('phase', phase);
     if (status) query = query.eq('status', status);
-    const { data, error, count } = await query.order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+    const { data, error, count } = await query.order('display_order').order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
     res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
   } catch (error) {
@@ -3014,15 +3018,24 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
 app.post('/api/clinical-trials', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.clinicalTrial), async (req, res) => {
   try {
     const body = { ...req.body };
-    // Observational/Expanded Access studies may not have a phase — default to 'Phase I' to satisfy
-    // the DB CHECK constraint until the schema is updated to allow null or N/A
     const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
     if (!VALID_PHASES.includes(body.phase)) body.phase = 'Phase I';
-    // protocol_id is NOT NULL UNIQUE in DB — auto-generate if not provided
     if (!body.protocol_id) body.protocol_id = `PROT-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
+    // Ensure array fields are arrays
+    body.target_diseases  = Array.isArray(body.target_diseases)  ? body.target_diseases  : [];
+    body.tags             = Array.isArray(body.tags)             ? body.tags             : [];
+    body.co_investigators = Array.isArray(body.co_investigators) ? body.co_investigators : [];
+    body.sub_investigators= Array.isArray(body.sub_investigators)? body.sub_investigators: [];
+    body.milestones       = Array.isArray(body.milestones)       ? body.milestones       : [];
+    body.external_team    = Array.isArray(body.external_team)    ? body.external_team.map(m => ({ name: m.name?.trim()||null, institution: m.institution?.trim()||null, role: m.role?.trim()||null, email: m.email?.trim()||null })).filter(m=>m.name||m.institution) : [];
+    body.team_roles       = (typeof body.team_roles === 'object' && !Array.isArray(body.team_roles)) ? body.team_roles : {};
+    body.data_manager_id  = body.data_manager_id || null;
+    // Scope: if general, scope_note required; if specific, clear scope_note
+    if (body.scope_type === 'general' && !body.scope_note) body.scope_note = null;
+    if (body.scope_type === 'specific') body.scope_note = null;
     const { data, error } = await supabase.from('clinical_trials')
       .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
-      .select().single();
+      .select('*, research_lines(name, line_number), pi:medical_staff!clinical_trials_principal_investigator_id_fkey(id, full_name)').single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Clinical study created successfully' });
   } catch (error) {
@@ -3032,34 +3045,67 @@ app.post('/api/clinical-trials', authenticateToken, checkPermission('research_li
 
 app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.clinicalTrial), async (req, res) => {
   try {
-    // B6 FIX: Whitelist updatable fields
     const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
-    const VALID_STATUSES = ['Reclutando','Activo','Completado','En preparación'];
+    const VALID_STATUSES = ['Reclutando','Activo','Completado','En preparación','Suspendido'];
+    const VALID_ETHICS = ['pending','approved','exempt','not_required'];
+    const VALID_FUNDING = ['not_applicable','seeking','funded','completed'];
+    const VALID_SCOPE = ['specific','general'];
+    const VALID_POPULATION = ['adult','paediatric','mixed','not_applicable'];
     const b = req.body;
     const updatePayload = {
       updated_at: new Date().toISOString(),
-      ...(b.title              !== undefined && { title: b.title }),
-      ...(b.research_line_id   !== undefined && { research_line_id: b.research_line_id || null }),
-      ...(b.phase              !== undefined && { phase: VALID_PHASES.includes(b.phase) ? b.phase : 'Phase I' }),
-      ...(b.status             !== undefined && (() => {
-        if (!VALID_STATUSES.includes(b.status)) return {};  // unknown status — skip field, keep current DB value
-        return { status: b.status };
-      })()),
-      ...(b.description        !== undefined && { description: b.description }),
-      ...(b.inclusion_criteria !== undefined && { inclusion_criteria: b.inclusion_criteria }),
-      ...(b.exclusion_criteria !== undefined && { exclusion_criteria: b.exclusion_criteria }),
-      ...(b.principal_investigator_id !== undefined && { principal_investigator_id: b.principal_investigator_id || null }),
-      ...(b.co_investigators   !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
-      ...(b.sub_investigators  !== undefined && { sub_investigators: Array.isArray(b.sub_investigators) ? b.sub_investigators : [] }),
-      ...(b.contact_email      !== undefined && { contact_email: b.contact_email }),
-      ...(b.featured_in_website!== undefined && { featured_in_website: b.featured_in_website }),
-      ...(b.display_order      !== undefined && { display_order: b.display_order }),
-      ...(b.start_date         !== undefined && { start_date: b.start_date || null }),
-      ...(b.end_date           !== undefined && { end_date: b.end_date || null }),
-      ...(b.sponsor_name       !== undefined && { sponsor_name: b.sponsor_name }),
-      ...(b.tags               !== undefined && { tags: Array.isArray(b.tags) ? b.tags : [] }),
+      ...(b.title                       !== undefined && { title: b.title }),
+      ...(b.research_line_id            !== undefined && { research_line_id: b.research_line_id || null }),
+      ...(b.phase                       !== undefined && { phase: VALID_PHASES.includes(b.phase) ? b.phase : 'Phase I' }),
+      ...(b.status                      !== undefined && VALID_STATUSES.includes(b.status) && { status: b.status }),
+      ...(b.description                 !== undefined && { description: b.description }),
+      ...(b.inclusion_criteria          !== undefined && { inclusion_criteria: b.inclusion_criteria }),
+      ...(b.exclusion_criteria          !== undefined && { exclusion_criteria: b.exclusion_criteria }),
+      ...(b.principal_investigator_id   !== undefined && { principal_investigator_id: b.principal_investigator_id || null }),
+      ...(b.co_investigators            !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
+      ...(b.sub_investigators           !== undefined && { sub_investigators: Array.isArray(b.sub_investigators) ? b.sub_investigators : [] }),
+      ...(b.contact_email               !== undefined && { contact_email: b.contact_email }),
+      ...(b.featured_in_website         !== undefined && { featured_in_website: b.featured_in_website }),
+      ...(b.display_order               !== undefined && { display_order: b.display_order }),
+      ...(b.start_date                  !== undefined && { start_date: b.start_date || null }),
+      ...(b.end_date                    !== undefined && { end_date: b.end_date || null }),
+      ...(b.estimated_end_date          !== undefined && { estimated_end_date: b.estimated_end_date || null }),
+      ...(b.actual_end_date             !== undefined && { actual_end_date: b.actual_end_date || null }),
+      ...(b.sponsor_name                !== undefined && { sponsor_name: b.sponsor_name }),
+      ...(b.sponsor_type                !== undefined && { sponsor_type: b.sponsor_type }),
+      ...(b.study_type                  !== undefined && { study_type: b.study_type }),
+      ...(b.enrollment_target           !== undefined && { enrollment_target: b.enrollment_target || null }),
+      ...(b.actual_enrollment           !== undefined && { actual_enrollment: b.actual_enrollment || null }),
+      ...(b.funding_amount              !== undefined && { funding_amount: b.funding_amount || null }),
+      ...(b.tags                        !== undefined && { tags: Array.isArray(b.tags) ? b.tags : [] }),
+      ...(b.milestones                  !== undefined && { milestones: Array.isArray(b.milestones) ? b.milestones : [] }),
+      // New fields
+      ...(b.protocol_finalized          !== undefined && { protocol_finalized: Boolean(b.protocol_finalized) }),
+      ...(b.ethics_status               !== undefined && { ethics_status: VALID_ETHICS.includes(b.ethics_status) ? b.ethics_status : null }),
+      ...(b.funding_status              !== undefined && { funding_status: VALID_FUNDING.includes(b.funding_status) ? b.funding_status : 'not_applicable' }),
+      ...(b.target_diseases             !== undefined && { target_diseases: Array.isArray(b.target_diseases) ? b.target_diseases : [] }),
+      ...(b.scope_type                  !== undefined && { scope_type: VALID_SCOPE.includes(b.scope_type) ? b.scope_type : 'specific' }),
+      ...(b.scope_note                  !== undefined && { scope_note: b.scope_note ? b.scope_note.slice(0, 150) : null }),
+      ...(b.is_multicentre              !== undefined && { is_multicentre: Boolean(b.is_multicentre) }),
+      ...(b.participating_centres       !== undefined && { participating_centres: b.participating_centres || null }),
+      ...(b.population_type             !== undefined && { population_type: VALID_POPULATION.includes(b.population_type) ? b.population_type : 'adult' }),
+      // Team fields
+      ...(b.data_manager_id             !== undefined && { data_manager_id: b.data_manager_id || null }),
+      ...(b.team_roles                  !== undefined && { team_roles: (typeof b.team_roles === 'object' && !Array.isArray(b.team_roles)) ? b.team_roles : {} }),
+      ...(b.external_team               !== undefined && { external_team: Array.isArray(b.external_team) ? b.external_team.map(m => ({
+        name:        m.name?.trim()        || null,
+        institution: m.institution?.trim() || null,
+        role:        m.role?.trim()        || null,
+        email:       m.email?.trim()       || null,
+      })).filter(m => m.name || m.institution) : [] }),
     };
-    const { data, error } = await supabase.from('clinical_trials').update(updatePayload).eq('id', req.params.id).select().single();
+    // If scope changed to specific, clear scope_note
+    if (updatePayload.scope_type === 'specific') updatePayload.scope_note = null;
+    const { data, error } = await supabase.from('clinical_trials').update(updatePayload).eq('id', req.params.id)
+      .select(`*, research_lines(name, line_number),
+        pi:medical_staff!clinical_trials_principal_investigator_id_fkey(id, full_name),
+        dm:medical_staff!clinical_trials_data_manager_id_fkey(id, full_name)
+      `).single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Clinical trial not found' });
       throw error;
@@ -3093,12 +3139,16 @@ app.get('/api/innovation-projects/website', apiLimiter, async (req, res) => {
 
 app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { research_line_id, category, page = 1, limit = 50 } = req.query;
+    const { research_line_id, category, stage, page = 1, limit = 50 } = req.query;
     const offset = (page - 1) * limit;
-    let query = supabase.from('innovation_projects').select('*, research_lines(name)', { count: 'exact' });
+    let query = supabase.from('innovation_projects').select(`
+      *, research_lines(name, line_number),
+      lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)
+    `, { count: 'exact' });
     if (research_line_id) query = query.eq('research_line_id', research_line_id);
     if (category) query = query.eq('category', category);
-    const { data, error, count } = await query.order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+    if (stage) query = query.eq('current_stage', stage);
+    const { data, error, count } = await query.order('display_order').order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
     res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
   } catch (error) {
@@ -3109,11 +3159,22 @@ app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, r
 app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.innovationProject), async (req, res) => {
   try {
     const body = { ...req.body };
-    // Always write development_stage (NOT NULL) in sync with current_stage
     const STAGE_MAP = { 'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica' };
     if (body.current_stage) body.development_stage = STAGE_MAP[body.current_stage] || 'En Desarrollo';
     if (!body.development_stage) body.development_stage = 'En Desarrollo';
-    const { data, error } = await supabase.from('innovation_projects').insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    // Ensure array fields
+    body.target_diseases  = Array.isArray(body.target_diseases)  ? body.target_diseases  : [];
+    body.keywords         = Array.isArray(body.keywords)         ? body.keywords         : [];
+    body.co_investigators = Array.isArray(body.co_investigators) ? body.co_investigators : [];
+    body.tags             = Array.isArray(body.tags)             ? body.tags             : [];
+    body.milestones       = Array.isArray(body.milestones)       ? body.milestones       : [];
+    body.external_team    = Array.isArray(body.external_team)    ? body.external_team.map(m => ({ name: m.name?.trim()||null, institution: m.institution?.trim()||null, role: m.role?.trim()||null, email: m.email?.trim()||null })).filter(m=>m.name||m.institution) : [];
+    body.team_roles       = (typeof body.team_roles === 'object' && !Array.isArray(body.team_roles)) ? body.team_roles : {};
+    if (body.scope_type === 'specific') body.scope_note = null;
+    if (body.scope_note) body.scope_note = body.scope_note.slice(0, 150);
+    const { data, error } = await supabase.from('innovation_projects')
+      .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
+      .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)').single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Innovation project created successfully' });
   } catch (error) {
@@ -3123,35 +3184,60 @@ app.post('/api/innovation-projects', authenticateToken, checkPermission('researc
 
 app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.innovationProject), async (req, res) => {
   try {
-    // B6 FIX: Whitelist updatable fields
     const VALID_STAGES = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
+    const VALID_FUNDING = ['not_applicable','seeking','funded','completed'];
+    const VALID_SCOPE = ['specific','general'];
+    const VALID_POPULATION = ['adult','paediatric','mixed','not_applicable'];
+    const VALID_REGULATORY = ['none','ce_mdr','samd','aemps','fda','other'];
+    const STAGE_MAP = {'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica'};
     const b = req.body;
     const updatePayload = {
       updated_at: new Date().toISOString(),
       ...(b.title               !== undefined && { title: b.title }),
       ...(b.category            !== undefined && { category: b.category }),
-      ...(b.current_stage !== undefined && (() => {
-        const VALID = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
-        if (!VALID.includes(b.current_stage)) return {};
-        const MAP = {'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica'};
-        return { current_stage: b.current_stage, development_stage: MAP[b.current_stage] || 'En Desarrollo' };
-      })()),
+      ...(b.current_stage !== undefined && VALID_STAGES.includes(b.current_stage) && {
+        current_stage: b.current_stage,
+        development_stage: STAGE_MAP[b.current_stage] || 'En Desarrollo'
+      }),
       ...(b.description         !== undefined && { description: b.description }),
       ...(b.clinical_rationale  !== undefined && { clinical_rationale: b.clinical_rationale }),
       ...(b.research_line_id    !== undefined && { research_line_id: b.research_line_id || null }),
       ...(b.lead_investigator_id!== undefined && { lead_investigator_id: b.lead_investigator_id || null }),
       ...(b.co_investigators    !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
       ...(b.partner_needs       !== undefined && { partner_needs: Array.isArray(b.partner_needs) ? b.partner_needs : [] }),
-      ...(b.partner_found       !== undefined && { partner_found: b.partner_found }),
+      ...(b.partner_found       !== undefined && { partner_found: Boolean(b.partner_found) }),
       ...(b.partner_name        !== undefined && { partner_name: b.partner_name || null }),
-      ...(b.funding_status      !== undefined && { funding_status: b.funding_status }),
+      ...(b.funding_status      !== undefined && { funding_status: VALID_FUNDING.includes(b.funding_status) ? b.funding_status : 'not_applicable' }),
+      ...(b.funding_source      !== undefined && { funding_source: b.funding_source || null }),
+      ...(b.budget              !== undefined && { budget: b.budget || null }),
+      ...(b.trl_level           !== undefined && { trl_level: b.trl_level || null }),
+      ...(b.ip_status           !== undefined && { ip_status: b.ip_status || null }),
       ...(b.keywords            !== undefined && { keywords: Array.isArray(b.keywords) ? b.keywords : [] }),
+      ...(b.tags                !== undefined && { tags: Array.isArray(b.tags) ? b.tags : [] }),
+      ...(b.milestones          !== undefined && { milestones: Array.isArray(b.milestones) ? b.milestones : [] }),
       ...(b.featured_in_website !== undefined && { featured_in_website: b.featured_in_website }),
       ...(b.display_order       !== undefined && { display_order: b.display_order }),
       ...(b.start_date          !== undefined && { start_date: b.start_date || null }),
       ...(b.estimated_end_date  !== undefined && { estimated_end_date: b.estimated_end_date || null }),
+      // New fields
+      ...(b.scope_finalized     !== undefined && { scope_finalized: Boolean(b.scope_finalized) }),
+      ...(b.target_diseases     !== undefined && { target_diseases: Array.isArray(b.target_diseases) ? b.target_diseases : [] }),
+      ...(b.scope_type          !== undefined && { scope_type: VALID_SCOPE.includes(b.scope_type) ? b.scope_type : 'specific' }),
+      ...(b.scope_note          !== undefined && { scope_note: b.scope_note ? b.scope_note.slice(0, 150) : null }),
+      ...(b.regulatory_pathway  !== undefined && { regulatory_pathway: VALID_REGULATORY.includes(b.regulatory_pathway) ? b.regulatory_pathway : 'none' }),
+      ...(b.population_type     !== undefined && { population_type: VALID_POPULATION.includes(b.population_type) ? b.population_type : 'adult' }),
+      // Team fields
+      ...(b.team_roles          !== undefined && { team_roles: (typeof b.team_roles === 'object' && !Array.isArray(b.team_roles)) ? b.team_roles : {} }),
+      ...(b.external_team       !== undefined && { external_team: Array.isArray(b.external_team) ? b.external_team.map(m => ({
+        name:        m.name?.trim()        || null,
+        institution: m.institution?.trim() || null,
+        role:        m.role?.trim()        || null,
+        email:       m.email?.trim()       || null,
+      })).filter(m => m.name || m.institution) : [] }),
     };
-    const { data, error } = await supabase.from('innovation_projects').update(updatePayload).eq('id', req.params.id).select().single();
+    if (updatePayload.scope_type === 'specific') updatePayload.scope_note = null;
+    const { data, error } = await supabase.from('innovation_projects').update(updatePayload).eq('id', req.params.id)
+      .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)').single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Innovation project not found' });
       throw error;
