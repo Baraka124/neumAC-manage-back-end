@@ -4,7 +4,7 @@
 // FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
 // FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
-// FIX 4: rotation_category Joi/DB enum mismatch corrected  
+// FIX 4: rotation_category Joi/DB enum mismatch corrected
 // FIX 5: research_lines added to rolePermissions
 // FIX 6: Duplicate on-call routes removed
 // FIX 8: full_name added to JWT payload  
@@ -4543,7 +4543,7 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
   }
 });
 
-process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
+process.on('SIGTERM', () => { server.close(() => process.exit(0)); });   
 process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 
 module.exports = app;
