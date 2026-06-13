@@ -1207,12 +1207,66 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       clinical_study_certificates: Array.isArray(dataSource.clinical_study_certificates) ? dataSource.clinical_study_certificates : (dataSource.clinical_study_certificates || null),
       updated_at: new Date().toISOString()
     };
+    // Read current staff_type BEFORE update so we can detect type changes
+    const prevStaff = await supabase.from('medical_staff').select('staff_type').eq('id', req.params.id).single();
     const { data, error } = await supabase.from('medical_staff').update(updateData).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Medical staff not found' });
       throw error;
     }
-    res.json(data);
+
+    // If marking inactive: scan for future records that are now orphaned
+    const warnings = [];
+    if (dataSource.employment_status === 'inactive') {
+      const today = new Date().toISOString().split('T')[0];
+      const [rotationCheck, oncallCheck, absenceCheck] = await Promise.all([
+        supabase.from('resident_rotations')
+          .select('id, training_unit_id, start_date, end_date, rotation_status')
+          .eq('resident_id', req.params.id)
+          .in('rotation_status', ['active','scheduled'])
+          .gte('end_date', today),
+        supabase.from('oncall_schedule')
+          .select('id, duty_date, shift_type')
+          .eq('primary_physician_id', req.params.id)
+          .gte('duty_date', today),
+        supabase.from('staff_absence_records')
+          .select('id, start_date, end_date')
+          .eq('staff_member_id', req.params.id)
+          .in('current_status', ['pending','active'])
+      ]);
+      if (rotationCheck.data?.length) warnings.push({ type: 'rotations', count: rotationCheck.data.length, message: `${rotationCheck.data.length} future rotation(s) still assigned` });
+      if (oncallCheck.data?.length) warnings.push({ type: 'oncall', count: oncallCheck.data.length, message: `${oncallCheck.data.length} future on-call shift(s) unassigned` });
+      if (absenceCheck.data?.length) warnings.push({ type: 'absences', count: absenceCheck.data.length, message: `${absenceCheck.data.length} active absence record(s) remain` });
+      // Flag oncall conflicts
+      if (oncallCheck.data?.length) {
+        const ids = oncallCheck.data.map(o => o.id);
+        await supabase.from('oncall_schedule').update({ has_conflict: true }).in('id', ids);
+      }
+    }
+
+    // If staff type changes FROM a resident type TO a non-resident type,
+    // terminate their active/scheduled rotations automatically
+    if (prevStaff.data && prevStaff.data.staff_type !== dataSource.staff_type) {
+      const [prevType, newType] = await Promise.all([
+        supabase.from('staff_types').select('is_resident_type').eq('type_key', prevStaff.data.staff_type).single(),
+        supabase.from('staff_types').select('is_resident_type').eq('type_key', dataSource.staff_type).single()
+      ]);
+      const wasResident = prevType.data?.is_resident_type;
+      const nowResident = newType.data?.is_resident_type;
+      if (wasResident && !nowResident) {
+        // Promoted to attending — terminate their rotations
+        const { data: terminated } = await supabase.from('resident_rotations')
+          .update({ rotation_status: 'terminated_early', updated_at: new Date().toISOString() })
+          .eq('resident_id', req.params.id)
+          .in('rotation_status', ['active','scheduled'])
+          .select('id');
+        if (terminated?.length) {
+          warnings.push({ type: 'rotations_terminated', count: terminated.length, message: `${terminated.length} rotation(s) automatically terminated — staff promoted from resident to attending` });
+        }
+      }
+    }
+
+    res.json({ ...data, _warnings: warnings });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update medical staff', message: error.message });
   }
@@ -2268,6 +2322,21 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
       });
     }
     res.status(201).json({ success: true, data, message: 'Absence record created successfully' });
+
+    // Flag has_conflict on any oncall shifts that overlap this absence
+    setImmediate(async () => {
+      try {
+        const { data: conflicts } = await supabase.from('oncall_schedule')
+          .select('id')
+          .gte('duty_date', startDateStr)
+          .lte('duty_date', endDateStr)
+          .or(`primary_physician_id.eq.${absenceData.staff_member_id},backup_physician_id.eq.${absenceData.staff_member_id}`);
+        if (conflicts?.length) {
+          const ids = conflicts.map(c => c.id);
+          await supabase.from('oncall_schedule').update({ has_conflict: true }).in('id', ids);
+        }
+      } catch (e) { console.warn('Conflict flag update failed (non-fatal):', e.message); }
+    });
   } catch (error) {
     console.error('💥 Failed to create absence record:', error);
     res.status(500).json({ error: 'Failed to create absence record', message: error.message });
