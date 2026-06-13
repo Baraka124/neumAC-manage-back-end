@@ -3983,6 +3983,10 @@ app.post('/api/news', authenticateToken, checkPermission('research_lines', 'crea
     const { title, post_type, body, author_id, research_line_id, is_public,
             status, expires_at, featured_image_url, journal_name, authors_text, doi, word_count } = req.body;
     if (!title) return res.status(400).json({ error: 'Title is required' });
+    // Validate publication posts have at least journal name or DOI
+    if (post_type === 'publication' && !journal_name && !doi) {
+      return res.status(400).json({ error: 'Publications require at least a journal name or DOI' });
+    }
     const payload = {
       title, post_type: ['update','article','publication','photo_story'].includes(post_type) ? post_type : 'update', body: body || null,
       author_id: author_id || null, research_line_id: research_line_id || null,
@@ -3993,8 +3997,11 @@ app.post('/api/news', authenticateToken, checkPermission('research_lines', 'crea
       journal_name: journal_name || null,
       authors_text: authors_text || null,
       doi: doi || null,
-      word_count: word_count || null,
-      published_at: status === 'published' ? new Date().toISOString() : null
+      word_count: body ? body.trim().split(/\s+/).filter(Boolean).length : (word_count || null),
+      // published_at: use provided date, or set now if publishing, or null for drafts
+      published_at: req.body.published_at
+        ? new Date(req.body.published_at).toISOString()
+        : status === 'published' ? new Date().toISOString() : null
     };
     const { data, error } = await supabase.from('news_posts').insert(payload).select().single();
     if (error) throw error;
@@ -4008,14 +4015,42 @@ app.post('/api/news', authenticateToken, checkPermission('research_lines', 'crea
 app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'update'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
   try {
     const { id } = req.params;
-    const updates = { ...req.body, updated_at: new Date().toISOString() };
-    if (updates.status === 'published' && !updates.published_at) {
-      updates.published_at = new Date().toISOString();
+    const b = req.body;
+    // Whitelist only real columns — prevent joined fields from reaching Supabase
+    const VALID_TYPES = ['update','article','publication','photo_story'];
+    const VALID_STATUSES = ['draft','published','archived'];
+    const updates = {
+      updated_at: new Date().toISOString(),
+      ...(b.title              !== undefined && { title: b.title }),
+      ...(b.post_type          !== undefined && { post_type: VALID_TYPES.includes(b.post_type) ? b.post_type : 'update' }),
+      ...(b.body               !== undefined && { body: b.body || null }),
+      ...(b.author_id          !== undefined && { author_id: b.author_id || null }),
+      ...(b.research_line_id   !== undefined && { research_line_id: b.research_line_id || null }),
+      ...(b.is_public          !== undefined && { is_public: b.is_public === true || b.is_public === 'true' }),
+      ...(b.status             !== undefined && VALID_STATUSES.includes(b.status) && { status: b.status }),
+      ...(b.expires_at         !== undefined && { expires_at: b.expires_at || null }),
+      ...(b.featured_image_url !== undefined && { featured_image_url: b.featured_image_url || null }),
+      ...(b.journal_name       !== undefined && { journal_name: b.journal_name || null }),
+      ...(b.authors_text       !== undefined && { authors_text: b.authors_text || null }),
+      ...(b.doi                !== undefined && { doi: b.doi || null }),
+      // published_at: editable so papers can reflect actual publication date
+      ...(b.published_at       !== undefined && { published_at: b.published_at ? new Date(b.published_at).toISOString() : null }),
+    };
+    // Auto-compute word_count from body
+    if (b.body) {
+      updates.word_count = b.body.trim().split(/\s+/).filter(Boolean).length;
+    } else if (b.body === '' || b.body === null) {
+      updates.word_count = null;
     }
-    // Strip joined/virtual fields that come back from GET but aren't real columns
-    delete updates.id; delete updates.created_at;
-    delete updates.author; delete updates.research_line;
-    const { data, error } = await supabase.from('news_posts').update(updates).eq('id', id).select().single();
+    // Handle published_at: set when publishing (if not already provided), clear when unpublishing
+    if (b.status === 'published' && !updates.published_at) {
+      updates.published_at = new Date().toISOString();
+    } else if (b.status && b.status !== 'published' && !b.published_at) {
+      updates.published_at = null; // clear when going back to draft/archived
+    }
+    const { data, error } = await supabase.from('news_posts').update(updates).eq('id', id)
+      .select('*, author:medical_staff!news_posts_author_id_fkey(id, full_name), research_line:research_lines!news_posts_research_line_id_fkey(id, line_number, name)')
+      .single();
     if (error) throw error;
     res.json({ data });
   } catch (err) {
@@ -4543,7 +4578,7 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
   }
 });
 
-process.on('SIGTERM', () => { server.close(() => process.exit(0)); });   
+process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 
 module.exports = app;
