@@ -35,6 +35,57 @@ const fs = require('fs');
 const crypto = require('crypto');
 require('dotenv').config();
 
+// ── Notification system (Resend API — free, no extra npm install) ────────
+// Set RESEND_API_KEY and NOTIFY_EMAIL in Railway environment variables
+const NOTIFY_EMAIL  = process.env.NOTIFY_EMAIL  || '';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const FROM_EMAIL    = 'neumDesk <notifications@neumac.health>';
+const APP_URL       = process.env.APP_URL || process.env.FRONTEND_URL || 'https://baraka124.github.io/neumAC-manage-Frontend-end';
+
+async function sendNotification(subject, html, urgent = false) {
+  if (!NOTIFY_EMAIL) return;  // silently skip if not configured
+  if (!RESEND_API_KEY) {
+    // Dev mode: log to console
+    console.log(`[NOTIFY] ${subject}\n${html.replace(/<[^>]+>/g, ' ')}`);
+    return;
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: FROM_EMAIL,
+        to: [NOTIFY_EMAIL],
+        subject: urgent ? `🔴 ${subject}` : `📋 ${subject}`,
+        html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+          <div style="background:#0a1628;padding:16px 20px;border-radius:8px 8px 0 0">
+            <span style="color:#48cae4;font-weight:700;font-size:16px">neumDesk</span>
+            <span style="color:rgba(255,255,255,.4);font-size:12px;margin-left:8px">Clinical Operations</span>
+          </div>
+          <div style="background:#fff;padding:20px 24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px">
+            ${html}
+          </div>
+          <p style="color:#9ca3af;font-size:11px;margin-top:8px;text-align:center">
+            neumDesk · ${new Date().toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long', year:'numeric' })}
+          </p>
+        </div>`
+      })
+    });
+    if (!res.ok) console.error('[NOTIFY] Failed:', res.status, await res.text());
+  } catch (e) {
+    console.error('[NOTIFY] Error:', e.message);
+  }
+}
+
+// Helper: get physician name from DB
+async function getPhysicianName(id) {
+  if (!id) return 'Unknown';
+  try {
+    const { data } = await supabase.from('medical_staff').select('full_name').eq('id', id).single();
+    return data?.full_name || 'Unknown';
+  } catch { return 'Unknown'; }
+}
+
 // ============ INITIALIZATION ============
 const app = express();
 app.set('trust proxy', 1);
@@ -182,36 +233,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Maintenance mode middleware ──
-let _maintenanceMode = false;
-let _maintenanceLastCheck = 0;
-const MAINTENANCE_CACHE_MS = 60000;
-
-async function checkMaintenanceMode() {
-  if (Date.now() - _maintenanceLastCheck < MAINTENANCE_CACHE_MS) return _maintenanceMode;
-  try {
-    const { data } = await supabase.from('system_settings').select('maintenance_mode').limit(1).single();
-    _maintenanceMode = data?.maintenance_mode === true;
-    _maintenanceLastCheck = Date.now();
-  } catch { /* don't block on DB errors */ }
-  return _maintenanceMode;
-}
-
-app.use(async (req, res, next) => {
-  const bypass = ['/health', '/api/auth/login', '/api/auth/logout'];
-  if (bypass.some(p => req.path.startsWith(p))) return next();
-  const inMaintenance = await checkMaintenanceMode();
-  if (!inMaintenance) return next();
-  // System admins bypass maintenance
-  const token = req.headers.authorization?.split(' ')[1];
-  if (token) {
-    try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      if (decoded?.role === 'system_admin') return next();
-    } catch {}
-  }
-  res.status(503).json({ error: 'maintenance', message: 'The system is currently under maintenance. Please try again shortly.' });
-});
+// ── Maintenance mode — see maintenanceCheck middleware registered on /api below ──
 
 // ============ UTILITY FUNCTIONS ============
 const generateId = (prefix) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).substr(2, 9)}`;
@@ -454,6 +476,7 @@ const schemas = {
     reason_category: Joi.string().max(80).allow('', null).optional(),
     notes:           Joi.string().max(1000).allow('', null).optional(),
     time_type:       Joi.string().valid('night','weekend','daytime','holiday').default('night'),
+    coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
   }),
 
   // ── Research Line ────────────────────────────────────────────────────
@@ -833,8 +856,23 @@ app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPasswo
     const { data: user } = await supabase.from('app_users').select('id, email, full_name').eq('email', email.toLowerCase()).single();
     // Always return 200 — never reveal whether the email exists (prevents enumeration)
     if (user) {
-      // Token generated but not stored — email sending not yet implemented (B-SEC1)
-      jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+      const resetToken = jwt.sign({ userId: user.id, email: user.email, purpose: 'password_reset' }, JWT_SECRET, { expiresIn: '1h' });
+      const tokenExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      // Store token hash in DB so it can be invalidated after use
+      await supabase.from('app_users').update({
+        reset_token: resetToken,
+        reset_token_expires_at: tokenExpiry,
+        updated_at: new Date().toISOString()
+      }).eq('id', user.id);
+      const resetLink = `${APP_URL}?reset_token=${resetToken}`;
+      await sendNotification(
+        'Password reset request — neumDesk',
+        `<h2 style="margin:0 0 12px;color:#0a1628">Password Reset</h2>
+        <p style="color:#374151">Hello <strong>${user.full_name || user.email}</strong>,</p>
+        <p style="color:#374151">A password reset was requested for your neumDesk account. Click the link below to set a new password. This link expires in <strong>1 hour</strong>.</p>
+        <a href="${resetLink}" style="display:inline-block;margin:12px 0;padding:10px 20px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px;font-weight:600">Reset my password →</a>
+        <p style="color:#9ca3af;font-size:12px;margin-top:16px">If you did not request this reset, you can safely ignore this email. Your password will not change.</p>`
+      );
     }
     res.json({ message: 'If an account with that email exists, a reset link has been sent.' });
   } catch (error) {
@@ -845,15 +883,38 @@ app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPasswo
 app.post('/api/auth/reset-password', authLimiter, validate(schemas.resetPassword), async (req, res) => {
   try {
     const { token, new_password } = req.validatedData || req.body;
-    const decoded = jwt.verify(token, JWT_SECRET);
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(400).json({ error: 'Invalid or expired token', message: 'The reset link is invalid or has expired. Please request a new one.' });
+    }
+    if (decoded.purpose !== 'password_reset') {
+      return res.status(400).json({ error: 'Invalid token', message: 'This token cannot be used for password reset.' });
+    }
+    // Verify token matches what's stored (prevents token reuse after a new reset was requested)
+    const { data: user } = await supabase.from('app_users')
+      .select('id, reset_token, reset_token_expires_at')
+      .eq('email', decoded.email).single();
+    if (!user || user.reset_token !== token) {
+      return res.status(400).json({ error: 'Token already used', message: 'This reset link has already been used or superseded. Please request a new one.' });
+    }
+    if (new Date(user.reset_token_expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Token expired', message: 'This reset link has expired. Please request a new one.' });
+    }
     const passwordHash = await bcrypt.hash(new_password, 10);
     const { error } = await supabase.from('app_users')
-      .update({ password_hash: passwordHash, updated_at: new Date().toISOString() })
+      .update({
+        password_hash: passwordHash,
+        reset_token: null,
+        reset_token_expires_at: null,
+        updated_at: new Date().toISOString()
+      })
       .eq('email', decoded.email);
     if (error) throw error;
-    res.json({ message: 'Password reset successfully' });
+    res.json({ message: 'Password reset successfully. You can now log in with your new password.' });
   } catch (error) {
-    res.status(400).json({ error: 'Invalid or expired token', message: error.message });
+    res.status(400).json({ error: 'Failed to reset password', message: error.message });
   }
 });
 
@@ -1143,6 +1204,7 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       can_be_coi:  dataSource.can_be_coi  ?? false,
       has_phd:     dataSource.has_phd     ?? false,
       phd_field:   dataSource.phd_field   || null,
+      clinical_study_certificates: Array.isArray(dataSource.clinical_study_certificates) ? dataSource.clinical_study_certificates : (dataSource.clinical_study_certificates || null),
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('medical_staff').update(updateData).eq('id', req.params.id).select().single();
@@ -1406,6 +1468,32 @@ app.put('/api/training-units/:id', authenticateToken, checkPermission('training_
     const dataSource = req.validatedData || req.body;
     // FIX: Joi field 'supervising_attending_id' must map to DB columns 'supervisor_id' + 'default_supervisor_id'
     // stripUnknown:true would drop supervising_attending_id since it's not a DB column name
+    // GAP 2 FIX: Check if reducing capacity would breach existing rotations
+    if (dataSource.maximum_residents) {
+      const { data: currentUnit } = await supabase
+        .from('training_units')
+        .select('maximum_residents')
+        .eq('id', req.params.id)
+        .single();
+      if (currentUnit && dataSource.maximum_residents < currentUnit.maximum_residents) {
+        const today = new Date().toISOString().split('T')[0];
+        const { data: activeRots } = await supabase
+          .from('resident_rotations')
+          .select('id')
+          .eq('training_unit_id', req.params.id)
+          .in('rotation_status', ['active', 'scheduled'])
+          .gte('end_date', today);
+        const occupied = activeRots?.length || 0;
+        if (occupied > dataSource.maximum_residents) {
+          return res.status(409).json({
+            error: 'Capacity conflict',
+            message: `Cannot reduce capacity to ${dataSource.maximum_residents} — unit currently has ${occupied} active/scheduled rotations`,
+            occupied, requested: dataSource.maximum_residents
+          });
+        }
+      }
+    }
+
     const updateData = {
       unit_name:         dataSource.unit_name,
       unit_code:         dataSource.unit_code,
@@ -1513,7 +1601,156 @@ app.get('/api/rotations/current', authenticateToken, apiLimiter, async (req, res
   }
 });
 
-// FIX 1: POST /api/rotations — formatDate() used on Joi-converted Date objects
+// GET /api/rotations/availability
+// Returns occupancy for a training unit over a date range so the frontend
+// can warn when capacity would be exceeded.
+// Query params: training_unit_id (required), start_date, end_date, exclude_id
+app.get('/api/rotations/availability', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { training_unit_id, start_date, end_date, exclude_id } = req.query
+    if (!training_unit_id) return res.status(400).json({ error: 'training_unit_id is required' })
+
+    // Fetch the unit to get its capacity
+    const { data: unit, error: unitErr } = await supabase
+      .from('training_units')
+      .select('id, unit_name, maximum_residents, current_resident_count')
+      .eq('id', training_unit_id)
+      .single()
+    if (unitErr) throw unitErr
+    if (!unit) return res.status(404).json({ error: 'Training unit not found' })
+
+    const capacity = unit.maximum_residents || 999
+
+    // Fetch overlapping active/scheduled rotations for this unit in the date range
+    let query = supabase
+      .from('resident_rotations')
+      .select('id, resident_id, start_date, end_date, rotation_status, resident:medical_staff!resident_rotations_resident_id_fkey(id, full_name)')
+      .eq('training_unit_id', training_unit_id)
+      .in('rotation_status', ['active', 'scheduled'])
+
+    if (start_date && end_date) {
+      // Overlapping: existing.start <= new.end AND existing.end >= new.start
+      query = query.lte('start_date', end_date).gte('end_date', start_date)
+    }
+
+    if (exclude_id) query = query.neq('id', exclude_id)
+
+    const { data: overlapping, error: rotErr } = await query.order('start_date')
+    if (rotErr) throw rotErr
+
+    const occupied = overlapping?.length || 0
+    const available = Math.max(0, capacity - occupied)
+
+    res.json({
+      unit_id:    unit.id,
+      unit_name:  unit.unit_name,
+      capacity,
+      occupied,
+      available,
+      is_full:    occupied >= capacity,
+      overlapping: (overlapping || []).map(r => ({
+        id:         r.id,
+        resident_id: r.resident_id,
+        resident_name: r.resident?.full_name || null,
+        start_date: r.start_date,
+        end_date:   r.end_date,
+        status:     r.rotation_status
+      }))
+    })
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to check rotation availability', message: error.message })
+  }
+})
+// ══════════════════════════════════════════════════════════════════════════════
+// UNIT STAFF — who works in each training unit (operational staffing)
+// GET  /api/training-units/:id/staff   → list attendings for a unit
+// POST /api/training-units/:id/staff   → add attending to unit
+// DELETE /api/training-units/:unitId/staff/:staffId → remove
+// GET  /api/staff/:id/units            → which units does this person belong to
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/training-units/:id/staff', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('unit_staff')
+      .select(`
+        id, role, assigned_from, assigned_until,
+        staff:medical_staff!unit_staff_staff_id_fkey(
+          id, full_name, staff_type, employment_status, professional_email
+        )
+      `)
+      .eq('unit_id', req.params.id)
+      .is('assigned_until', null)   // active only — no end date means current
+      .order('role')
+      .order('created_at');
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch unit staff', message: e.message });
+  }
+});
+
+app.post('/api/training-units/:id/staff', authenticateToken,
+  checkPermission('training_units', 'update'), async (req, res) => {
+  try {
+    const { staff_id, role = 'primary' } = req.body;
+    if (!staff_id) return res.status(400).json({ error: 'staff_id is required' });
+    const { data, error } = await supabase.from('unit_staff').insert([{
+      unit_id: req.params.id, staff_id, role,
+      assigned_from: formatDate(new Date()),
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    }]).select(`
+      id, role, assigned_from,
+      staff:medical_staff!unit_staff_staff_id_fkey(id, full_name, staff_type, employment_status)
+    `).single();
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'This clinician is already assigned to this unit' });
+      throw error;
+    }
+    res.status(201).json({ success: true, data });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to assign staff to unit', message: e.message });
+  }
+});
+
+app.delete('/api/training-units/:unitId/staff/:staffId', authenticateToken,
+  checkPermission('training_units', 'update'), async (req, res) => {
+  try {
+    const { error } = await supabase.from('unit_staff')
+      .update({ assigned_until: formatDate(new Date()), updated_at: new Date().toISOString() })
+      .eq('unit_id', req.params.unitId)
+      .eq('staff_id', req.params.staffId)
+      .is('assigned_until', null);
+    if (error) throw error;
+    res.json({ success: true, message: 'Clinician removed from unit' });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to remove staff from unit', message: e.message });
+  }
+});
+
+// Which units does a staff member belong to? (used in staff profile + absence impact)
+app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('unit_staff')
+      .select(`
+        id, role, assigned_from,
+        unit:training_units!unit_staff_unit_id_fkey(
+          id, unit_name, unit_code, unit_type, unit_status, department_id
+        )
+      `)
+      .eq('staff_id', req.params.id)
+      .is('assigned_until', null)
+      .order('role');
+    if (error) throw error;
+    res.json({ success: true, data: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to fetch staff units', message: e.message });
+  }
+});
+
+
+
 app.post('/api/rotations', authenticateToken, checkPermission('resident_rotations', 'create'), validate(schemas.rotation), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
@@ -1538,6 +1775,31 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
     if (checkError) throw checkError;
     if (existingRotations && existingRotations.length > 0) {
       return res.status(409).json({ error: 'Scheduling conflict', message: 'Resident already has a rotation during these dates', conflicts: existingRotations });
+    }
+
+    // GAP 1 FIX: Check unit capacity for the requested date range
+    const { data: unitForCap, error: unitCapErr } = await supabase
+      .from('training_units')
+      .select('id, unit_name, maximum_residents')
+      .eq('id', dataSource.training_unit_id)
+      .single();
+    if (unitCapErr) throw unitCapErr;
+    if (unitForCap) {
+      const { data: overlappingInUnit } = await supabase
+        .from('resident_rotations')
+        .select('id, resident_id, start_date, end_date')
+        .eq('training_unit_id', dataSource.training_unit_id)
+        .in('rotation_status', ['active', 'scheduled'])
+        .lte('start_date', endDate)
+        .gte('end_date', startDate);
+      const occupied = overlappingInUnit?.length || 0;
+      if (occupied >= unitForCap.maximum_residents) {
+        return res.status(409).json({
+          error: 'Unit at capacity',
+          message: `"${unitForCap.unit_name}" is full for this period (${occupied}/${unitForCap.maximum_residents} slots occupied)`,
+          occupied, capacity: unitForCap.maximum_residents
+        });
+      }
     }
 
     const rotationData = {
@@ -1591,6 +1853,37 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Rotation not found' });
       throw error;
     }
+
+    // ── NOTIFICATION: Rotation ending soon with no successor scheduled ───
+    try {
+      const endDate = new Date(rotationData.end_date + 'T00:00:00');
+      const today   = new Date(); today.setHours(0,0,0,0);
+      const daysLeft = Math.round((endDate - today) / 86400000);
+      if (daysLeft >= 0 && daysLeft <= 7) {
+        // Check if a replacement rotation exists for this unit after end_date
+        const { data: nextRots } = await supabase.from('resident_rotations')
+          .select('id').eq('training_unit_id', rotationData.training_unit_id)
+          .in('rotation_status', ['scheduled','active'])
+          .gte('start_date', rotationData.end_date).limit(1);
+        if (!nextRots || nextRots.length === 0) {
+          const resName = await getPhysicianName(rotationData.resident_id);
+          const { data: unit } = await supabase.from('training_units').select('unit_name').eq('id', rotationData.training_unit_id).single();
+          const unitName = unit?.unit_name || 'Unknown unit';
+          sendNotification(
+            `Rotation ending soon — no successor: ${unitName}`,
+            `<h2 style="margin:0 0 12px;color:#0a1628">Rotation slot opening soon</h2>
+            <p style="color:#374151"><strong>${resName}</strong>'s rotation at <strong>${unitName}</strong> 
+            ends on <strong>${rotationData.end_date}</strong> (${daysLeft} day${daysLeft!==1?'s':''} from today).</p>
+            <p style="color:#f59e0b;font-weight:600">⚠ No successor has been scheduled for this unit.</p>
+            <a href="${APP_URL}" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Assign rotation →</a>`,
+            daysLeft <= 3
+          );
+        }
+      }
+    } catch (notifErr) {
+      console.error('[NOTIFY] Rotation check error:', notifErr.message);
+    }
+
     res.json(data);
   } catch (error) {
     console.error('Failed to update rotation:', error);
@@ -1676,35 +1969,88 @@ app.get('/api/oncall/upcoming', authenticateToken, apiLimiter, async (req, res) 
 
 app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'create'), validate(schemas.onCall), async (req, res) => {
   try {
-    const dataSource = req.validatedData || req.body;
-    // FIX 1 applied here too: duty_date comes through Joi as Date object
+    const d = req.validatedData || req.body;
     const scheduleData = {
-      ...dataSource,
-      duty_date: formatDate(dataSource.duty_date),
-      schedule_id: dataSource.schedule_id || generateId('SCH'),
-      created_by: req.user.id,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
+      duty_date:            formatDate(d.duty_date),
+      shift_type:           d.shift_type || 'primary_call',
+      start_time:           d.start_time,
+      end_time:             d.end_time,
+      primary_physician_id: d.primary_physician_id,
+      backup_physician_id:  d.backup_physician_id  || null,
+      coverage_notes:       d.coverage_notes       || null,
+      coverage_area_id:     d.coverage_area_id     || null,
+      schedule_id:          generateId('SCH'),   // always server-generated — never trust client value
+      created_by:           req.user.id,
+      created_at:           new Date().toISOString(),
+      updated_at:           new Date().toISOString()
     };
     const { data, error } = await supabase.from('oncall_schedule').insert([scheduleData]).select().single();
     if (error) throw error;
+
+    // ── NOTIFICATION: On-call scheduled without backup ───────────────────
+    if (!scheduleData.backup_physician_id) {
+      getPhysicianName(scheduleData.primary_physician_id).then(async name => {
+        // Check if this area requires coverage
+        let areaName = 'Unknown area';
+        if (scheduleData.coverage_area_id) {
+          const { data: area } = await supabase.from('coverage_areas').select('name,requires_coverage').eq('id', scheduleData.coverage_area_id).single();
+          if (area) {
+            areaName = area.name;
+            if (!area.requires_coverage) return; // only notify for required areas
+          }
+        }
+        sendNotification(
+          `On-call without backup — ${areaName} on ${scheduleData.duty_date}`,
+          `<h2 style="margin:0 0 12px;color:#0a1628">On-call shift has no backup</h2>
+          <p style="color:#374151"><strong>${name}</strong> is scheduled for <strong>${areaName}</strong> 
+          on <strong>${scheduleData.duty_date}</strong> with no backup assigned.</p>
+          <p style="color:#f59e0b;font-weight:600">⚠ Consider assigning a backup physician.</p>
+          <a href="${APP_URL}" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Open neumDesk →</a>`,
+          false
+        );
+      });
+    }
+
     res.status(201).json(data);
   } catch (error) {
+    if (error.code === '23505') {
+      // Check which unique constraint was violated
+      const isAreaDuplicate = error.constraint === 'oncall_one_primary_per_area_per_day'
+        || error.detail?.includes('coverage_area_id');
+      const isScheduleIdDuplicate = error.constraint?.includes('schedule_id')
+        || error.detail?.includes('schedule_id');
+      if (isAreaDuplicate)
+        return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date. Choose a different coverage area.' });
+      if (isScheduleIdDuplicate)
+        return res.status(409).json({ error: 'Duplicate schedule', message: 'ID collision — please try saving again.' });
+      // Unknown 23505 — log and return detail
+      return res.status(409).json({ error: 'Duplicate entry', message: error.detail || error.message });
+    }
+    if (error.code === '42703')
+      return res.status(500).json({ error: 'Schema mismatch', message: 'Run the coverage_areas migration in Supabase first. Column missing: ' + error.message });
     res.status(500).json({ error: 'Failed to create on-call schedule', message: error.message });
   }
 });
 
 app.put('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), validate(schemas.onCall), async (req, res) => {
   try {
-    const dataSource = req.validatedData || req.body;
+    const d = req.validatedData || req.body;
     const scheduleData = {
-      ...dataSource,
-      duty_date: formatDate(dataSource.duty_date),
-      updated_at: new Date().toISOString()
+      duty_date:            formatDate(d.duty_date),
+      shift_type:           d.shift_type || 'primary_call',
+      start_time:           d.start_time,
+      end_time:             d.end_time,
+      primary_physician_id: d.primary_physician_id,
+      backup_physician_id:  d.backup_physician_id  || null,
+      coverage_notes:       d.coverage_notes       || null,
+      coverage_area_id:     d.coverage_area_id     || null,
+      updated_at:           new Date().toISOString()
     };
     const { data, error } = await supabase.from('oncall_schedule').update(scheduleData).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Schedule not found' });
+      if (error.code === '23505')    return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date.' });
+      if (error.code === '42703')    return res.status(500).json({ error: 'Schema mismatch', message: 'Run the coverage_areas migration in Supabase first. Column missing: ' + error.message });
       throw error;
     }
     res.json(data);
@@ -1906,6 +2252,21 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
     }
 
     console.log('✅ Absence record created:', data.id);
+    // ── NOTIFICATION: Absence without coverage ──────────────────────
+    if (!absenceData.coverage_arranged) {
+      getPhysicianName(absenceData.staff_member_id).then(name => {
+        const reason = (absenceData.absence_reason || 'absence').replace(/_/g,' ');
+        sendNotification(
+          `No coverage arranged — ${name}`,
+          `<h2 style="margin:0 0 12px;color:#0a1628">Absence recorded without coverage</h2>
+          <p style="color:#374151"><strong>${name}</strong> is absent (${reason}) 
+          from <strong>${absenceData.start_date}</strong> to <strong>${absenceData.end_date}</strong>.</p>
+          <p style="color:#ef4444;font-weight:600">⚠ No cover arranged — action required.</p>
+          <a href="${APP_URL}" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Open neumDesk →</a>`,
+          true
+        );
+      });
+    }
     res.status(201).json({ success: true, data, message: 'Absence record created successfully' });
   } catch (error) {
     console.error('💥 Failed to create absence record:', error);
@@ -2249,19 +2610,7 @@ app.get('/api/notifications/unread', authenticateToken, apiLimiter, async (req, 
   }
 });
 
-app.put('/api/notifications/:id/read', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { error } = await supabase.from('notifications')
-      .update({ read: true })
-      .eq('id', req.params.id)
-      .eq('user_id', req.user.id);
-    if (error) throw error;
-    res.json({ message: 'Notification marked as read' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update notification', message: error.message });
-  }
-});
-
+// Static route MUST come before /:id/read — otherwise Express matches 'mark-all-read' as :id
 app.put('/api/notifications/mark-all-read', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { error } = await supabase.from('notifications')
@@ -2272,6 +2621,19 @@ app.put('/api/notifications/mark-all-read', authenticateToken, apiLimiter, async
     res.json({ message: 'All notifications marked as read' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update notifications', message: error.message });
+  }
+});
+
+app.put('/api/notifications/:id/read', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { error } = await supabase.from('notifications')
+      .update({ read: true })
+      .eq('id', req.params.id)
+      .eq('user_id', req.user.id);
+    if (error) throw error;
+    res.json({ message: 'Notification marked as read' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update notification', message: error.message });
   }
 });
 
@@ -2373,10 +2735,14 @@ app.delete('/api/attachments/:id', authenticateToken, checkPermission('attachmen
 app.get('/api/system-stats', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const today = formatDate(new Date());
+    // FIX 8: Use staff_types table to find resident/attending keys dynamically
+    const { data: staffTypes } = await supabase.from('staff_types').select('type_key, is_resident_type').eq('is_active', true);
+    const residentKeys  = (staffTypes || []).filter(t =>  t.is_resident_type).map(t => t.type_key);
+    const attendingKeys = (staffTypes || []).filter(t => !t.is_resident_type).map(t => t.type_key);
     const [totalStaff, activeAttending, activeResidents, todayOnCall, currentlyAbsent, activeRotations] = await Promise.all([
       supabase.from('medical_staff').select('*', { count: 'exact', head: true }),
-      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).eq('staff_type', 'attending_physician').eq('employment_status', 'active'),
-      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).eq('staff_type', 'medical_resident').eq('employment_status', 'active'),
+      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).in('staff_type', attendingKeys.length ? attendingKeys : ['__none__']).eq('employment_status', 'active'),
+      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).in('staff_type', residentKeys.length ? residentKeys : ['__none__']).eq('employment_status', 'active'),
       supabase.from('oncall_schedule').select('*', { count: 'exact', head: true }).eq('duty_date', today),
       supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'currently_absent'),
       supabase.from('resident_rotations').select('*', { count: 'exact', head: true }).eq('rotation_status', 'active')
@@ -2401,7 +2767,7 @@ app.get('/api/dashboard/upcoming-events', authenticateToken, apiLimiter, async (
     const today = formatDate(new Date());
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     const [rotations, oncall, absences] = await Promise.all([
-      supabase.from('resident_rotations').select('*, resident:medical_staff!resident_rotations_resident_id_fkey(full_name), training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name)').gte('start_date', today).lte('start_date', nextWeek).eq('rotation_status', 'upcoming').order('start_date').limit(5),
+      supabase.from('resident_rotations').select('*, resident:medical_staff!resident_rotations_resident_id_fkey(full_name), training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name)').gte('start_date', today).lte('start_date', nextWeek).eq('rotation_status', 'scheduled').order('start_date').limit(5),
       supabase.from('oncall_schedule').select('*, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name)').gte('duty_date', today).lte('duty_date', nextWeek).order('duty_date').limit(5),
       supabase.from('staff_absence_records').select('*, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(full_name)').eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek).order('start_date').limit(5)
     ]);
@@ -2424,7 +2790,19 @@ app.get('/api/settings', authenticateToken, apiLimiter, async (req, res) => {
 
 app.put('/api/settings', authenticateToken, checkPermission('system_settings', 'update'), validate(schemas.systemSettings), async (req, res) => {
   try {
-    const { data, error } = await supabase.from('system_settings').upsert([req.validatedData || req.body]).select().single();
+    const payload = req.validatedData || req.body;
+    // Fetch existing row to get its id (avoids upsert without onConflict creating duplicates)
+    const { data: existing } = await supabase.from('system_settings').select('id').limit(1).single();
+    let data, error;
+    if (existing?.id) {
+      ({ data, error } = await supabase.from('system_settings')
+        .update({ ...payload, updated_at: new Date().toISOString() })
+        .eq('id', existing.id).select().single());
+    } else {
+      ({ data, error } = await supabase.from('system_settings')
+        .insert([{ ...payload, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
+        .select().single());
+    }
     if (error) throw error;
     res.json(data);
   } catch (error) {
@@ -2435,13 +2813,20 @@ app.put('/api/settings', authenticateToken, checkPermission('system_settings', '
 // ===== 19. SEARCH & AVAILABLE DATA =====
 app.get('/api/available-data', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const [departments, residents, attendings, trainingUnits] = await Promise.all([
+    // FIX 8: Replaced hardcoded 'medical_resident' / 'attending_physician' strings with
+    // dynamic lookup from staff_types table so renamed types still work
+    const [departments, staffTypes, allActiveStaff, trainingUnits] = await Promise.all([
       supabase.from('departments').select('id, name, code').eq('status', 'active').order('name'),
-      supabase.from('medical_staff').select('id, full_name, training_year').eq('staff_type', 'medical_resident').eq('employment_status', 'active').order('full_name'),
-      supabase.from('medical_staff').select('id, full_name, specialization').eq('staff_type', 'attending_physician').eq('employment_status', 'active').order('full_name'),
+      supabase.from('staff_types').select('type_key, is_resident_type').eq('is_active', true),
+      supabase.from('medical_staff').select('id, full_name, training_year, specialization, staff_type').eq('employment_status', 'active').order('full_name'),
       supabase.from('training_units').select('id, unit_name, unit_code, maximum_residents').eq('unit_status', 'active').order('unit_name')
     ]);
-    res.json({ success: true, data: { departments: departments.data || [], residents: residents.data || [], attendings: attendings.data || [], trainingUnits: trainingUnits.data || [] } });
+    const residentKeys = new Set((staffTypes.data || []).filter(t => t.is_resident_type).map(t => t.type_key));
+    const attendingKeys = new Set((staffTypes.data || []).filter(t => !t.is_resident_type).map(t => t.type_key));
+    const staff = allActiveStaff.data || [];
+    const residents  = staff.filter(s => residentKeys.has(s.staff_type)).map(s => ({ id: s.id, full_name: s.full_name, training_year: s.training_year }));
+    const attendings = staff.filter(s => attendingKeys.has(s.staff_type)).map(s => ({ id: s.id, full_name: s.full_name, specialization: s.specialization }));
+    res.json({ success: true, data: { departments: departments.data || [], residents, attendings, trainingUnits: trainingUnits.data || [] } });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch available data', message: error.message });
   }
@@ -2541,7 +2926,8 @@ app.put('/api/research-lines/:id', authenticateToken, checkPermission('research_
   try {
     // B6 FIX: Whitelist updatable fields — do not pass req.body directly to prevent
     // clients from overwriting id, created_at, line_number (unique) or injecting garbage fields
-    const { name, description, capabilities, sort_order, active, keywords, coordinator_id } = req.body;
+    const { description, capabilities, sort_order, active, keywords, coordinator_id } = req.body;
+    const name = req.body.name || req.body.research_line_name;
     const updatePayload = { updated_at: new Date().toISOString() };
     if (name !== undefined)           updatePayload.name           = name;
     if (description !== undefined)    updatePayload.description    = description;
@@ -2613,11 +2999,15 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
   try {
     const { research_line_id, phase, status, page = 1, limit = 50 } = req.query;
     const offset = (page - 1) * limit;
-    let query = supabase.from('clinical_trials').select('*, research_lines(name)', { count: 'exact' });
+    let query = supabase.from('clinical_trials').select(`
+      *, research_lines(name, line_number),
+      pi:medical_staff!clinical_trials_principal_investigator_id_fkey(id, full_name, professional_email),
+      dm:medical_staff!clinical_trials_data_manager_id_fkey(id, full_name)
+    `, { count: 'exact' });
     if (research_line_id) query = query.eq('research_line_id', research_line_id);
     if (phase) query = query.eq('phase', phase);
     if (status) query = query.eq('status', status);
-    const { data, error, count } = await query.order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+    const { data, error, count } = await query.order('display_order').order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
     res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
   } catch (error) {
@@ -2628,15 +3018,24 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
 app.post('/api/clinical-trials', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.clinicalTrial), async (req, res) => {
   try {
     const body = { ...req.body };
-    // Observational/Expanded Access studies may not have a phase — default to 'Phase I' to satisfy
-    // the DB CHECK constraint until the schema is updated to allow null or N/A
     const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
     if (!VALID_PHASES.includes(body.phase)) body.phase = 'Phase I';
-    // protocol_id is NOT NULL UNIQUE in DB — auto-generate if not provided
     if (!body.protocol_id) body.protocol_id = `PROT-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2,6).toUpperCase()}`;
+    // Ensure array fields are arrays
+    body.target_diseases  = Array.isArray(body.target_diseases)  ? body.target_diseases  : [];
+    body.tags             = Array.isArray(body.tags)             ? body.tags             : [];
+    body.co_investigators = Array.isArray(body.co_investigators) ? body.co_investigators : [];
+    body.sub_investigators= Array.isArray(body.sub_investigators)? body.sub_investigators: [];
+    body.milestones       = Array.isArray(body.milestones)       ? body.milestones       : [];
+    body.external_team    = Array.isArray(body.external_team)    ? body.external_team.map(m => ({ name: m.name?.trim()||null, institution: m.institution?.trim()||null, role: m.role?.trim()||null, email: m.email?.trim()||null })).filter(m=>m.name||m.institution) : [];
+    body.team_roles       = (typeof body.team_roles === 'object' && !Array.isArray(body.team_roles)) ? body.team_roles : {};
+    body.data_manager_id  = body.data_manager_id || null;
+    // Scope: if general, scope_note required; if specific, clear scope_note
+    if (body.scope_type === 'general' && !body.scope_note) body.scope_note = null;
+    if (body.scope_type === 'specific') body.scope_note = null;
     const { data, error } = await supabase.from('clinical_trials')
       .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
-      .select().single();
+      .select('*, research_lines(name, line_number), pi:medical_staff!clinical_trials_principal_investigator_id_fkey(id, full_name)').single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Clinical study created successfully' });
   } catch (error) {
@@ -2646,34 +3045,67 @@ app.post('/api/clinical-trials', authenticateToken, checkPermission('research_li
 
 app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.clinicalTrial), async (req, res) => {
   try {
-    // B6 FIX: Whitelist updatable fields
     const VALID_PHASES = ['Phase I','Phase II','Phase III','Phase IV'];
-    const VALID_STATUSES = ['Reclutando','Activo','Completado','En preparación'];
+    const VALID_STATUSES = ['Reclutando','Activo','Completado','En preparación','Suspendido'];
+    const VALID_ETHICS = ['pending','approved','exempt','not_required'];
+    const VALID_FUNDING = ['not_applicable','seeking','funded','completed'];
+    const VALID_SCOPE = ['specific','general'];
+    const VALID_POPULATION = ['adult','paediatric','mixed','not_applicable'];
     const b = req.body;
     const updatePayload = {
       updated_at: new Date().toISOString(),
-      ...(b.title              !== undefined && { title: b.title }),
-      ...(b.research_line_id   !== undefined && { research_line_id: b.research_line_id || null }),
-      ...(b.phase              !== undefined && { phase: VALID_PHASES.includes(b.phase) ? b.phase : 'Phase I' }),
-      ...(b.status             !== undefined && (() => {
-        if (!VALID_STATUSES.includes(b.status)) return {};  // unknown status — skip field, keep current DB value
-        return { status: b.status };
-      })()),
-      ...(b.description        !== undefined && { description: b.description }),
-      ...(b.inclusion_criteria !== undefined && { inclusion_criteria: b.inclusion_criteria }),
-      ...(b.exclusion_criteria !== undefined && { exclusion_criteria: b.exclusion_criteria }),
-      ...(b.principal_investigator_id !== undefined && { principal_investigator_id: b.principal_investigator_id || null }),
-      ...(b.co_investigators   !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
-      ...(b.sub_investigators  !== undefined && { sub_investigators: Array.isArray(b.sub_investigators) ? b.sub_investigators : [] }),
-      ...(b.contact_email      !== undefined && { contact_email: b.contact_email }),
-      ...(b.featured_in_website!== undefined && { featured_in_website: b.featured_in_website }),
-      ...(b.display_order      !== undefined && { display_order: b.display_order }),
-      ...(b.start_date         !== undefined && { start_date: b.start_date || null }),
-      ...(b.end_date           !== undefined && { end_date: b.end_date || null }),
-      ...(b.sponsor_name       !== undefined && { sponsor_name: b.sponsor_name }),
-      ...(b.tags               !== undefined && { tags: Array.isArray(b.tags) ? b.tags : [] }),
+      ...(b.title                       !== undefined && { title: b.title }),
+      ...(b.research_line_id            !== undefined && { research_line_id: b.research_line_id || null }),
+      ...(b.phase                       !== undefined && { phase: VALID_PHASES.includes(b.phase) ? b.phase : 'Phase I' }),
+      ...(b.status                      !== undefined && VALID_STATUSES.includes(b.status) && { status: b.status }),
+      ...(b.description                 !== undefined && { description: b.description }),
+      ...(b.inclusion_criteria          !== undefined && { inclusion_criteria: b.inclusion_criteria }),
+      ...(b.exclusion_criteria          !== undefined && { exclusion_criteria: b.exclusion_criteria }),
+      ...(b.principal_investigator_id   !== undefined && { principal_investigator_id: b.principal_investigator_id || null }),
+      ...(b.co_investigators            !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
+      ...(b.sub_investigators           !== undefined && { sub_investigators: Array.isArray(b.sub_investigators) ? b.sub_investigators : [] }),
+      ...(b.contact_email               !== undefined && { contact_email: b.contact_email }),
+      ...(b.featured_in_website         !== undefined && { featured_in_website: b.featured_in_website }),
+      ...(b.display_order               !== undefined && { display_order: b.display_order }),
+      ...(b.start_date                  !== undefined && { start_date: b.start_date || null }),
+      ...(b.end_date                    !== undefined && { end_date: b.end_date || null }),
+      ...(b.estimated_end_date          !== undefined && { estimated_end_date: b.estimated_end_date || null }),
+      ...(b.actual_end_date             !== undefined && { actual_end_date: b.actual_end_date || null }),
+      ...(b.sponsor_name                !== undefined && { sponsor_name: b.sponsor_name }),
+      ...(b.sponsor_type                !== undefined && { sponsor_type: b.sponsor_type }),
+      ...(b.study_type                  !== undefined && { study_type: b.study_type }),
+      ...(b.enrollment_target           !== undefined && { enrollment_target: b.enrollment_target || null }),
+      ...(b.actual_enrollment           !== undefined && { actual_enrollment: b.actual_enrollment || null }),
+      ...(b.funding_amount              !== undefined && { funding_amount: b.funding_amount || null }),
+      ...(b.tags                        !== undefined && { tags: Array.isArray(b.tags) ? b.tags : [] }),
+      ...(b.milestones                  !== undefined && { milestones: Array.isArray(b.milestones) ? b.milestones : [] }),
+      // New fields
+      ...(b.protocol_finalized          !== undefined && { protocol_finalized: Boolean(b.protocol_finalized) }),
+      ...(b.ethics_status               !== undefined && { ethics_status: VALID_ETHICS.includes(b.ethics_status) ? b.ethics_status : null }),
+      ...(b.funding_status              !== undefined && { funding_status: VALID_FUNDING.includes(b.funding_status) ? b.funding_status : 'not_applicable' }),
+      ...(b.target_diseases             !== undefined && { target_diseases: Array.isArray(b.target_diseases) ? b.target_diseases : [] }),
+      ...(b.scope_type                  !== undefined && { scope_type: VALID_SCOPE.includes(b.scope_type) ? b.scope_type : 'specific' }),
+      ...(b.scope_note                  !== undefined && { scope_note: b.scope_note ? b.scope_note.slice(0, 150) : null }),
+      ...(b.is_multicentre              !== undefined && { is_multicentre: Boolean(b.is_multicentre) }),
+      ...(b.participating_centres       !== undefined && { participating_centres: b.participating_centres || null }),
+      ...(b.population_type             !== undefined && { population_type: VALID_POPULATION.includes(b.population_type) ? b.population_type : 'adult' }),
+      // Team fields
+      ...(b.data_manager_id             !== undefined && { data_manager_id: b.data_manager_id || null }),
+      ...(b.team_roles                  !== undefined && { team_roles: (typeof b.team_roles === 'object' && !Array.isArray(b.team_roles)) ? b.team_roles : {} }),
+      ...(b.external_team               !== undefined && { external_team: Array.isArray(b.external_team) ? b.external_team.map(m => ({
+        name:        m.name?.trim()        || null,
+        institution: m.institution?.trim() || null,
+        role:        m.role?.trim()        || null,
+        email:       m.email?.trim()       || null,
+      })).filter(m => m.name || m.institution) : [] }),
     };
-    const { data, error } = await supabase.from('clinical_trials').update(updatePayload).eq('id', req.params.id).select().single();
+    // If scope changed to specific, clear scope_note
+    if (updatePayload.scope_type === 'specific') updatePayload.scope_note = null;
+    const { data, error } = await supabase.from('clinical_trials').update(updatePayload).eq('id', req.params.id)
+      .select(`*, research_lines(name, line_number),
+        pi:medical_staff!clinical_trials_principal_investigator_id_fkey(id, full_name),
+        dm:medical_staff!clinical_trials_data_manager_id_fkey(id, full_name)
+      `).single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Clinical trial not found' });
       throw error;
@@ -2707,12 +3139,16 @@ app.get('/api/innovation-projects/website', apiLimiter, async (req, res) => {
 
 app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { research_line_id, category, page = 1, limit = 50 } = req.query;
+    const { research_line_id, category, stage, page = 1, limit = 50 } = req.query;
     const offset = (page - 1) * limit;
-    let query = supabase.from('innovation_projects').select('*, research_lines(name)', { count: 'exact' });
+    let query = supabase.from('innovation_projects').select(`
+      *, research_lines(name, line_number),
+      lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)
+    `, { count: 'exact' });
     if (research_line_id) query = query.eq('research_line_id', research_line_id);
     if (category) query = query.eq('category', category);
-    const { data, error, count } = await query.order('created_at', { ascending: false }).range(offset, offset + limit - 1);
+    if (stage) query = query.eq('current_stage', stage);
+    const { data, error, count } = await query.order('display_order').order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
     res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
   } catch (error) {
@@ -2723,11 +3159,22 @@ app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, r
 app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.innovationProject), async (req, res) => {
   try {
     const body = { ...req.body };
-    // Always write development_stage (NOT NULL) in sync with current_stage
     const STAGE_MAP = { 'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica' };
     if (body.current_stage) body.development_stage = STAGE_MAP[body.current_stage] || 'En Desarrollo';
     if (!body.development_stage) body.development_stage = 'En Desarrollo';
-    const { data, error } = await supabase.from('innovation_projects').insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    // Ensure array fields
+    body.target_diseases  = Array.isArray(body.target_diseases)  ? body.target_diseases  : [];
+    body.keywords         = Array.isArray(body.keywords)         ? body.keywords         : [];
+    body.co_investigators = Array.isArray(body.co_investigators) ? body.co_investigators : [];
+    body.tags             = Array.isArray(body.tags)             ? body.tags             : [];
+    body.milestones       = Array.isArray(body.milestones)       ? body.milestones       : [];
+    body.external_team    = Array.isArray(body.external_team)    ? body.external_team.map(m => ({ name: m.name?.trim()||null, institution: m.institution?.trim()||null, role: m.role?.trim()||null, email: m.email?.trim()||null })).filter(m=>m.name||m.institution) : [];
+    body.team_roles       = (typeof body.team_roles === 'object' && !Array.isArray(body.team_roles)) ? body.team_roles : {};
+    if (body.scope_type === 'specific') body.scope_note = null;
+    if (body.scope_note) body.scope_note = body.scope_note.slice(0, 150);
+    const { data, error } = await supabase.from('innovation_projects')
+      .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
+      .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)').single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Innovation project created successfully' });
   } catch (error) {
@@ -2737,35 +3184,60 @@ app.post('/api/innovation-projects', authenticateToken, checkPermission('researc
 
 app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('research_lines', 'update'), validate(schemas.innovationProject), async (req, res) => {
   try {
-    // B6 FIX: Whitelist updatable fields
     const VALID_STAGES = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
+    const VALID_FUNDING = ['not_applicable','seeking','funded','completed'];
+    const VALID_SCOPE = ['specific','general'];
+    const VALID_POPULATION = ['adult','paediatric','mixed','not_applicable'];
+    const VALID_REGULATORY = ['none','ce_mdr','samd','aemps','fda','other'];
+    const STAGE_MAP = {'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica'};
     const b = req.body;
     const updatePayload = {
       updated_at: new Date().toISOString(),
       ...(b.title               !== undefined && { title: b.title }),
       ...(b.category            !== undefined && { category: b.category }),
-      ...(b.current_stage !== undefined && (() => {
-        const VALID = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
-        if (!VALID.includes(b.current_stage)) return {};
-        const MAP = {'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica'};
-        return { current_stage: b.current_stage, development_stage: MAP[b.current_stage] || 'En Desarrollo' };
-      })()),
+      ...(b.current_stage !== undefined && VALID_STAGES.includes(b.current_stage) && {
+        current_stage: b.current_stage,
+        development_stage: STAGE_MAP[b.current_stage] || 'En Desarrollo'
+      }),
       ...(b.description         !== undefined && { description: b.description }),
       ...(b.clinical_rationale  !== undefined && { clinical_rationale: b.clinical_rationale }),
       ...(b.research_line_id    !== undefined && { research_line_id: b.research_line_id || null }),
       ...(b.lead_investigator_id!== undefined && { lead_investigator_id: b.lead_investigator_id || null }),
       ...(b.co_investigators    !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
       ...(b.partner_needs       !== undefined && { partner_needs: Array.isArray(b.partner_needs) ? b.partner_needs : [] }),
-      ...(b.partner_found       !== undefined && { partner_found: b.partner_found }),
+      ...(b.partner_found       !== undefined && { partner_found: Boolean(b.partner_found) }),
       ...(b.partner_name        !== undefined && { partner_name: b.partner_name || null }),
-      ...(b.funding_status      !== undefined && { funding_status: b.funding_status }),
+      ...(b.funding_status      !== undefined && { funding_status: VALID_FUNDING.includes(b.funding_status) ? b.funding_status : 'not_applicable' }),
+      ...(b.funding_source      !== undefined && { funding_source: b.funding_source || null }),
+      ...(b.budget              !== undefined && { budget: b.budget || null }),
+      ...(b.trl_level           !== undefined && { trl_level: b.trl_level || null }),
+      ...(b.ip_status           !== undefined && { ip_status: b.ip_status || null }),
       ...(b.keywords            !== undefined && { keywords: Array.isArray(b.keywords) ? b.keywords : [] }),
+      ...(b.tags                !== undefined && { tags: Array.isArray(b.tags) ? b.tags : [] }),
+      ...(b.milestones          !== undefined && { milestones: Array.isArray(b.milestones) ? b.milestones : [] }),
       ...(b.featured_in_website !== undefined && { featured_in_website: b.featured_in_website }),
       ...(b.display_order       !== undefined && { display_order: b.display_order }),
       ...(b.start_date          !== undefined && { start_date: b.start_date || null }),
       ...(b.estimated_end_date  !== undefined && { estimated_end_date: b.estimated_end_date || null }),
+      // New fields
+      ...(b.scope_finalized     !== undefined && { scope_finalized: Boolean(b.scope_finalized) }),
+      ...(b.target_diseases     !== undefined && { target_diseases: Array.isArray(b.target_diseases) ? b.target_diseases : [] }),
+      ...(b.scope_type          !== undefined && { scope_type: VALID_SCOPE.includes(b.scope_type) ? b.scope_type : 'specific' }),
+      ...(b.scope_note          !== undefined && { scope_note: b.scope_note ? b.scope_note.slice(0, 150) : null }),
+      ...(b.regulatory_pathway  !== undefined && { regulatory_pathway: VALID_REGULATORY.includes(b.regulatory_pathway) ? b.regulatory_pathway : 'none' }),
+      ...(b.population_type     !== undefined && { population_type: VALID_POPULATION.includes(b.population_type) ? b.population_type : 'adult' }),
+      // Team fields
+      ...(b.team_roles          !== undefined && { team_roles: (typeof b.team_roles === 'object' && !Array.isArray(b.team_roles)) ? b.team_roles : {} }),
+      ...(b.external_team       !== undefined && { external_team: Array.isArray(b.external_team) ? b.external_team.map(m => ({
+        name:        m.name?.trim()        || null,
+        institution: m.institution?.trim() || null,
+        role:        m.role?.trim()        || null,
+        email:       m.email?.trim()       || null,
+      })).filter(m => m.name || m.institution) : [] }),
     };
-    const { data, error } = await supabase.from('innovation_projects').update(updatePayload).eq('id', req.params.id).select().single();
+    if (updatePayload.scope_type === 'specific') updatePayload.scope_note = null;
+    const { data, error } = await supabase.from('innovation_projects').update(updatePayload).eq('id', req.params.id)
+      .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)').single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Innovation project not found' });
       throw error;
@@ -2799,13 +3271,18 @@ app.get('/api/analytics/research-dashboard', authenticateToken, apiLimiter, asyn
     const projectsByStage = { 'Idea': 0, 'Prototipo': 0, 'Piloto': 0, 'Validación': 0, 'Escalamiento': 0, 'Comercialización': 0 };
     const projectsByCategory = { 'Dispositivo': 0, 'Salud Digital': 0, 'IA / ML': 0, 'Tecnología Quirúrgica': 0 };
     const partnerNeeds = {};
+    // Map legacy development_stage values → current_stage keys
+    const DEV_STAGE_MAP = { 'En Desarrollo': 'Prototipo', 'Fase Piloto': 'Piloto', 'Validación Clínica': 'Validación' };
     trials?.forEach(t => { if (trialsByPhase[t.phase] !== undefined) trialsByPhase[t.phase]++; if (trialsByStatus[t.status] !== undefined) trialsByStatus[t.status]++; });
     projects?.forEach(p => {
-      if (projectsByStage[p.current_stage] !== undefined) projectsByStage[p.current_stage]++;
+      const stage = p.current_stage || DEV_STAGE_MAP[p.development_stage] || null;
+      if (stage && projectsByStage[stage] !== undefined) projectsByStage[stage]++;
       if (projectsByCategory[p.category] !== undefined) projectsByCategory[p.category]++;
       p.partner_needs?.forEach(n => { partnerNeeds[n] = (partnerNeeds[n] || 0) + 1; });
     });
-    res.json({ success: true, data: { summary: { totalResearchLines: researchLines?.length || 0, activeResearchLines: researchLines?.filter(l => l.active !== false).length || 0, totalTrials: trials?.length || 0, activeTrials: (trialsByStatus['Activo'] || 0) + (trialsByStatus['Reclutando'] || 0), totalProjects: projects?.length || 0, activeProjects: (projectsByStage['Piloto'] || 0) + (projectsByStage['Validación'] || 0) + (projectsByStage['Escalamiento'] || 0) }, clinicalTrials: { byPhase: trialsByPhase, byStatus: trialsByStatus }, innovationProjects: { byStage: projectsByStage, byCategory: projectsByCategory, partnerNeeds: Object.entries(partnerNeeds).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count) } } });
+    const activeTrialsCount = (trialsByStatus['Activo'] || 0) + (trialsByStatus['Reclutando'] || 0);
+    const activeProjectsCount = (projectsByStage['Piloto'] || 0) + (projectsByStage['Validación'] || 0) + (projectsByStage['Escalamiento'] || 0) + (projectsByStage['Comercialización'] || 0);
+    res.json({ success: true, data: { summary: { totalResearchLines: researchLines?.length || 0, activeResearchLines: researchLines?.filter(l => l.active !== false).length || 0, totalTrials: trials?.length || 0, totalStudies: trials?.length || 0, activeTrials: activeTrialsCount, activeStudies: activeTrialsCount, totalProjects: projects?.length || 0, activeProjects: activeProjectsCount }, clinicalTrials: { byPhase: trialsByPhase, byStatus: trialsByStatus }, innovationProjects: { byStage: projectsByStage, byCategory: projectsByCategory, partnerNeeds: Object.entries(partnerNeeds).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count) } } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -2887,7 +3364,7 @@ app.get('/api/analytics/clinical-trials-timeline', authenticateToken, apiLimiter
   }
 });
 
-app.get('/api/analytics/summary', authenticateToken, apiLimiter, async (req, res) => {
+app.get('/api/analytics/summary', authenticateToken, checkPermission('research_lines', 'read'), apiLimiter, async (req, res) => {
   try {
     const [{ count: totalRL }, { count: totalTrials }, { count: activeTrials }, { count: totalProj }, { count: activeProj }] = await Promise.all([
       supabase.from('research_lines').select('*', { count: 'exact', head: true }),
@@ -3313,11 +3790,17 @@ app.post('/api/rotation-services', authenticateToken, checkPermission('system_se
 
 app.put('/api/rotation-services/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
   try {
-    const { name, contact_name, contact_email, contact_phone, status } = req.body
+    const { name, contact_name, contact_email, contact_phone, active } = req.body
+    const updates = { updated_at: new Date().toISOString() }
+    if (name         !== undefined) updates.name          = name.trim()
+    if (contact_name !== undefined) updates.contact_name  = contact_name || null
+    if (contact_email!== undefined) updates.contact_email = contact_email || null
+    if (contact_phone!== undefined) updates.contact_phone = contact_phone || null
+    if (active       !== undefined) updates.status        = active ? 'active' : 'inactive'
     const { data, error } = await supabase.from('departments')
-      .update({ name, contact_name, contact_email, contact_phone, status, updated_at: new Date().toISOString() })
+      .update(updates)
       .eq('id', req.params.id)
-      .neq('service_type', 'home_department') // never allow editing the home dept via this route
+      .eq('service_type', 'rotation_service')
       .select().single()
     if (error) throw error
     if (!data) return res.status(404).json({ error: 'Rotation service not found' })
@@ -3740,6 +4223,7 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
         reason_category: reason_category || 'unspecified',
         notes: notes || null,
         time_type: time_type || 'night',
+        coverage_area_id: coverage_area_id || null,
         created_by: null,  // app_users.id ≠ auth.users.id — FK requires auth.users
         created_at: new Date().toISOString()
       }])
@@ -3894,13 +4378,14 @@ app.get('/api/coverage-areas', authenticateToken, apiLimiter, async (req, res) =
 
 app.post('/api/coverage-areas', authenticateToken, checkPermission('system_settings', 'create'), async (req, res) => {
   try {
-    const { name, code, color, applies_weekends, display_order } = req.body
+    const { name, code, color, applies_weekends, display_order, requires_coverage } = req.body
     if (!name?.trim()) return res.status(400).json({ error: 'Name is required' })
     const row = {
       name: name.trim(),
       code: (code || name).trim().toUpperCase().replace(/\s+/g, '_').slice(0, 20),
       color: color || '#00b3b3',
       applies_weekends: applies_weekends !== false,
+      requires_coverage: requires_coverage === true,
       display_order: display_order || 0,
       is_active: true
     }
@@ -3915,13 +4400,15 @@ app.post('/api/coverage-areas', authenticateToken, checkPermission('system_setti
 
 app.put('/api/coverage-areas/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
   try {
-    const { name, color, applies_weekends, display_order, is_active } = req.body
-    const updates = { updated_at: new Date().toISOString() }
+    const { name, color, applies_weekends, requires_coverage, display_order, is_active } = req.body
+    const updates = {}
     if (name !== undefined) updates.name = name.trim()
     if (color !== undefined) updates.color = color
     if (applies_weekends !== undefined) updates.applies_weekends = applies_weekends
+    if (requires_coverage !== undefined) updates.requires_coverage = requires_coverage
     if (display_order !== undefined) updates.display_order = display_order
     if (is_active !== undefined) updates.is_active = is_active
+    if (Object.keys(updates).length === 0) return res.json({ success: true, message: 'Nothing to update' })
     const { data, error } = await supabase.from('coverage_areas').update(updates).eq('id', req.params.id).select().single()
     if (error) throw error
     res.json({ success: true, data })
@@ -3945,6 +4432,54 @@ app.delete('/api/coverage-areas/:id', authenticateToken, checkPermission('system
     res.json({ success: true })
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete coverage area', message: err.message })
+  }
+})
+
+// ===== ONCALL BATCH INSERT =====
+app.post('/api/oncall/batch', authenticateToken, checkPermission('oncall_schedule', 'create'), async (req, res) => {
+  try {
+    const { shifts } = req.body
+    if (!Array.isArray(shifts) || shifts.length === 0)
+      return res.status(400).json({ error: 'shifts array is required' })
+    if (shifts.length > 200)
+      return res.status(400).json({ error: 'Maximum 200 shifts per batch' })
+
+    const rows = shifts.map(s => ({
+      duty_date:            formatDate(new Date(s.duty_date)),
+      shift_type:           ['primary_call','backup_call','float_physician'].includes(s.shift_type) ? s.shift_type : 'primary_call',
+      coverage_area_id:     s.coverage_area_id || null,
+      start_time:           s.start_time || '15:00',
+      end_time:             s.end_time   || '08:00',
+      primary_physician_id: s.primary_physician_id,
+      backup_physician_id:  s.backup_physician_id  || null,
+      coverage_notes:       s.coverage_notes       || null,
+      schedule_id:          generateId('SCH'),
+      created_by:           req.user.id,
+      created_at:           new Date().toISOString(),
+      updated_at:           new Date().toISOString(),
+    }))
+
+    // Validate required fields
+    const invalid = rows.filter(r => !r.primary_physician_id || !r.duty_date)
+    if (invalid.length > 0)
+      return res.status(400).json({ error: `${invalid.length} shifts missing required fields (primary_physician_id, duty_date)` })
+
+    const { data, error } = await supabase
+      .from('oncall_schedule')
+      .insert(rows)
+      .select()
+
+    if (error) throw error
+    res.status(201).json({ success: true, count: data.length, data })
+  } catch (err) {
+    // Unique constraint violation — one primary per area per day
+    if (err.code === '23505')
+      return res.status(409).json({
+        error: 'Duplicate primary call',
+        message: 'One or more dates already have a primary call for the same area. Review conflicts and retry.',
+        detail: err.detail
+      })
+    res.status(500).json({ error: 'Batch insert failed', message: err.message })
   }
 })
 
@@ -3984,6 +4519,28 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     Environment: ${NODE_ENV}
     ======================================================
   `);
+});
+
+
+// ── Test notification endpoint ───────────────────────────────────────────
+app.post('/api/notify/test', authenticateToken, async (req, res) => {
+  try {
+    await sendNotification(
+      'neumDesk notification test',
+      `<h2 style="color:#0a1628">Notifications are working</h2>
+      <p style="color:#374151">This is a test notification from neumDesk. You will receive alerts for:</p>
+      <ul style="color:#374151;padding-left:20px">
+        <li>Absences with no coverage arranged</li>
+        <li>On-call shifts with no backup assigned (required areas only)</li>
+        <li>Rotations ending within 7 days with no successor scheduled</li>
+      </ul>
+      <p style="color:#6b7280;font-size:13px">Sent to: ${NOTIFY_EMAIL || 'not configured'}</p>`,
+      false
+    );
+    res.json({ ok: true, to: NOTIFY_EMAIL || 'not configured (set NOTIFY_EMAIL env var)' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
