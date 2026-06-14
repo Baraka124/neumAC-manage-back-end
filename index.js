@@ -1118,6 +1118,26 @@ app.get('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
 app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff', 'create'), validate(schemas.medicalStaff), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
+
+    // Validate department assignment
+    if (dataSource.department_id) {
+      const { data: dept } = await supabase.from('departments')
+        .select('is_external, name, status')
+        .eq('id', dataSource.department_id)
+        .single();
+      if (dept?.status === 'inactive') {
+        return res.status(400).json({ error: 'Invalid department', message: 'Department is inactive.' });
+      }
+      // External departments only valid for affiliated staff
+      const affiliation = dataSource.affiliation_type || 'primary';
+      if (dept?.is_external && affiliation === 'primary') {
+        return res.status(400).json({
+          error: 'Invalid department',
+          message: `${dept.name} is an external rotation service. Primary staff must belong to the home department. Set affiliation_type to "affiliated" for clinicians from external departments who participate in the rotation programme.`
+        });
+      }
+    }
+
     const staffData = {
       full_name: dataSource.full_name,
       staff_type: dataSource.staff_type,
@@ -1125,6 +1145,8 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
       professional_email: dataSource.professional_email,
       employment_status: dataSource.employment_status || 'active',
       department_id: dataSource.department_id || null,
+      affiliation_type: dataSource.affiliation_type || 'primary',
+      primary_dept_name: dataSource.primary_dept_name || null,
       academic_degree: dataSource.academic_degree || null,
       academic_degree_id: dataSource.academic_degree_id || null,
       specialization: dataSource.specialization || null,
@@ -1296,14 +1318,20 @@ app.delete('/api/medical-staff/:id', authenticateToken, checkPermission('medical
 // ===== 6. DEPARTMENTS =====
 app.get('/api/departments', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { include_inactive } = req.query;
+    const { include_inactive, type } = req.query;
     let query = supabase.from('departments')
       .select('*, medical_staff!departments_head_of_department_id_fkey(full_name, professional_email), hospital:hospitals!departments_hospital_id_fkey(id, name, code, parent_complex)')
-      .order('name');
-    // Default: active only. Pass ?include_inactive=true for name-resolution lookups
+      .order('display_order', { ascending: true })
+      .order('name', { ascending: true });
+
+    // Default: active only
     if (!include_inactive || include_inactive !== 'true') {
       query = query.eq('status', 'active');
     }
+    // Optional: filter by type — 'home' or 'external'
+    if (type === 'home')     query = query.eq('is_primary', true);
+    if (type === 'external') query = query.eq('is_external', true);
+
     const { data, error } = await query;
     if (error) throw error;
     res.json((data || []).map(item => ({
@@ -1311,7 +1339,11 @@ app.get('/api/departments', authenticateToken, apiLimiter, async (req, res) => {
       head_of_department: {
         full_name: item.medical_staff?.full_name || null,
         professional_email: item.medical_staff?.professional_email || null
-      }
+      },
+      // Explicit type flags for frontend
+      is_primary:  item.is_primary  || false,
+      is_external: item.is_external || false,
+      service_type: item.service_type || 'rotation_service'
     })));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch departments', message: error.message });
