@@ -204,6 +204,15 @@ const apiLimiter = rateLimit({
   legacyHeaders: false
 });
 
+// Separate stricter limiter for public website endpoints (unauthenticated)
+const publicApiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,  // 120 req per 15 min per IP — enough for a website, blocks scrapers
+  message: { error: 'Rate limit exceeded for public API' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
 const authLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 50,
@@ -1869,6 +1878,18 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
       updated_at: new Date().toISOString()
     };
 
+    // Auto-fill supervisor from unit default if not explicitly provided
+    if (!rotationData.supervising_attending_id && unitForCap) {
+      const { data: unitFull } = await supabase
+        .from('training_units')
+        .select('default_supervisor_id')
+        .eq('id', dataSource.training_unit_id)
+        .single();
+      if (unitFull?.default_supervisor_id) {
+        rotationData.supervising_attending_id = unitFull.default_supervisor_id;
+      }
+    }
+
     const { data, error } = await supabase.from('resident_rotations').insert([rotationData]).select().single();
     if (error) throw error;
     res.status(201).json(data);
@@ -2268,22 +2289,24 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
     const currentStatus = deriveAbsenceStatus(startDateStr, endDateStr);
 
     const absenceData = {
-      staff_member_id:   dataSource.staff_member_id,
-      absence_type:      dataSource.absence_type,
-      absence_reason:    dataSource.absence_reason,
-      start_date:        startDateStr,
-      end_date:          endDateStr,
-      total_days:        totalDays,        // FIX 2: was never set before
-      current_status:    currentStatus,    // FIX 2: was never set before
-      coverage_arranged: dataSource.coverage_arranged || false,
-      covering_staff_id: dataSource.covering_staff_id || null,
-      coverage_notes:    dataSource.coverage_notes || '',
-      hod_notes:         dataSource.hod_notes || '',
-      // FIX 3: recorded_by uses req.user.id; if mock user isn't in app_users this will fail FK
-      // Long-term fix: seed admin/mock users in app_users table, or make column nullable
-      recorded_by:       req.user.id || null,
-      recorded_at:       new Date().toISOString(),
-      last_updated:      new Date().toISOString()
+      staff_member_id:      dataSource.staff_member_id,
+      absence_type:         dataSource.absence_type,
+      absence_reason:       dataSource.absence_reason,
+      start_date:           startDateStr,
+      end_date:             endDateStr,
+      total_days:           totalDays,
+      current_status:       currentStatus,
+      coverage_arranged:    dataSource.coverage_arranged || false,
+      covering_staff_id:    dataSource.covering_staff_id || null,
+      coverage_notes:       dataSource.coverage_notes || '',
+      hod_notes:            dataSource.hod_notes || '',
+      recorded_by:          req.user.id || null,
+      recorded_at:          new Date().toISOString(),
+      last_updated:         new Date().toISOString(),
+      // Recurring fields
+      is_recurring:         dataSource.is_recurring || false,
+      recurrence_pattern:   dataSource.recurrence_pattern || null,
+      recurrence_end_date:  dataSource.recurrence_end_date || null,
     };
 
     console.log('💾 Inserting absence record:', absenceData);
@@ -2291,18 +2314,53 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
     const { data, error } = await supabase.from('staff_absence_records').insert([absenceData]).select().single();
     if (error) {
       console.error('❌ Database error:', error);
-      if (error.code === '23503') return res.status(400).json({ error: 'Invalid reference', message: 'Staff member or recorded_by user not found. Ensure the user performing this action exists in app_users.' });
+      if (error.code === '23503') return res.status(400).json({ error: 'Invalid reference', message: 'Staff member or recorded_by user not found.' });
       if (error.code === '23505') return res.status(409).json({ error: 'Duplicate entry', message: 'An absence record already exists for this staff member during this period' });
       throw error;
     }
 
-    try {
-      await supabase.from('absence_audit_log').insert({
-        absence_record_id: data.id, changed_field: 'all', change_type: 'created',
-        changed_by: req.user.id || null, changed_at: new Date().toISOString()
+    // Generate recurring instances in background
+    if (absenceData.is_recurring && absenceData.recurrence_pattern && absenceData.recurrence_end_date) {
+      setImmediate(async () => {
+        try {
+          const instances = [];
+          let cursor = new Date(startDateStr);
+          const recEnd = new Date(absenceData.recurrence_end_date);
+          const durationDays = Math.round((new Date(endDateStr) - new Date(startDateStr)) / 86400000);
+
+          const advance = (d) => {
+            const next = new Date(d);
+            if (absenceData.recurrence_pattern === 'weekly')    next.setDate(next.getDate() + 7);
+            if (absenceData.recurrence_pattern === 'biweekly')  next.setDate(next.getDate() + 14);
+            if (absenceData.recurrence_pattern === 'monthly')   next.setMonth(next.getMonth() + 1);
+            return next;
+          };
+
+          cursor = advance(cursor); // skip original
+          while (cursor <= recEnd) {
+            const instanceEnd = new Date(cursor);
+            instanceEnd.setDate(instanceEnd.getDate() + durationDays);
+            const iStart = cursor.toISOString().split('T')[0];
+            const iEnd   = instanceEnd.toISOString().split('T')[0];
+            instances.push({
+              ...absenceData,
+              start_date: iStart,
+              end_date: iEnd,
+              total_days: calculateDays(iStart, iEnd),
+              current_status: deriveAbsenceStatus(iStart, iEnd),
+              is_recurring: true,
+              recurrence_parent_id: data.id,
+              recorded_at: new Date().toISOString(),
+              last_updated: new Date().toISOString(),
+            });
+            cursor = advance(cursor);
+          }
+          if (instances.length > 0) {
+            await supabase.from('staff_absence_records').insert(instances);
+            console.log(`✅ Generated ${instances.length} recurring instances for absence ${data.id}`);
+          }
+        } catch (e) { console.warn('Recurring absence generation failed (non-fatal):', e.message); }
       });
-    } catch (auditErr) {
-      console.warn('Audit log insert failed (non-fatal):', auditErr.message);
     }
 
     console.log('✅ Absence record created:', data.id);
@@ -2847,6 +2905,29 @@ app.get('/api/dashboard/upcoming-events', authenticateToken, apiLimiter, async (
 });
 
 // ===== 18. SYSTEM SETTINGS =====
+// ===== AUDIT LOG =====
+app.get('/api/audit-log', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    // Only system_admin and department_head can read audit log
+    if (!['system_admin','department_head'].includes(req.user.user_role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    const { table_name, record_id, limit = 50, page = 1 } = req.query;
+    const offset = (page - 1) * limit;
+    let query = supabase.from('audit_log')
+      .select('*, changed_by_user:app_users!audit_log_changed_by_fkey(full_name, email)', { count: 'exact' })
+      .order('changed_at', { ascending: false })
+      .range(offset, offset + parseInt(limit) - 1);
+    if (table_name) query = query.eq('table_name', table_name);
+    if (record_id) query = query.eq('record_id', record_id);
+    const { data, error, count } = await query;
+    if (error) throw error;
+    res.json({ data, pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0 } });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch audit log', message: err.message });
+  }
+});
+
 app.get('/api/settings', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('system_settings').select('*').limit(1).single();
@@ -2952,7 +3033,7 @@ app.get('/api/research-lines', authenticateToken, apiLimiter, async (req, res) =
 // ── PUBLIC (no auth) — website-facing research lines ──────────────────────────
 // Used by the public website to render the research lines grid/accordion.
 // Returns only active lines with coordinator name. No sensitive fields exposed.
-app.get('/api/research-lines/website', apiLimiter, async (req, res) => {
+app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('research_lines')
@@ -3048,7 +3129,7 @@ app.put('/api/research-lines/:id/coordinator', authenticateToken, checkPermissio
 });
 
 // ===== 22. CLINICAL STUDIES =====
-app.get('/api/clinical-trials/website', apiLimiter, async (req, res) => {
+app.get('/api/clinical-trials/website', publicApiLimiter, async (req, res) => {
   try {
     const { line, phase, status, search } = req.query;
     let query = supabase.from('clinical_trials').select('*, research_line:research_lines(name, line_number)').eq('featured_in_website', true).order('display_order');
@@ -3196,7 +3277,7 @@ app.delete('/api/clinical-trials/:id', authenticateToken, checkPermission('resea
 });
 
 // ===== 23. INNOVATION PROJECTS =====
-app.get('/api/innovation-projects/website', apiLimiter, async (req, res) => {
+app.get('/api/innovation-projects/website', publicApiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('innovation_projects').select('*, research_line:research_lines(name)').eq('featured_in_website', true).order('display_order');
     if (error) throw error;
@@ -4025,7 +4106,7 @@ app.get('/api/news', authenticateToken, apiLimiter, async (req, res) => {
 });
 
 // GET /api/news/website — PUBLIC, returns only published+public posts
-app.get('/api/news/website', apiLimiter, async (req, res) => {
+app.get('/api/news/website', publicApiLimiter, async (req, res) => {
   try {
     const { type, line, limit = 20 } = req.query;
     let query = supabase
