@@ -1,7 +1,7 @@
-// ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============  
+// ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
 // VERSION 5.4 - ALL BUGS FIXED
 // --- ORIGINAL FIXES ---
-// FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects 
+// FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
 // FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
 // FIX 4: rotation_category Joi/DB enum mismatch corrected
@@ -3171,12 +3171,6 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch team', message: error.message });
   }
 });
-      meta: { total: team.length }
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch team', message: error.message });
-  }
-});
 
 app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
   try {
@@ -4914,7 +4908,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 });
 
 
-// ── Test notification endpoint ───────────────────────────────────────────  
+// ── Test notification endpoint ───────────────────────────────────────────
 app.post('/api/notify/test', authenticateToken, async (req, res) => {
   try {
     await sendNotification(
