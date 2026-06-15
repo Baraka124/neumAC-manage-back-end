@@ -3075,20 +3075,13 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
     const { data, error } = await supabase
       .from('medical_staff')
       .select(`
-        id,
-        full_name,
-        staff_type,
-        specialization,
-        public_bio,
-        public_photo_url,
-        affiliation_type,
-        primary_dept_name,
-        can_be_pi,
-        department:departments!medical_staff_department_id_fkey(
-          name, is_primary, is_external
-        ),
+        id, full_name, title, staff_type, specialization,
+        public_bio, public_photo_url, affiliation_type, primary_dept_name, can_be_pi,
+        department:departments!medical_staff_department_id_fkey(name, is_primary, is_external),
         research_lines:research_lines!research_lines_coordinator_id_fkey(
-          id, line_number, name
+          id, line_number, name, short_name,
+          clinical_trials(id, status, title, phase),
+          innovation_projects(id, current_stage, funding_status, title)
         )
       `)
       .eq('is_public', true)
@@ -3097,27 +3090,87 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
 
     if (error) throw error;
 
-    const team = (data || []).map(m => ({
-      id:               m.id,
-      full_name:        m.full_name,
-      staff_type:       m.staff_type,
-      specialization:   m.specialization || null,
-      public_bio:       m.public_bio || null,
-      public_photo_url: m.public_photo_url || null,
-      affiliation_type: m.affiliation_type || 'primary',
-      primary_dept_name: m.primary_dept_name || m.department?.name || null,
-      department_name:  m.department?.name || null,
-      is_external:      m.department?.is_external || false,
-      can_be_pi:        m.can_be_pi || false,
-      coordinates_line: m.research_lines?.[0] ? {
-        id:          m.research_lines[0].id,
-        line_number: m.research_lines[0].line_number,
-        name:        m.research_lines[0].name
-      } : null
-    }));
+    // Get latest publication per person from news_posts authors_text
+    // (lightweight join — authors_text contains full_name substrings)
+    const { data: recentPubs } = await supabase
+      .from('news_posts')
+      .select('id, title, journal_name, published_at, doi, authors_text, author_id')
+      .eq('status', 'published')
+      .eq('post_type', 'publication')
+      .not('journal_name', 'is', null)
+      .order('published_at', { ascending: false })
+      .limit(50);
 
-    res.json({
-      data: team,
+    const team = (data || []).map(m => {
+      const displayName = m.title ? `${m.title} ${m.full_name}` : m.full_name;
+      const line = m.research_lines?.[0] || null;
+
+      // Trials for this line
+      const lineTrials = line?.clinical_trials || [];
+      const activeTrials = lineTrials.filter(t =>
+        ['Reclutando','Activo','Active','Recruiting'].includes(t.status)
+      );
+      const recruitingTrials = lineTrials.filter(t =>
+        ['Reclutando','Recruiting'].includes(t.status)
+      );
+
+      // Projects for this line
+      const lineProjects = line?.innovation_projects || [];
+      const activeProjects = lineProjects.filter(p => p.current_stage !== 'completed');
+      const seekingProjects = lineProjects.filter(p => p.funding_status === 'seeking');
+
+      // Latest publication where this person is named as author
+      const personPubs = (recentPubs || []).filter(p =>
+        p.author_id === m.id ||
+        (p.authors_text && m.full_name && p.authors_text.toLowerCase().includes(m.full_name.toLowerCase().split(' ').slice(-1)[0]))
+      );
+      const latestPub = personPubs[0] || null;
+
+      // Collaboration status
+      let collabStatus = null;
+      if (recruitingTrials.length > 0) collabStatus = 'recruiting';
+      else if (seekingProjects.length > 0) collabStatus = 'seeking_partner';
+      else if (activeTrials.length > 0) collabStatus = 'active';
+
+      return {
+        id:               m.id,
+        full_name:        m.full_name,
+        display_name:     displayName,
+        title:            m.title || null,
+        staff_type:       m.staff_type,
+        specialization:   m.specialization || null,
+        public_bio:       m.public_bio || null,
+        public_photo_url: m.public_photo_url || null,
+        affiliation_type: m.affiliation_type || 'primary',
+        primary_dept_name: m.primary_dept_name || m.department?.name || null,
+        is_external:      m.department?.is_external || false,
+        can_be_pi:        m.can_be_pi || false,
+        coordinates_line: line ? {
+          id:           line.id,
+          line_number:  line.line_number,
+          name:         line.name,
+          short_name:   line.short_name || line.name,
+        } : null,
+        // Live contextual data — counts only, not full lists
+        active_trials:    activeTrials.length,
+        recruiting_trials: recruitingTrials.length,
+        active_projects:  activeProjects.length,
+        seeking_partner:  seekingProjects.length > 0,
+        latest_pub:       latestPub ? {
+          title:        latestPub.title,
+          journal:      latestPub.journal_name,
+          year:         latestPub.published_at ? new Date(latestPub.published_at).getFullYear() : null,
+          doi:          latestPub.doi || null,
+        } : null,
+        collab_status:    collabStatus,
+      };
+    });
+
+    res.json({ data: team, meta: { total: team.length } });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch team', message: error.message });
+  }
+});
       meta: { total: team.length }
     });
   } catch (error) {
@@ -3130,21 +3183,31 @@ app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
     const { data, error } = await supabase
       .from('research_lines')
       .select(`
-        id,
-        line_number,
-        name,
-        description,
-        capabilities,
-        keywords,
-        sort_order,
+        id, line_number, name, short_name, description, capabilities, keywords, sort_order,
         coordinator:medical_staff!research_lines_coordinator_id_fkey(
-          full_name
-        )
+          id, full_name, specialization, public_bio, public_photo_url, is_public
+        ),
+        clinical_trials(id, status),
+        innovation_projects(id, current_stage)
       `)
       .eq('active', true)
+      .eq('is_public', true)
       .order('sort_order');
     if (error) throw error;
-    res.json({ data: data || [], meta: { total: (data || []).length } });
+    const lines = (data || []).map(l => ({
+      id:           l.id,
+      line_number:  l.line_number,
+      name:         l.name,
+      short_name:   l.short_name || l.name,
+      description:  l.description,
+      capabilities: l.capabilities,
+      keywords:     l.keywords,
+      coordinator:  l.coordinator || null,
+      active_trials:  (l.clinical_trials || []).filter(t => ['Reclutando','Activo','Active','Recruiting'].includes(t.status)).length,
+      total_trials:   (l.clinical_trials || []).length,
+      active_projects:(l.innovation_projects || []).filter(p => p.current_stage !== 'completed').length,
+    }));
+    res.json({ data: lines, meta: { total: lines.length } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
