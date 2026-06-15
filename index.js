@@ -3065,6 +3065,66 @@ app.get('/api/research-lines', authenticateToken, apiLimiter, async (req, res) =
 // ── PUBLIC (no auth) — website-facing research lines ──────────────────────────
 // Used by the public website to render the research lines grid/accordion.
 // Returns only active lines with coordinator name. No sensitive fields exposed.
+// ================================================================
+// PUBLIC WEBSITE: TEAM
+// GET /api/team/website — staff marked is_public = true
+// No authentication required — publicApiLimiter only
+// ================================================================
+app.get('/api/team/website', publicApiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('medical_staff')
+      .select(`
+        id,
+        full_name,
+        staff_type,
+        specialization,
+        public_bio,
+        public_photo_url,
+        affiliation_type,
+        primary_dept_name,
+        can_be_pi,
+        department:departments!medical_staff_department_id_fkey(
+          name, is_primary, is_external
+        ),
+        research_lines:research_lines!research_lines_coordinator_id_fkey(
+          id, line_number, name
+        )
+      `)
+      .eq('is_public', true)
+      .eq('employment_status', 'active')
+      .order('full_name', { ascending: true });
+
+    if (error) throw error;
+
+    const team = (data || []).map(m => ({
+      id:               m.id,
+      full_name:        m.full_name,
+      staff_type:       m.staff_type,
+      specialization:   m.specialization || null,
+      public_bio:       m.public_bio || null,
+      public_photo_url: m.public_photo_url || null,
+      affiliation_type: m.affiliation_type || 'primary',
+      primary_dept_name: m.primary_dept_name || m.department?.name || null,
+      department_name:  m.department?.name || null,
+      is_external:      m.department?.is_external || false,
+      can_be_pi:        m.can_be_pi || false,
+      coordinates_line: m.research_lines?.[0] ? {
+        id:          m.research_lines[0].id,
+        line_number: m.research_lines[0].line_number,
+        name:        m.research_lines[0].name
+      } : null
+    }));
+
+    res.json({
+      data: team,
+      meta: { total: team.length }
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch team', message: error.message });
+  }
+});
+
 app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -3084,7 +3144,7 @@ app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
       .eq('active', true)
       .order('sort_order');
     if (error) throw error;
-    res.json({ success: true, data: data || [] });
+    res.json({ data: data || [], meta: { total: (data || []).length } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3171,7 +3231,7 @@ app.get('/api/clinical-trials/website', publicApiLimiter, async (req, res) => {
     if (search) query = query.or(`title.ilike.%${search}%,protocol_id.ilike.%${search}%`);
     const { data, error } = await query.limit(50);
     if (error) throw error;
-    res.json({ success: true, data: data || [] });
+    res.json({ data: data || [], meta: { total: (data || []).length } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3313,7 +3373,7 @@ app.get('/api/innovation-projects/website', publicApiLimiter, async (req, res) =
   try {
     const { data, error } = await supabase.from('innovation_projects').select('*, research_line:research_lines(name)').eq('featured_in_website', true).order('display_order');
     if (error) throw error;
-    res.json({ success: true, data: data || [] });
+    res.json({ data: data || [], meta: { total: (data || []).length } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3341,24 +3401,37 @@ app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, r
 app.post('/api/innovation-projects', authenticateToken, checkPermission('research_lines', 'create'), validate(schemas.innovationProject), async (req, res) => {
   try {
     const body = { ...req.body };
-    const STAGE_MAP = { 'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica' };
-    if (body.current_stage) body.development_stage = STAGE_MAP[body.current_stage] || 'En Desarrollo';
-    if (!body.development_stage) body.development_stage = 'En Desarrollo';
-    // Ensure array fields
+
+    // current_stage now uses English values — drop old Spanish mapping
+    if (!body.current_stage) body.current_stage = 'development';
+    // Keep development_stage in sync for backward compat (Spanish UI fallback)
+    const STAGE_MAP_EN = { concept:'Fase Piloto', development:'En Desarrollo', pilot:'Fase Piloto', validation:'Validación', scaling:'Validación', completed:'Validación' };
+    body.development_stage = STAGE_MAP_EN[body.current_stage] || 'En Desarrollo';
+
+    // New fields
+    body.project_url    = body.project_url    || null;
+    body.repo_url       = body.repo_url       || null;
+    body.demo_url       = body.demo_url       || null;
+    body.project_nature = body.project_nature || 'clinical_innovation';
+    body.is_featured    = body.is_featured    || false;
+
+    // Array fields
     body.target_diseases  = Array.isArray(body.target_diseases)  ? body.target_diseases  : [];
     body.keywords         = Array.isArray(body.keywords)         ? body.keywords         : [];
     body.co_investigators = Array.isArray(body.co_investigators) ? body.co_investigators : [];
+    body.partner_needs    = Array.isArray(body.partner_needs)    ? body.partner_needs    : [];
     body.tags             = Array.isArray(body.tags)             ? body.tags             : [];
     body.milestones       = Array.isArray(body.milestones)       ? body.milestones       : [];
     body.external_team    = Array.isArray(body.external_team)    ? body.external_team.map(m => ({ name: m.name?.trim()||null, institution: m.institution?.trim()||null, role: m.role?.trim()||null, email: m.email?.trim()||null })).filter(m=>m.name||m.institution) : [];
     body.team_roles       = (typeof body.team_roles === 'object' && !Array.isArray(body.team_roles)) ? body.team_roles : {};
     if (body.scope_type === 'specific') body.scope_note = null;
     if (body.scope_note) body.scope_note = body.scope_note.slice(0, 150);
+
     const { data, error } = await supabase.from('innovation_projects')
       .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
       .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)').single();
     if (error) throw error;
-    res.status(201).json({ success: true, data, message: 'Innovation project created successfully' });
+    res.status(201).json({ data, message: 'Innovation project created successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -4140,20 +4213,40 @@ app.get('/api/news', authenticateToken, apiLimiter, async (req, res) => {
 // GET /api/news/website — PUBLIC, returns only published+public posts
 app.get('/api/news/website', publicApiLimiter, async (req, res) => {
   try {
-    const { type, line, limit = 20 } = req.query;
+    const { type, line, limit = 20, featured_only } = req.query;
+
     let query = supabase
       .from('news_posts')
-      .select(`id, post_type, title, body, featured_image_url, word_count, expires_at, published_at, created_at, journal_name, authors_text, doi, author:medical_staff!news_posts_author_id_fkey(id, full_name), research_line:research_lines!news_posts_research_line_id_fkey(id, line_number, name)`)
+      .select(`
+        id, post_type, title, body, featured_image_url, image_urls,
+        word_count, expires_at, published_at, created_at,
+        journal_name, authors_text, doi, is_featured, is_public,
+        author:medical_staff!news_posts_author_id_fkey(id, full_name),
+        research_line:research_lines!news_posts_research_line_id_fkey(id, line_number, name)
+      `)
       .eq('status', 'published')
       .eq('is_public', true)
       .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString())
+      // Featured posts first, then by date
+      .order('is_featured', { ascending: false })
       .order('published_at', { ascending: false })
       .limit(parseInt(limit));
+
     if (type) query = query.eq('post_type', type);
     if (line) query = query.eq('research_line_id', line);
+    if (featured_only === 'true') query = query.eq('is_featured', true);
+
     const { data, error } = await query;
     if (error) throw error;
-    res.json({ data: data || [] });
+
+    const posts = data || [];
+    res.json({
+      data: posts,
+      meta: {
+        total:    posts.length,
+        featured: posts.filter(p => p.is_featured).length
+      }
+    });
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch news', message: err.message });
   }
@@ -4229,6 +4322,22 @@ app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'u
       ...(b.doi                !== undefined && { doi: b.doi || null }),
       ...(b.published_at       !== undefined && { published_at: b.published_at ? new Date(b.published_at).toISOString() : null }),
     };
+
+    // is_featured: enforce max 5 featured posts
+    if (b.is_featured !== undefined) {
+      const featuring = b.is_featured === true || b.is_featured === 'true';
+      if (featuring) {
+        const { data: current } = await supabase.from('news_posts')
+          .select('id').eq('is_featured', true).neq('id', id);
+        if ((current || []).length >= 5) {
+          return res.status(409).json({
+            error: 'Featured limit reached',
+            message: 'Maximum 5 posts can be featured on the homepage at once. Un-feature an existing post first.'
+          });
+        }
+      }
+      updates.is_featured = featuring;
+    }
     if (b.body) updates.word_count = b.body.trim().split(/\s+/).filter(Boolean).length;
     else if (b.body === '' || b.body === null) updates.word_count = null;
     if (b.status === 'published' && !updates.published_at) updates.published_at = new Date().toISOString();
@@ -4748,7 +4857,7 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
     await sendNotification(
       'neumDesk notification test',
       `<h2 style="color:#0a1628">Notifications are working</h2>
-      <p style="color:#374151">This is a test notification from neumDesk. You will receive alerts for:</p>  
+      <p style="color:#374151">This is a test notification from neumDesk. You will receive alerts for:</p>
       <ul style="color:#374151;padding-left:20px">
         <li>Absences with no coverage arranged</li>
         <li>On-call shifts with no backup assigned (required areas only)</li>
