@@ -4310,7 +4310,7 @@ app.get('/api/news/website', publicApiLimiter, async (req, res) => {
 });
 
 // POST /api/news — create
-app.post('/api/news', authenticateToken, checkPermission('research_lines', 'create'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
+app.post('/api/news', authenticateToken, checkPermission('news_posts', 'create'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
   try {
     const { title, post_type, body, author_id, research_line_id, is_public,
             status, expires_at, featured_image_url, image_urls,
@@ -4352,7 +4352,7 @@ app.post('/api/news', authenticateToken, checkPermission('research_lines', 'crea
 });
 
 // PUT /api/news/:id — update
-app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'update'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
+app.put('/api/news/:id', authenticateToken, checkPermission('news_posts', 'update'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
   try {
     const { id } = req.params;
     const b = req.body;
@@ -4410,7 +4410,7 @@ app.put('/api/news/:id', authenticateToken, checkPermission('research_lines', 'u
 });
 
 // DELETE /api/news/:id
-app.delete('/api/news/:id', authenticateToken, checkPermission('research_lines', 'delete'), apiLimiter, async (req, res) => {
+app.delete('/api/news/:id', authenticateToken, checkPermission('news_posts', 'delete'), apiLimiter, async (req, res) => {
   try {
     const { error } = await supabase.from('news_posts').delete().eq('id', req.params.id);
     if (error) throw error;
