@@ -1,7 +1,7 @@
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
 // VERSION 5.4 - ALL BUGS FIXED
-// --- ORIGINAL FIXES ---   
-// FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects  
+// --- ORIGINAL FIXES --- 
+// FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
 // FIX 3: Absence FK - recorded_by nullable-safe + full_name in JWT
 // FIX 4: rotation_category Joi/DB enum mismatch corrected
@@ -643,43 +643,59 @@ const maintenanceCheck = async (req, res, next) => {
 }
 app.use('/api', maintenanceCheck)
 
-// ============ PERMISSION MIDDLEWARE ============
+// ============ PERMISSION SYSTEM ============
+// Per-user, per-module permissions stored in user_permissions table.
+// No presets, no role inheritance — every permission is explicit.
+// admin_level on app_users controls who CAN assign permissions (not what they have).
+
+const loadUserPermissions = async (userId) => {
+  const { data, error } = await supabase
+    .from('user_permissions')
+    .select('module, can_read, can_write')
+    .eq('user_id', userId)
+  if (error) throw error
+  const map = new Map()
+  for (const p of (data || [])) map.set(p.module, p)
+  return map
+}
+
 const checkPermission = (resource, action) => {
-  return (req, res, next) => {
-    if (req.method === 'OPTIONS') return next();
-    if (!req.user || !req.user.role) {
-      return res.status(401).json({ error: 'Authentication required' });
+  return async (req, res, next) => {
+    if (req.method === 'OPTIONS') return next()
+    if (!req.user?.id) return res.status(401).json({ error: 'Authentication required' })
+    if (!req.permissions) {
+      try { req.permissions = await loadUserPermissions(req.user.id) }
+      catch (e) { return res.status(500).json({ error: 'Could not load permissions' }) }
     }
-    if (req.user.role === 'system_admin') return next();
-
-    // FIX 5: Added 'research_lines' to rolePermissions so department_head can manage them
-    const rolePermissions = {
-      medical_staff:        ['system_admin', 'department_head', 'resident_manager'],
-      departments:          ['system_admin', 'department_head'],
-      training_units:       ['system_admin', 'department_head', 'resident_manager'],
-      resident_rotations:   ['system_admin', 'department_head', 'resident_manager'],
-      oncall_schedule:      ['system_admin', 'department_head', 'resident_manager'],
-      staff_absence:        ['system_admin', 'department_head', 'resident_manager'],
-      communications:       ['system_admin', 'department_head', 'resident_manager'],
-      system_settings:      ['system_admin'],
-      users:                ['system_admin', 'department_head'],
-      audit_logs:           ['system_admin'],
-      notifications:        ['system_admin', 'department_head', 'resident_manager'],
-      attachments:          ['system_admin', 'department_head', 'resident_manager'],
-      research_lines:       ['system_admin', 'department_head', 'resident_manager'],  // ← FIX: resident_manager added
-      staff_types:          ['system_admin', 'department_head'],   // ← dynamic staff type management
-    };
-
-    const allowedRoles = rolePermissions[resource];
-    if (!allowedRoles || !allowedRoles.includes(req.user.role)) {
+    const perm = req.permissions.get(resource)
+    const needsWrite = ['create', 'update', 'delete', 'write'].includes(action)
+    const allowed = perm && (needsWrite ? perm.can_write : perm.can_read)
+    if (!allowed) {
       return res.status(403).json({
         error: 'Insufficient permissions',
-        message: `Your role (${req.user.role}) does not have permission to ${action} ${resource}`
-      });
+        message: `You do not have ${action} access to ${resource}`
+      })
     }
-    next();
-  };
-};
+    next()
+  }
+}
+
+const isAdmin = async (req, res, next) => {
+  try {
+    const { data } = await supabase
+      .from('app_users')
+      .select('admin_level')
+      .eq('id', req.user.id)
+      .single()
+    if (!data || data.admin_level < 1) {
+      return res.status(403).json({ error: 'Admin access required' })
+    }
+    req.user.admin_level = data.admin_level
+    next()
+  } catch (e) {
+    res.status(500).json({ error: 'Could not verify admin status' })
+  }
+}
 
 // ============ AUDIT LOGGING ============
 // req is optional — pass it when available to capture user + IP context
@@ -794,7 +810,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
     const { data: user, error } = await supabase
       .from('app_users')
-      .select('id, email, full_name, user_role, department_id, password_hash, account_status')
+      .select('id, email, full_name, user_role, job_title, admin_level, department_id, password_hash, account_status')
       .eq('email', email.toLowerCase()).single();
 
     if (error || !user) {
@@ -810,12 +826,16 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
     }
 
+    // Load this user's explicit permissions from DB
+    const permMap = await loadUserPermissions(user.id)
+    const permissions = Array.from(permMap.values())
+
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.user_role, full_name: user.full_name },
       JWT_SECRET, { expiresIn: '24h' }
     );
     const { password_hash, ...userWithoutPassword } = user;
-    res.json({ token, user: userWithoutPassword, expires_in: '24h' });
+    res.json({ token, user: { ...userWithoutPassword, permissions }, expires_in: '24h' });
 
   } catch (error) {
     console.error('Login error:', error);
@@ -828,18 +848,19 @@ app.post('/api/auth/logout', authenticateToken, apiLimiter, async (req, res) => 
 });
 
 // Token validation endpoint — called on mount to verify session is still valid
-// Used to block QR/shared-session access with expired tokens
 app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('app_users')
-      .select('id, email, full_name, user_role, account_status, department_id')
+      .select('id, email, full_name, user_role, job_title, admin_level, account_status, department_id')
       .eq('id', req.user.id)
       .single()
     if (error || !data) return res.status(401).json({ error: 'User not found' })
     if (data.account_status !== 'active') return res.status(401).json({ error: 'Account suspended or inactive' })
-    res.json(data)
-  } catch { res.status(401).json({ error: 'Session validation failed' }) }
+    const permMap = await loadUserPermissions(req.user.id)
+    const permissions = Array.from(permMap.values())
+    res.json({ ...data, permissions })
+  } catch (e) { res.status(401).json({ error: 'Session validation failed' }) }
 });
 
 app.post('/api/auth/register', authenticateToken, checkPermission('users', 'create'), validate(schemas.register), async (req, res) => {
@@ -926,6 +947,98 @@ app.post('/api/auth/reset-password', authLimiter, validate(schemas.resetPassword
     res.status(400).json({ error: 'Failed to reset password', message: error.message });
   }
 });
+
+// ===== 2b. PERMISSION MANAGEMENT =====
+// GET /api/permissions/users — list all users with their current permission tags (admin only)
+app.get('/api/permissions/users', authenticateToken, isAdmin, apiLimiter, async (req, res) => {
+  try {
+    const { data: users, error } = await supabase
+      .from('app_users')
+      .select('id, full_name, professional_email, user_role, job_title, admin_level, account_status')
+      .order('full_name')
+    if (error) throw error
+
+    const { data: perms } = await supabase
+      .from('user_permissions')
+      .select('user_id, module, can_read, can_write, granted_by, granted_at')
+
+    // Group permissions by user
+    const permsByUser = {}
+    for (const p of (perms || [])) {
+      if (!permsByUser[p.user_id]) permsByUser[p.user_id] = []
+      permsByUser[p.user_id].push(p)
+    }
+
+    res.json({
+      success: true,
+      data: users.map(u => ({ ...u, permissions: permsByUser[u.id] || [] }))
+    })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// PUT /api/permissions/:userId/:module — grant or revoke a specific module permission
+// Body: { can_read: bool, can_write: bool }
+// Constraint: admin cannot grant more than they themselves have
+app.put('/api/permissions/:userId/:module', authenticateToken, isAdmin, apiLimiter, async (req, res) => {
+  try {
+    const { userId, module } = req.params
+    const { can_read = false, can_write = false } = req.body
+
+    // Safety: admin cannot grant more than they themselves have
+    const adminPerms = await loadUserPermissions(req.user.id)
+    const adminHas = adminPerms.get(module)
+    if (can_read && !adminHas?.can_read) {
+      return res.status(403).json({ error: 'You cannot grant read access to ' + module + ' because you do not have it yourself' })
+    }
+    if (can_write && !adminHas?.can_write) {
+      return res.status(403).json({ error: 'You cannot grant write access to ' + module + ' because you do not have it yourself' })
+    }
+
+    // Upsert — if both false, remove the row entirely (clean revoke)
+    if (!can_read && !can_write) {
+      await supabase.from('user_permissions').delete().eq('user_id', userId).eq('module', module)
+      return res.json({ success: true, action: 'revoked', module })
+    }
+
+    const { data, error } = await supabase
+      .from('user_permissions')
+      .upsert({
+        user_id: userId,
+        module,
+        can_read,
+        can_write,
+        granted_by: req.user.id,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id,module' })
+      .select()
+
+    if (error) throw error
+    res.json({ success: true, action: 'granted', data: data?.[0] })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// PUT /api/permissions/:userId/admin — toggle admin_level (admin only, cannot self-demote)
+app.put('/api/permissions/:userId/admin-level', authenticateToken, isAdmin, apiLimiter, async (req, res) => {
+  try {
+    const { userId } = req.params
+    const { admin_level } = req.body
+    if (userId === req.user.id) {
+      return res.status(403).json({ error: 'You cannot change your own admin level' })
+    }
+    const { error } = await supabase
+      .from('app_users')
+      .update({ admin_level: admin_level ? 1 : 0, updated_at: new Date().toISOString() })
+      .eq('id', userId)
+    if (error) throw error
+    res.json({ success: true, admin_level })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
 
 // ===== 3. USER MANAGEMENT =====
 app.get('/api/users', authenticateToken, checkPermission('users', 'read'), apiLimiter, async (req, res) => {
