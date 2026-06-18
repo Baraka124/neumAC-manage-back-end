@@ -4390,12 +4390,13 @@ app.get('/api/news/website', publicApiLimiter, async (req, res) => {
       .select(`
         id, post_type, title, body, featured_image_url, image_urls,
         word_count, expires_at, published_at, created_at,
-        journal_name, authors_text, doi, is_featured, is_public,
+        journal_name, authors_text, doi, is_featured, is_public, show_on_homepage,
         author:medical_staff!news_posts_author_id_fkey(id, full_name),
         research_line:research_lines!news_posts_research_line_id_fkey(id, line_number, name)
       `)
       .eq('status', 'published')
       .eq('is_public', true)
+      .is('deleted_at', null)
       .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString())
       // Featured posts first, then by date
       .order('is_featured', { ascending: false })
@@ -4421,6 +4422,224 @@ app.get('/api/news/website', publicApiLimiter, async (req, res) => {
     res.status(500).json({ error: 'Failed to fetch news', message: err.message });
   }
 });
+
+// ══════════════════════════════════════════════════════════════
+// NOTIFICATIONS
+// ══════════════════════════════════════════════════════════════
+
+// GET /api/notifications — fetch for current user
+app.get('/api/notifications', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { limit = 20, unread_only } = req.query
+    let query = supabase.from('notifications')
+      .select('id, title, message, type, read, link, action_view, created_at')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit))
+    if (unread_only === 'true') query = query.eq('read', false)
+    const { data, error } = await query
+    if (error) throw error
+    const unreadCount = (data || []).filter(n => !n.read).length
+    res.json({ success: true, data: data || [], unread_count: unreadCount })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// PUT /api/notifications/:id/read — mark one as read
+app.put('/api/notifications/:id/read', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    await supabase.from('notifications').update({ read: true })
+      .eq('id', req.params.id).eq('user_id', req.user.id)
+    res.json({ success: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// PUT /api/notifications/read-all — mark all as read
+app.put('/api/notifications/read-all', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    await supabase.from('notifications').update({ read: true })
+      .eq('user_id', req.user.id).eq('read', false)
+    res.json({ success: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// Internal helper — create a notification for a user (called from other routes)
+const createNotification = async (userId, title, message, type = 'info', link = null, actionView = null) => {
+  try {
+    await supabase.from('notifications').insert({
+      user_id: userId, title, message, type, read: false,
+      link, action_view: actionView, created_at: new Date().toISOString()
+    })
+  } catch (e) { console.error('createNotification failed:', e.message) }
+}
+
+// ══════════════════════════════════════════════════════════════
+// ICAL FEED — on-call schedule subscription
+// ══════════════════════════════════════════════════════════════
+
+app.get('/api/ical/oncall', authenticateToken, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('oncall_schedule')
+      .select('id, duty_date, shift_type, start_time, end_time, coverage_notes, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name)')
+      .is('deleted_at', null)
+      .gte('duty_date', new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0])
+      .order('duty_date', { ascending: true })
+      .limit(180)
+    if (error) throw error
+
+    const shifts = data || []
+    const now = new Date().toISOString().replace(/[-:]/g,'').split('.')[0] + 'Z'
+    const lines = [
+      'BEGIN:VCALENDAR',
+      'VERSION:2.0',
+      'PRODID:-//neumDesk//CHUAC Neumologia On-Call//ES',
+      'CALSCALE:GREGORIAN',
+      'METHOD:PUBLISH',
+      'X-WR-CALNAME:CHUAC Neumologia - Guardias',
+      'X-WR-CALDESC:Guardias del Servicio de Neumologia CHUAC',
+    ]
+
+    for (const s of shifts) {
+      const dateStr = s.duty_date.replace(/-/g,'')
+      const start = s.start_time ? dateStr + 'T' + s.start_time.replace(/:/g,'').slice(0,6) : dateStr
+      const end   = s.end_time   ? dateStr + 'T' + s.end_time.replace(/:/g,'').slice(0,6)   : dateStr
+      const allDay = !s.start_time
+      lines.push('BEGIN:VEVENT')
+      lines.push('UID:oncall-' + s.id + '@neumaCtorg')
+      lines.push('DTSTAMP:' + now)
+      if (allDay) {
+        lines.push('DTSTART;VALUE=DATE:' + dateStr)
+        lines.push('DTEND;VALUE=DATE:' + dateStr)
+      } else {
+        lines.push('DTSTART:' + start)
+        lines.push('DTEND:' + end)
+      }
+      const shiftLabel = s.shift_type === 'primary_call' ? 'Guardia Principal' : s.shift_type === 'backup' ? 'Guardia Backup' : s.shift_type || 'Guardia'
+      const physician = s.primary_physician?.full_name || 'Sin asignar'
+      lines.push('SUMMARY:' + shiftLabel + ' - ' + physician)
+      if (s.coverage_notes) lines.push('DESCRIPTION:' + s.coverage_notes.split('\n').join('\\n'))
+      lines.push('END:VEVENT')
+    }
+
+    lines.push('END:VCALENDAR')
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8')
+    res.setHeader('Content-Disposition', 'attachment; filename="guardias-neumologia.ics"')
+    res.send(lines.join('\r\n'))
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ══════════════════════════════════════════════════════════════
+// SOFT-DELETE RECOVERY — restore recently deleted records
+// ══════════════════════════════════════════════════════════════
+
+app.put('/api/restore/:table/:id', authenticateToken, isAdmin, apiLimiter, async (req, res) => {
+  try {
+    const ALLOWED = ['medical_staff','resident_rotations','oncall_schedule','staff_absence_records','news_posts']
+    const { table, id } = req.params
+    if (!ALLOWED.includes(table)) return res.status(400).json({ error: 'Table not restorable' })
+    const { error } = await supabase.from(table).update({ deleted_at: null }).eq('id', id)
+    if (error) throw error
+    res.json({ success: true, table, id })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ══════════════════════════════════════════════════════════════
+// DATA EXPORT — CSV generation server-side
+// ══════════════════════════════════════════════════════════════
+
+const toCSV = (rows, cols) => {
+  const header = cols.map(c => '"' + c.label + '"').join(',')
+  const body = rows.map(r => cols.map(c => {
+    const v = c.fn ? c.fn(r) : (r[c.key] ?? '')
+    return '"' + String(v).replace(/"/g, '""') + '"'
+  }).join(',')).join('\n')
+  return header + '\n' + body
+}
+
+app.get('/api/export/staff', authenticateToken, checkPermission('medical_staff', 'read'), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('medical_staff')
+      .select('full_name, staff_type, employment_status, primary_clinic, work_phone, professional_email, created_at')
+      .is('deleted_at', null).order('full_name')
+    if (error) throw error
+    const csv = toCSV(data || [], [
+      { key: 'full_name', label: 'Full Name' },
+      { key: 'staff_type', label: 'Staff Type' },
+      { key: 'employment_status', label: 'Status' },
+      { key: 'primary_clinic', label: 'Clinic' },
+      { key: 'work_phone', label: 'Phone' },
+      { key: 'professional_email', label: 'Email' },
+      { key: 'created_at', label: 'Added', fn: r => r.created_at?.split('T')[0] || '' },
+    ])
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', 'attachment; filename="staff-export.csv"')
+    res.send('﻿' + csv) // BOM for Excel UTF-8
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/export/rotations', authenticateToken, checkPermission('resident_rotations', 'read'), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('resident_rotations')
+      .select('start_date, end_date, rotation_status, resident:medical_staff!resident_rotations_resident_id_fkey(full_name), unit:training_units!resident_rotations_training_unit_id_fkey(unit_name)')
+      .is('deleted_at', null).order('start_date', { ascending: false }).limit(500)
+    if (error) throw error
+    const csv = toCSV(data || [], [
+      { key: 'resident', label: 'Resident', fn: r => r.resident?.full_name || '' },
+      { key: 'unit', label: 'Training Unit', fn: r => r.unit?.unit_name || '' },
+      { key: 'start_date', label: 'Start Date' },
+      { key: 'end_date', label: 'End Date' },
+      { key: 'rotation_status', label: 'Status' },
+    ])
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', 'attachment; filename="rotations-export.csv"')
+    res.send('﻿' + csv)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/export/absences', authenticateToken, checkPermission('staff_absence', 'read'), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('staff_absence_records')
+      .select('start_date, end_date, reason, status, staff:medical_staff!staff_absence_records_staff_id_fkey(full_name)')
+      .is('deleted_at', null).order('start_date', { ascending: false }).limit(500)
+    if (error) throw error
+    const csv = toCSV(data || [], [
+      { key: 'staff', label: 'Staff Member', fn: r => r.staff?.full_name || '' },
+      { key: 'reason', label: 'Reason' },
+      { key: 'start_date', label: 'Start Date' },
+      { key: 'end_date', label: 'End Date' },
+      { key: 'status', label: 'Status' },
+    ])
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', 'attachment; filename="absences-export.csv"')
+    res.send('﻿' + csv)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+app.get('/api/export/oncall', authenticateToken, checkPermission('oncall_schedule', 'read'), async (req, res) => {
+  try {
+    const { from, to } = req.query
+    let query = supabase.from('oncall_schedule')
+      .select('duty_date, shift_type, start_time, end_time, coverage_notes, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name)')
+      .is('deleted_at', null).order('duty_date', { ascending: true })
+    if (from) query = query.gte('duty_date', from)
+    if (to) query = query.lte('duty_date', to)
+    const { data, error } = await query.limit(500)
+    if (error) throw error
+    const csv = toCSV(data || [], [
+      { key: 'duty_date', label: 'Date' },
+      { key: 'primary_physician', label: 'Physician', fn: r => r.primary_physician?.full_name || '' },
+      { key: 'shift_type', label: 'Shift Type' },
+      { key: 'start_time', label: 'Start Time' },
+      { key: 'end_time', label: 'End Time' },
+      { key: 'coverage_notes', label: 'Notes' },
+    ])
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', 'attachment; filename="oncall-export.csv"')
+    res.send('﻿' + csv)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
 
 // POST /api/news — create
 app.post('/api/news', authenticateToken, checkPermission('news_posts', 'create'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
