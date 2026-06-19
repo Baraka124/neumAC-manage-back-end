@@ -147,7 +147,7 @@ const upload = multer({
   }
 });
 
-// ============ CORS MIDDLEWARE ============
+
 const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
@@ -2964,6 +2964,41 @@ app.get('/api/audit-logs', authenticateToken, checkPermission('audit_logs', 'rea
 });
 
 // ===== 16. ATTACHMENTS =====
+// Separate memory-storage multer instance for uploads that go straight to
+// Supabase Storage (no local disk involved at all -- avoids the data-loss
+// risk the disk-storage instance below has on Railway's ephemeral filesystem).
+const uploadToMemory = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  fileFilter: (req, file, cb) => {
+    const allowed = /jpeg|jpg|png|webp|gif/;
+    const ok = allowed.test(path.extname(file.originalname).toLowerCase()) && allowed.test(file.mimetype);
+    if (ok) return cb(null, true);
+    cb(new Error('Only JPEG, PNG, WEBP, or GIF images are allowed'));
+  }
+});
+
+// POST /api/upload/news-image — uploads directly to the public news-images
+// Supabase Storage bucket and returns the public URL. Used by the news post
+// editor's image picker instead of requiring users to paste an external URL.
+app.post('/api/upload/news-image', authenticateToken, checkPermission('news_posts', 'create'), uploadToMemory.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const ext = path.extname(req.file.originalname).toLowerCase() || '.jpg';
+    const fileName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('news-images')
+      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype, cacheControl: '3600' });
+    if (uploadError) throw uploadError;
+
+    const { data: urlData } = supabase.storage.from('news-images').getPublicUrl(fileName);
+    res.json({ success: true, url: urlData.publicUrl });
+  } catch (e) {
+    res.status(500).json({ error: 'Upload failed', message: e.message });
+  }
+});
+
 app.post('/api/attachments/upload', authenticateToken, checkPermission('attachments', 'create'), upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
@@ -3641,6 +3676,7 @@ app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('rese
       ...(b.tags                !== undefined && { tags: Array.isArray(b.tags) ? b.tags : [] }),
       ...(b.milestones          !== undefined && { milestones: Array.isArray(b.milestones) ? b.milestones : [] }),
       ...(b.featured_in_website !== undefined && { featured_in_website: b.featured_in_website }),
+      ...(b.is_featured         !== undefined && { is_featured: Boolean(b.is_featured) }),
       ...(b.display_order       !== undefined && { display_order: b.display_order }),
       ...(b.start_date          !== undefined && { start_date: b.start_date || null }),
       ...(b.estimated_end_date  !== undefined && { estimated_end_date: b.estimated_end_date || null }),
