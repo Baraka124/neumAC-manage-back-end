@@ -339,7 +339,11 @@ const schemas = {
     can_be_pi:  Joi.boolean().optional().default(false),
     can_be_coi: Joi.boolean().optional().default(false),
     has_phd:    Joi.boolean().optional().default(false),
-    phd_field:  Joi.string().optional().allow('', null)
+    phd_field:  Joi.string().optional().allow('', null),
+    // Public profile fields — surfaced on neumact.org's team page when is_public=true
+    is_public:        Joi.boolean().optional().default(false),
+    public_bio:       Joi.string().max(2000).optional().allow('', null),
+    public_photo_url: Joi.string().uri().optional().allow('', null)
   }),
 
   announcement: Joi.object({
@@ -1293,6 +1297,9 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
       can_be_coi:  dataSource.can_be_coi  ?? false,
       has_phd:     dataSource.has_phd     ?? false,
       phd_field:   dataSource.phd_field   || null,
+      is_public:        dataSource.is_public        ?? false,
+      public_bio:       dataSource.public_bio        || null,
+      public_photo_url: dataSource.public_photo_url  || null,
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('medical_staff').insert([staffData]).select().single();
@@ -1349,6 +1356,9 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       has_phd:     dataSource.has_phd     ?? false,
       phd_field:   dataSource.phd_field   || null,
       clinical_study_certificates: Array.isArray(dataSource.clinical_study_certificates) ? dataSource.clinical_study_certificates : (dataSource.clinical_study_certificates || null),
+      is_public:        dataSource.is_public        ?? false,
+      public_bio:       dataSource.public_bio        || null,
+      public_photo_url: dataSource.public_photo_url  || null,
       updated_at: new Date().toISOString()
     };
     // Read current staff_type BEFORE update so we can detect type changes
@@ -2993,6 +3003,28 @@ app.post('/api/upload/news-image', authenticateToken, checkPermission('news_post
     if (uploadError) throw uploadError;
 
     const { data: urlData } = supabase.storage.from('news-images').getPublicUrl(fileName);
+    res.json({ success: true, url: urlData.publicUrl });
+  } catch (e) {
+    res.status(500).json({ error: 'Upload failed', message: e.message });
+  }
+});
+
+// POST /api/upload/staff-photo — uploads a staff member's public profile
+// photo directly to Supabase Storage and returns the public URL. Used by
+// the medical staff edit modal's "Public Profile" tab instead of requiring
+// a manually pasted URL.
+app.post('/api/upload/staff-photo', authenticateToken, checkPermission('medical_staff', 'update'), uploadToMemory.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const ext = path.extname(req.file.originalname).toLowerCase() || '.jpg';
+    const fileName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('staff-photos')
+      .upload(fileName, req.file.buffer, { contentType: req.file.mimetype, cacheControl: '3600' });
+    if (uploadError) throw uploadError;
+
+    const { data: urlData } = supabase.storage.from('staff-photos').getPublicUrl(fileName);
     res.json({ success: true, url: urlData.publicUrl });
   } catch (e) {
     res.status(500).json({ error: 'Upload failed', message: e.message });
@@ -4881,6 +4913,16 @@ app.post('/api/medical-staff/:id/certificates', authenticateToken, checkPermissi
   try {
     const { certificate_name, issued_date, renewal_months, notes } = req.body;
     if (!certificate_name?.trim()) return res.status(400).json({ error: 'certificate_name is required' });
+    // Compute the actual expiry date — this was never being set, meaning every
+    // certificate silently showed as permanently valid regardless of reality.
+    let expiry_date = null;
+    if (issued_date) {
+      const d = new Date(issued_date + 'T00:00:00');
+      if (!isNaN(d.getTime())) {
+        d.setMonth(d.getMonth() + (renewal_months || 24));
+        expiry_date = d.toISOString().split('T')[0];
+      }
+    }
     const { data, error } = await supabase
       .from('staff_certificates')
       .insert([{
@@ -4888,6 +4930,7 @@ app.post('/api/medical-staff/:id/certificates', authenticateToken, checkPermissi
         certificate_name: certificate_name.trim(),
         issued_date: issued_date || null,
         renewal_months: renewal_months || 24,
+        expiry_date,
         notes: notes || null
       }])
       .select().single();
@@ -4902,9 +4945,17 @@ app.post('/api/medical-staff/:id/certificates', authenticateToken, checkPermissi
 app.put('/api/medical-staff/:staffId/certificates/:certId', authenticateToken, checkPermission('medical_staff', 'update'), async (req, res) => {
   try {
     const { certificate_name, issued_date, renewal_months, notes } = req.body;
+    let expiry_date = null;
+    if (issued_date) {
+      const d = new Date(issued_date + 'T00:00:00');
+      if (!isNaN(d.getTime())) {
+        d.setMonth(d.getMonth() + (renewal_months || 24));
+        expiry_date = d.toISOString().split('T')[0];
+      }
+    }
     const { data, error } = await supabase
       .from('staff_certificates')
-      .update({ certificate_name, issued_date, renewal_months, notes, updated_at: new Date().toISOString() })
+      .update({ certificate_name, issued_date, renewal_months, expiry_date, notes, updated_at: new Date().toISOString() })
       .eq('id', req.params.certId)
       .eq('staff_id', req.params.staffId)
       .select().single();
