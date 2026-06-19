@@ -954,7 +954,7 @@ app.get('/api/permissions/users', authenticateToken, isAdmin, apiLimiter, async 
   try {
     const { data: users, error } = await supabase
       .from('app_users')
-      .select('id, full_name, professional_email, user_role, job_title, admin_level, account_status')
+      .select('id, full_name, email, user_role, job_title, admin_level, account_status')
       .order('full_name')
     if (error) throw error
 
