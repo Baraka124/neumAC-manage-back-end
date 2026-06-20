@@ -3257,6 +3257,7 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
       .select(`
         id, full_name, title, staff_type, specialization,
         public_bio, public_photo_url, affiliation_type, primary_dept_name, can_be_pi,
+        is_chief_of_department,
         department:departments!medical_staff_department_id_fkey(name, is_primary, is_external),
         research_lines:research_lines!research_lines_coordinator_id_fkey(
           id, line_number, name, short_name,
@@ -3325,6 +3326,7 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
         primary_dept_name: m.primary_dept_name || m.department?.name || null,
         is_external:      m.department?.is_external || false,
         can_be_pi:        m.can_be_pi || false,
+        is_chief_of_department: m.is_chief_of_department || false,
         coordinates_line: line ? {
           id:           line.id,
           line_number:  line.line_number,
@@ -3382,6 +3384,101 @@ app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
       active_projects:(l.innovation_projects || []).filter(p => p.current_stage !== 'completed').length,
     }));
     res.json({ data: lines, meta: { total: lines.length } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/research-lines/:id/website — single-line detail for line.html.
+// Returns deep_content (long-form page text, may be null if not yet
+// written), full coordinator profile, and a derived team list built from
+// trial/project investigator fields — there's no dedicated team-membership
+// table, so "who works on this line" is inferred from who's named as PI,
+// co-investigator, or sub-investigator on that line's public trials/projects.
+// Trial/project lists themselves are NOT duplicated here — the frontend
+// calls the existing /api/clinical-trials/website?line=:id and
+// /api/innovation-projects/website?line=:id endpoints for those, same as
+// clinical.html and innovation.html already do, so there's one source of
+// truth for trial/project data rather than two.
+app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: line, error: lineError } = await supabase
+      .from('research_lines')
+      .select(`
+        id, line_number, name, short_name, description, capabilities, keywords, deep_content, deep_content_updated_at,
+        coordinator:medical_staff!research_lines_coordinator_id_fkey(
+          id, full_name, title, specialization, public_bio, public_photo_url, is_public,
+          can_be_pi, is_chief_of_department
+        )
+      `)
+      .eq('id', id)
+      .eq('active', true)
+      .eq('is_public', true)
+      .maybeSingle();
+    if (lineError) throw lineError;
+    if (!line) return res.status(404).json({ error: 'Research line not found' });
+
+    // Pull investigator ids off this line's trials and projects to build
+    // the team list. Two lightweight queries rather than one heavy join.
+    const [{ data: trials }, { data: projects }] = await Promise.all([
+      supabase.from('clinical_trials')
+        .select('principal_investigator_id, co_investigators, sub_investigators, status')
+        .eq('research_line_id', id)
+        .eq('featured_in_website', true),
+      supabase.from('innovation_projects')
+        .select('lead_investigator_id, co_investigators, current_stage')
+        .eq('research_line_id', id)
+        .eq('featured_in_website', true),
+    ]);
+
+    const teamIds = new Set();
+    if (line.coordinator?.id) teamIds.add(line.coordinator.id);
+    (trials || []).forEach(t => {
+      if (t.principal_investigator_id) teamIds.add(t.principal_investigator_id);
+      (t.co_investigators || []).forEach(i => i && teamIds.add(i));
+      (t.sub_investigators || []).forEach(i => i && teamIds.add(i));
+    });
+    (projects || []).forEach(p => {
+      if (p.lead_investigator_id) teamIds.add(p.lead_investigator_id);
+      (p.co_investigators || []).forEach(i => i && teamIds.add(i));
+    });
+    teamIds.delete(null);
+    teamIds.delete(undefined);
+
+    let team = [];
+    if (teamIds.size) {
+      const { data: staff } = await supabase
+        .from('medical_staff')
+        .select('id, full_name, title, specialization, public_photo_url, is_public, can_be_pi, is_chief_of_department')
+        .in('id', Array.from(teamIds))
+        .eq('is_public', true);
+      team = staff || [];
+    }
+
+    const activeTrialCount = (trials || []).filter(t => ['Reclutando','Activo','Active','Recruiting'].includes(t.status)).length;
+    const activeProjectCount = (projects || []).filter(p => p.current_stage !== 'completed').length;
+
+    res.json({
+      data: {
+        id:            line.id,
+        line_number:   line.line_number,
+        name:          line.name,
+        short_name:    line.short_name || line.name,
+        description:   line.description,
+        capabilities:  line.capabilities,
+        keywords:      line.keywords,
+        deep_content:  line.deep_content || null,
+        deep_content_updated_at: line.deep_content_updated_at || null,
+        coordinator:   line.coordinator || null,
+        team,
+        active_trials:   activeTrialCount,
+        total_trials:    (trials || []).length,
+        active_projects: activeProjectCount,
+        total_projects:  (projects || []).length,
+      }
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3608,7 +3705,10 @@ app.delete('/api/clinical-trials/:id', authenticateToken, checkPermission('resea
 // ===== 23. INNOVATION PROJECTS =====
 app.get('/api/innovation-projects/website', publicApiLimiter, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('innovation_projects').select('*, research_line:research_lines(name)').eq('featured_in_website', true).order('display_order');
+    const { line } = req.query;
+    let query = supabase.from('innovation_projects').select('*, research_line:research_lines(name)').eq('featured_in_website', true).order('display_order');
+    if (line) query = query.eq('research_line_id', line);
+    const { data, error } = await query;
     if (error) throw error;
     res.json({ data: data || [], meta: { total: (data || []).length } });
   } catch (error) {
