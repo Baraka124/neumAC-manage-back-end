@@ -3344,6 +3344,7 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
           year:         latestPub.published_at ? new Date(latestPub.published_at).getFullYear() : null,
           doi:          latestPub.doi || null,
         } : null,
+        publication_count: personPubs.length,
         collab_status:    collabStatus,
       };
     });
@@ -3407,7 +3408,7 @@ app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) =>
     const { data: line, error: lineError } = await supabase
       .from('research_lines')
       .select(`
-        id, line_number, name, short_name, description, capabilities, keywords, deep_content, deep_content_updated_at,
+        id, line_number, name, short_name, description, capabilities, keywords, deep_content, deep_content_updated_at, track_record,
         coordinator:medical_staff!research_lines_coordinator_id_fkey(
           id, full_name, title, specialization, public_bio, public_photo_url, is_public,
           can_be_pi, is_chief_of_department
@@ -3421,8 +3422,11 @@ app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) =>
     if (!line) return res.status(404).json({ error: 'Research line not found' });
 
     // Pull investigator ids off this line's trials and projects to build
-    // the team list. Two lightweight queries rather than one heavy join.
-    const [{ data: trials }, { data: projects }] = await Promise.all([
+    // the team list. Plus explicit memberships from research_line_members,
+    // which covers staff whose involvement isn't captured by being named
+    // PI/co-investigator on a trial — e.g. engineers, coordinators, data
+    // staff supporting the line directly.
+    const [{ data: trials }, { data: projects }, { data: explicitMembers }] = await Promise.all([
       supabase.from('clinical_trials')
         .select('principal_investigator_id, co_investigators, sub_investigators, status')
         .eq('research_line_id', id)
@@ -3431,6 +3435,10 @@ app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) =>
         .select('lead_investigator_id, co_investigators, current_stage')
         .eq('research_line_id', id)
         .eq('featured_in_website', true),
+      supabase.from('research_line_members')
+        .select('staff_id, role_on_line, sort_order')
+        .eq('research_line_id', id)
+        .order('sort_order'),
     ]);
 
     const teamIds = new Set();
@@ -3444,6 +3452,13 @@ app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) =>
       if (p.lead_investigator_id) teamIds.add(p.lead_investigator_id);
       (p.co_investigators || []).forEach(i => i && teamIds.add(i));
     });
+    const roleByStaffId = {};
+    (explicitMembers || []).forEach(m => {
+      if (m.staff_id) {
+        teamIds.add(m.staff_id);
+        roleByStaffId[m.staff_id] = m.role_on_line;
+      }
+    });
     teamIds.delete(null);
     teamIds.delete(undefined);
 
@@ -3454,7 +3469,7 @@ app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) =>
         .select('id, full_name, title, specialization, public_photo_url, is_public, can_be_pi, is_chief_of_department')
         .in('id', Array.from(teamIds))
         .eq('is_public', true);
-      team = staff || [];
+      team = (staff || []).map(s => ({ ...s, role_on_line: roleByStaffId[s.id] || null }));
     }
 
     const activeTrialCount = (trials || []).filter(t => ['Reclutando','Activo','Active','Recruiting'].includes(t.status)).length;
@@ -3469,6 +3484,7 @@ app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) =>
         description:   line.description,
         capabilities:  line.capabilities,
         keywords:      line.keywords,
+        track_record:  line.track_record || [],
         deep_content:  line.deep_content || null,
         deep_content_updated_at: line.deep_content_updated_at || null,
         coordinator:   line.coordinator || null,
@@ -3558,7 +3574,7 @@ app.put('/api/research-lines/:id/coordinator', authenticateToken, checkPermissio
 app.get('/api/clinical-trials/website', publicApiLimiter, async (req, res) => {
   try {
     const { line, phase, status, search } = req.query;
-    let query = supabase.from('clinical_trials').select('*, research_line:research_lines(name, line_number)').eq('featured_in_website', true).order('display_order');
+    let query = supabase.from('clinical_trials').select('*, research_line:research_lines(name, short_name, line_number)').eq('featured_in_website', true).order('display_order');
     if (line && line !== 'All Lines') query = query.eq('research_line_id', line);
     if (phase && phase !== 'All Phases') query = query.eq('phase', phase);
     if (status && status !== 'All Status') query = query.eq('status', status);
