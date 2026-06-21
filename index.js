@@ -2864,23 +2864,6 @@ app.post('/api/live-updates', authenticateToken, checkPermission('communications
 // DB schema: id, user_id(FK→app_users), title, message, type, read(boolean), created_at
 // Previous code used non-existent columns (recipient_id, is_read, read_at, recipient_role).
 // Fixed to match actual DB columns.
-app.get('/api/notifications', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { unread, limit = 50 } = req.query;
-    let query = supabase.from('notifications').select('*')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false });
-    if (unread === 'true') query = query.eq('read', false);
-    if (limit) query = query.limit(parseInt(limit));
-    const { data, error } = await query;
-    if (error) throw error;
-    // Expose is_read alias for frontend compatibility
-    res.json((data || []).map(n => ({ ...n, is_read: n.read })));
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch notifications', message: error.message });
-  }
-});
-
 app.get('/api/notifications/unread', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { count, error } = await supabase.from('notifications').select('*', { count: 'exact', head: true })
@@ -2889,33 +2872,6 @@ app.get('/api/notifications/unread', authenticateToken, apiLimiter, async (req, 
     res.json({ unread_count: count || 0 });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch unread count', message: error.message });
-  }
-});
-
-// Static route MUST come before /:id/read — otherwise Express matches 'mark-all-read' as :id
-app.put('/api/notifications/mark-all-read', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { error } = await supabase.from('notifications')
-      .update({ read: true })
-      .eq('user_id', req.user.id)
-      .eq('read', false);
-    if (error) throw error;
-    res.json({ message: 'All notifications marked as read' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update notifications', message: error.message });
-  }
-});
-
-app.put('/api/notifications/:id/read', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const { error } = await supabase.from('notifications')
-      .update({ read: true })
-      .eq('id', req.params.id)
-      .eq('user_id', req.user.id);
-    if (error) throw error;
-    res.json({ message: 'Notification marked as read' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update notification', message: error.message });
   }
 });
 
@@ -3580,14 +3536,32 @@ app.put('/api/research-lines/:id/coordinator', authenticateToken, checkPermissio
 app.get('/api/clinical-trials/website', publicApiLimiter, async (req, res) => {
   try {
     const { line, phase, status, search } = req.query;
-    let query = supabase.from('clinical_trials').select('*, research_line:research_lines(name, short_name, line_number)').eq('featured_in_website', true).order('display_order');
-    if (line && line !== 'All Lines') query = query.eq('research_line_id', line);
+    let query = supabase.from('clinical_trials')
+      .select('*, research_line:research_lines(name, short_name, line_number), clinical_trial_lines(research_line_id, research_lines(id, line_number, name, short_name))')
+      .eq('featured_in_website', true).order('display_order');
+    if (line && line !== 'All Lines') {
+      // A trial matches if this line is its primary line OR one of its
+      // additional lines (clinical_trial_lines) — a trial can span more
+      // than one line, so filtering by primary alone would silently hide
+      // it from a line that genuinely includes it.
+      const { data: viaJoin } = await supabase.from('clinical_trial_lines').select('clinical_trial_id').eq('research_line_id', line);
+      const additionalIds = (viaJoin || []).map(r => r.clinical_trial_id);
+      if (additionalIds.length) {
+        query = query.or(`research_line_id.eq.${line},id.in.(${additionalIds.join(',')})`);
+      } else {
+        query = query.eq('research_line_id', line);
+      }
+    }
     if (phase && phase !== 'All Phases') query = query.eq('phase', phase);
     if (status && status !== 'All Status') query = query.eq('status', status);
     if (search) query = query.or(`title.ilike.%${search}%,protocol_id.ilike.%${search}%`);
     const { data, error } = await query.limit(50);
     if (error) throw error;
-    res.json({ data: data || [], meta: { total: (data || []).length } });
+    const normalized = (data || []).map(t => {
+      const { clinical_trial_lines, ...rest } = t;
+      return { ...rest, additional_lines: (clinical_trial_lines || []).map(r => r.research_lines).filter(Boolean) };
+    });
+    res.json({ data: normalized, meta: { total: normalized.length } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3758,11 +3732,25 @@ app.delete('/api/clinical-trials/:id', authenticateToken, checkPermission('resea
 app.get('/api/innovation-projects/website', publicApiLimiter, async (req, res) => {
   try {
     const { line } = req.query;
-    let query = supabase.from('innovation_projects').select('*, research_line:research_lines(name)').eq('featured_in_website', true).order('display_order');
-    if (line) query = query.eq('research_line_id', line);
+    let query = supabase.from('innovation_projects')
+      .select('*, research_line:research_lines(name), innovation_project_lines(research_line_id, research_lines(id, line_number, name, short_name))')
+      .eq('featured_in_website', true).order('display_order');
+    if (line) {
+      const { data: viaJoin } = await supabase.from('innovation_project_lines').select('innovation_project_id').eq('research_line_id', line);
+      const additionalIds = (viaJoin || []).map(r => r.innovation_project_id);
+      if (additionalIds.length) {
+        query = query.or(`research_line_id.eq.${line},id.in.(${additionalIds.join(',')})`);
+      } else {
+        query = query.eq('research_line_id', line);
+      }
+    }
     const { data, error } = await query;
     if (error) throw error;
-    res.json({ data: data || [], meta: { total: (data || []).length } });
+    const normalized = (data || []).map(p => {
+      const { innovation_project_lines, ...rest } = p;
+      return { ...rest, additional_lines: (innovation_project_lines || []).map(r => r.research_lines).filter(Boolean) };
+    });
+    res.json({ data: normalized, meta: { total: normalized.length } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
