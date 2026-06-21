@@ -3306,6 +3306,11 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
         (p.authors_text && m.full_name && p.authors_text.toLowerCase().includes(m.full_name.toLowerCase().split(' ').slice(-1)[0]))
       );
       const latestPub = personPubs[0] || null;
+      const recentPubsForPerson = personPubs.slice(0, 3).map(p => ({
+        title: p.title, journal: p.journal_name,
+        year: p.published_at ? new Date(p.published_at).getFullYear() : null,
+        doi: p.doi || null,
+      }));
 
       // Collaboration status
       let collabStatus = null;
@@ -3344,6 +3349,7 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
           year:         latestPub.published_at ? new Date(latestPub.published_at).getFullYear() : null,
           doi:          latestPub.doi || null,
         } : null,
+        recent_pubs:       recentPubsForPerson,
         publication_count: personPubs.length,
         collab_status:    collabStatus,
       };
@@ -3594,14 +3600,19 @@ app.get('/api/clinical-trials', authenticateToken, apiLimiter, async (req, res) 
     let query = supabase.from('clinical_trials').select(`
       *, research_lines(name, line_number),
       pi:medical_staff!clinical_trials_principal_investigator_id_fkey(id, full_name, professional_email),
-      dm:medical_staff!clinical_trials_data_manager_id_fkey(id, full_name)
+      dm:medical_staff!clinical_trials_data_manager_id_fkey(id, full_name),
+      clinical_trial_lines(research_line_id, research_lines(id, line_number, name, short_name))
     `, { count: 'exact' });
     if (research_line_id) query = query.eq('research_line_id', research_line_id);
     if (phase) query = query.eq('phase', phase);
     if (status) query = query.eq('status', status);
     const { data, error, count } = await query.order('display_order').order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
+    const normalized = (data || []).map(t => {
+      const { clinical_trial_lines, ...rest } = t;
+      return { ...rest, additional_lines: (clinical_trial_lines || []).map(r => r.research_lines).filter(Boolean) };
+    });
+    res.json({ success: true, data: normalized, pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3625,10 +3636,19 @@ app.post('/api/clinical-trials', authenticateToken, checkPermission('research_li
     // Scope: if general, scope_note required; if specific, clear scope_note
     if (body.scope_type === 'general' && !body.scope_note) body.scope_note = null;
     if (body.scope_type === 'specific') body.scope_note = null;
+    const { additional_line_ids, ...trialBody } = body;
     const { data, error } = await supabase.from('clinical_trials')
-      .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
+      .insert([{ ...trialBody, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
       .select('*, research_lines(name, line_number), pi:medical_staff!clinical_trials_principal_investigator_id_fkey(id, full_name)').single();
     if (error) throw error;
+
+    if (Array.isArray(additional_line_ids) && additional_line_ids.length) {
+      const rows = additional_line_ids
+        .filter(lid => lid && lid !== data.research_line_id)
+        .map(lid => ({ clinical_trial_id: data.id, research_line_id: lid }));
+      if (rows.length) await supabase.from('clinical_trial_lines').insert(rows);
+    }
+
     res.status(201).json({ success: true, data, message: 'Clinical study created successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -3702,6 +3722,22 @@ app.put('/api/clinical-trials/:id', authenticateToken, checkPermission('research
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Clinical trial not found' });
       throw error;
     }
+
+    // Additional lines this trial spans, beyond its primary research_line_id.
+    // Frontend sends the full desired set each save; sync by replacing.
+    if (Array.isArray(b.additional_line_ids)) {
+      await supabase.from('clinical_trial_lines').delete().eq('clinical_trial_id', req.params.id);
+      const rows = b.additional_line_ids
+        .filter(lid => lid && lid !== data.research_line_id)
+        .map(lid => ({ clinical_trial_id: req.params.id, research_line_id: lid }));
+      if (rows.length) await supabase.from('clinical_trial_lines').insert(rows);
+    }
+    const { data: additionalLines } = await supabase
+      .from('clinical_trial_lines')
+      .select('research_line_id, research_lines(id, line_number, name, short_name)')
+      .eq('clinical_trial_id', req.params.id);
+    data.additional_lines = (additionalLines || []).map(r => r.research_lines).filter(Boolean);
+
     res.json({ success: true, data, message: 'Clinical study updated successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -3738,14 +3774,19 @@ app.get('/api/innovation-projects', authenticateToken, apiLimiter, async (req, r
     const offset = (page - 1) * limit;
     let query = supabase.from('innovation_projects').select(`
       *, research_lines(name, line_number),
-      lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)
+      lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name),
+      innovation_project_lines(research_line_id, research_lines(id, line_number, name, short_name))
     `, { count: 'exact' });
     if (research_line_id) query = query.eq('research_line_id', research_line_id);
     if (category) query = query.eq('category', category);
     if (stage) query = query.eq('current_stage', stage);
     const { data, error, count } = await query.order('display_order').order('created_at', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
+    const normalized = (data || []).map(p => {
+      const { innovation_project_lines, ...rest } = p;
+      return { ...rest, additional_lines: (innovation_project_lines || []).map(r => r.research_lines).filter(Boolean) };
+    });
+    res.json({ success: true, data: normalized, pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -3780,10 +3821,19 @@ app.post('/api/innovation-projects', authenticateToken, checkPermission('researc
     if (body.scope_type === 'specific') body.scope_note = null;
     if (body.scope_note) body.scope_note = body.scope_note.slice(0, 150);
 
+    const { additional_line_ids, ...projectBody } = body;
     const { data, error } = await supabase.from('innovation_projects')
-      .insert([{ ...body, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
+      .insert([{ ...projectBody, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
       .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)').single();
     if (error) throw error;
+
+    if (Array.isArray(additional_line_ids) && additional_line_ids.length) {
+      const rows = additional_line_ids
+        .filter(lid => lid && lid !== data.research_line_id)
+        .map(lid => ({ innovation_project_id: data.id, research_line_id: lid }));
+      if (rows.length) await supabase.from('innovation_project_lines').insert(rows);
+    }
+
     res.status(201).json({ data, message: 'Innovation project created successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -3851,6 +3901,20 @@ app.put('/api/innovation-projects/:id', authenticateToken, checkPermission('rese
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Innovation project not found' });
       throw error;
     }
+
+    if (Array.isArray(b.additional_line_ids)) {
+      await supabase.from('innovation_project_lines').delete().eq('innovation_project_id', req.params.id);
+      const rows = b.additional_line_ids
+        .filter(lid => lid && lid !== data.research_line_id)
+        .map(lid => ({ innovation_project_id: req.params.id, research_line_id: lid }));
+      if (rows.length) await supabase.from('innovation_project_lines').insert(rows);
+    }
+    const { data: additionalLines } = await supabase
+      .from('innovation_project_lines')
+      .select('research_line_id, research_lines(id, line_number, name, short_name)')
+      .eq('innovation_project_id', req.params.id);
+    data.additional_lines = (additionalLines || []).map(r => r.research_lines).filter(Boolean);
+
     res.json({ success: true, data, message: 'Innovation project updated successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
