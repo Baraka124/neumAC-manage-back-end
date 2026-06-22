@@ -627,12 +627,14 @@ const authenticateToken = (req, res, next) => {
 app.use('/uploads', authenticateToken, express.static(path.join(__dirname, 'uploads')));
 
 // ============ MAINTENANCE MODE MIDDLEWARE ============
-// Reads maintenance_mode from DB on each /api request (cached 30s) and returns 503 if enabled.
-// Exempt: /api/auth/* (login must always work), /api/settings (so admin can disable it), GET /api/settings
+// Reads maintenance_mode from DB on each /api request (cached 30s).
+// Admins pass through regardless of route — the actual "you will still
+// have access" promise the UI makes. Previously this only exempted
+// /api/auth and /api/settings by path, with no admin check at all,
+// meaning it blocked admins from everything else too.
 let _maintenanceCache = { value: false, at: 0 }
-const maintenanceCheck = async (req, res, next) => {
-  // Always allow auth + settings routes so admin can log in and toggle it off
-  if (req.path.startsWith('/api/auth') || req.path === '/api/settings') return next()
+app.use('/api', async (req, res, next) => {
+  if (req.path.startsWith('/api/auth')) return next()
   const now = Date.now()
   if (now - _maintenanceCache.at > 30000) {
     try {
@@ -640,12 +642,20 @@ const maintenanceCheck = async (req, res, next) => {
       _maintenanceCache = { value: data?.maintenance_mode === true, at: now }
     } catch { _maintenanceCache.at = now }
   }
-  if (_maintenanceCache.value) {
-    return res.status(503).json({ error: 'maintenance', message: 'System is under scheduled maintenance. Please try again shortly.' })
+  if (!_maintenanceCache.value) return next()
+  // Maintenance mode is on — only now is it worth decoding the token
+  // early, to check admin status before authenticateToken runs later.
+  // Skipping this in the normal (not-in-maintenance) case avoids
+  // verifying every JWT twice on every single request.
+  const header = req.headers.authorization
+  let user = null
+  if (header?.startsWith('Bearer ')) {
+    try { user = jwt.verify(header.slice(7), JWT_SECRET) } catch { /* not authenticated */ }
   }
-  next()
-}
-app.use('/api', maintenanceCheck)
+  if (user?.admin_level >= 1) { req.user = user; return next() }
+  if (req.path === '/api/auth/me') return next()
+  return res.status(503).json({ error: 'maintenance', message: 'System is under scheduled maintenance. Please try again shortly.' })
+})
 
 // ============ PERMISSION SYSTEM ============
 // Per-user, per-module permissions stored in user_permissions table.
@@ -814,7 +824,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
     const { data: user, error } = await supabase
       .from('app_users')
-      .select('id, email, full_name, user_role, job_title, admin_level, department_id, password_hash, account_status')
+      .select('id, email, full_name, user_role, job_title, admin_level, department_id, password_hash, account_status, medical_staff_id')
       .eq('email', email.toLowerCase()).single();
 
     if (error || !user) {
@@ -834,12 +844,24 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const permMap = await loadUserPermissions(user.id)
     const permissions = Array.from(permMap.values())
 
+    // Real linked staff record, if any — replaces runtime email/name
+    // guessing on the frontend with the actual stored relationship.
+    let linkedStaff = null;
+    if (user.medical_staff_id) {
+      const { data: staffRow } = await supabase
+        .from('medical_staff')
+        .select('id, full_name, professional_email, staff_type, specialization, public_photo_url')
+        .eq('id', user.medical_staff_id)
+        .maybeSingle();
+      linkedStaff = staffRow || null;
+    }
+
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.user_role, full_name: user.full_name },
       JWT_SECRET, { expiresIn: '24h' }
     );
     const { password_hash, ...userWithoutPassword } = user;
-    res.json({ token, user: { ...userWithoutPassword, permissions }, expires_in: '24h' });
+    res.json({ token, user: { ...userWithoutPassword, permissions, linked_staff: linkedStaff }, expires_in: '24h' });
 
   } catch (error) {
     console.error('Login error:', error);
@@ -856,14 +878,23 @@ app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('app_users')
-      .select('id, email, full_name, user_role, job_title, admin_level, account_status, department_id')
+      .select('id, email, full_name, user_role, job_title, admin_level, account_status, department_id, medical_staff_id')
       .eq('id', req.user.id)
       .single()
     if (error || !data) return res.status(401).json({ error: 'User not found' })
     if (data.account_status !== 'active') return res.status(401).json({ error: 'Account suspended or inactive' })
     const permMap = await loadUserPermissions(req.user.id)
     const permissions = Array.from(permMap.values())
-    res.json({ ...data, permissions })
+    let linkedStaff = null;
+    if (data.medical_staff_id) {
+      const { data: staffRow } = await supabase
+        .from('medical_staff')
+        .select('id, full_name, professional_email, staff_type, specialization, public_photo_url')
+        .eq('id', data.medical_staff_id)
+        .maybeSingle();
+      linkedStaff = staffRow || null;
+    }
+    res.json({ ...data, permissions, linked_staff: linkedStaff })
   } catch (e) { res.status(401).json({ error: 'Session validation failed' }) }
 });
 
@@ -958,7 +989,7 @@ app.get('/api/permissions/users', authenticateToken, isAdmin, apiLimiter, async 
   try {
     const { data: users, error } = await supabase
       .from('app_users')
-      .select('id, full_name, email, user_role, job_title, admin_level, account_status')
+      .select('id, full_name, email, user_role, job_title, admin_level, account_status, medical_staff_id')
       .order('full_name')
     if (error) throw error
 
@@ -973,9 +1004,24 @@ app.get('/api/permissions/users', authenticateToken, isAdmin, apiLimiter, async 
       permsByUser[p.user_id].push(p)
     }
 
+    // Resolve linked staff records in one batch query, not N+1
+    const staffIds = users.map(u => u.medical_staff_id).filter(Boolean);
+    let staffById = {};
+    if (staffIds.length) {
+      const { data: staffRows } = await supabase
+        .from('medical_staff')
+        .select('id, full_name, specialization, staff_type')
+        .in('id', staffIds);
+      staffById = Object.fromEntries((staffRows || []).map(s => [s.id, s]));
+    }
+
     res.json({
       success: true,
-      data: users.map(u => ({ ...u, permissions: permsByUser[u.id] || [] }))
+      data: users.map(u => ({
+        ...u,
+        permissions: permsByUser[u.id] || [],
+        linked_staff: u.medical_staff_id ? (staffById[u.medical_staff_id] || null) : null,
+      }))
     })
   } catch (e) {
     res.status(500).json({ error: e.message })
@@ -989,6 +1035,15 @@ app.put('/api/permissions/:userId/:module', authenticateToken, isAdmin, apiLimit
   try {
     const { userId, module } = req.params
     const { can_read = false, can_write = false } = req.body
+
+    // Safety: an admin cannot revoke their own access — same protection
+    // already applied to the admin-level toggle below. Without this, an
+    // admin could click their own way down to zero modules (including
+    // 'settings', the page this control lives on) with no one else able
+    // to restore it short of direct database access.
+    if (userId === req.user.id && !can_read && !can_write) {
+      return res.status(403).json({ error: 'You cannot revoke your own access to ' + module + '. Ask another admin to do this if needed.' })
+    }
 
     // Safety: admin cannot grant more than they themselves have
     const adminPerms = await loadUserPermissions(req.user.id)
