@@ -3243,11 +3243,11 @@ app.get('/api/research-lines', authenticateToken, apiLimiter, async (req, res) =
   try {
     const { data: viewData, error: viewError } = await supabase.from('research_lines_with_coordinators').select('*').order('sort_order');
     if (!viewError && viewData) {
-      return res.json({ success: true, data: viewData.map(line => ({ id: line.id, line_number: line.line_number, research_line_name: line.name, description: line.description, capabilities: line.capabilities, sort_order: line.sort_order, active: line.active, coordinator_id: line.coordinator_id, coordinator_name: line.full_name, coordinator_email: line.professional_email, coordinator_type: line.staff_type })) });
+      return res.json({ success: true, data: viewData.map(line => ({ id: line.id, line_number: line.line_number, research_line_name: line.name, short_name: line.short_name, description: line.description, capabilities: line.capabilities, sort_order: line.sort_order, active: line.active, coordinator_id: line.coordinator_id, coordinator_name: line.full_name, coordinator_email: line.professional_email, coordinator_type: line.staff_type })) });
     }
     const { data, error } = await supabase.from('research_lines').select('*').order('sort_order');
     if (error) throw error;
-    res.json({ success: true, data: data.map(line => ({ id: line.id, line_number: line.line_number, research_line_name: line.name, description: line.description, capabilities: line.capabilities, sort_order: line.sort_order, active: line.active, coordinator_id: line.coordinator_id, coordinator_name: null })) });
+    res.json({ success: true, data: data.map(line => ({ id: line.id, line_number: line.line_number, research_line_name: line.name, short_name: line.short_name, description: line.description, capabilities: line.capabilities, sort_order: line.sort_order, active: line.active, coordinator_id: line.coordinator_id, coordinator_name: null })) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -5576,4 +5576,4 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
 process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 
-module.exports = app;   
+module.exports = app;
