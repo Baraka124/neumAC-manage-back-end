@@ -3482,7 +3482,7 @@ app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) =>
     if (teamIds.size) {
       const { data: staff } = await supabase
         .from('medical_staff')
-        .select('id, full_name, title, specialization, public_photo_url, is_public, can_be_pi, is_chief_of_department')
+        .select('id, full_name, title, specialization, public_bio, public_photo_url, is_public, can_be_pi, is_chief_of_department')
         .in('id', Array.from(teamIds));
       team = (staff || []).map(s => ({
         ...s,
