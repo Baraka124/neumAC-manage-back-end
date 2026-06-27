@@ -3272,7 +3272,7 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
         department:departments!medical_staff_department_id_fkey(name, is_primary, is_external),
         research_lines:research_lines!research_lines_coordinator_id_fkey(
           id, line_number, name, short_name,
-          clinical_trials(id, status, title, phase),
+          clinical_trials(id, status, title, phase, featured_in_website),
           innovation_projects(id, current_stage, funding_status, title)
         )
       `)
@@ -3297,7 +3297,7 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
       const line = m.research_lines?.[0] || null;
 
       // Trials for this line
-      const lineTrials = line?.clinical_trials || [];
+      const lineTrials = (line?.clinical_trials || []).filter(t => t.featured_in_website);
       const activeTrials = lineTrials.filter(t =>
         ['Reclutando','Activo','Active','Recruiting'].includes(t.status)
       );
@@ -3380,7 +3380,7 @@ app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
         coordinator:medical_staff!research_lines_coordinator_id_fkey(
           id, full_name, specialization, public_bio, public_photo_url, is_public
         ),
-        clinical_trials(id, status),
+        clinical_trials(id, status, featured_in_website),
         innovation_projects(id, current_stage)
       `)
       .eq('active', true)
@@ -3396,8 +3396,8 @@ app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
       capabilities: l.capabilities,
       keywords:     l.keywords,
       coordinator:  l.coordinator ? { ...l.coordinator, public_photo_url: l.coordinator.is_public ? l.coordinator.public_photo_url : null } : null,
-      active_trials:  (l.clinical_trials || []).filter(t => ['Reclutando','Activo','Active','Recruiting'].includes(t.status)).length,
-      total_trials:   (l.clinical_trials || []).length,
+      active_trials:  (l.clinical_trials || []).filter(t => t.featured_in_website && ['Reclutando','Activo','Active','Recruiting'].includes(t.status)).length,
+      total_trials:   (l.clinical_trials || []).filter(t => t.featured_in_website).length,
       active_projects:(l.innovation_projects || []).filter(p => p.current_stage !== 'completed').length,
     }));
     res.json({ data: lines, meta: { total: lines.length } });
@@ -3444,7 +3444,7 @@ app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) =>
     // staff supporting the line directly.
     const [{ data: trials }, { data: projects }, { data: explicitMembers }] = await Promise.all([
       supabase.from('clinical_trials')
-        .select('principal_investigator_id, co_investigators, sub_investigators, status')
+        .select('id, title, protocol_id, principal_investigator_id, co_investigators, sub_investigators, status')
         .eq('research_line_id', id)
         .eq('featured_in_website', true),
       supabase.from('innovation_projects')
@@ -3508,6 +3508,7 @@ app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) =>
         deep_content_updated_at: line.deep_content_updated_at || null,
         coordinator:   line.coordinator ? { ...line.coordinator, public_photo_url: line.coordinator.is_public ? line.coordinator.public_photo_url : null } : null,
         team,
+        trials_list:   (trials || []).map(t => ({ id: t.id, title: t.title, protocol_id: t.protocol_id })),
         active_trials:   activeTrialCount,
         total_trials:    (trials || []).length,
         active_projects: activeProjectCount,
