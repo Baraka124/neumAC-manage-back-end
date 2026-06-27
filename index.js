@@ -5559,7 +5559,7 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
     await sendNotification(
       'neumDesk notification test',
       `<h2 style="color:#0a1628">Notifications are working</h2>
-      <p style="color:#374151">This is a test notification from neumDesk. You will receive alerts for:</p>
+      <p style="color:#374151">This is a test notification from neumDesk. You will receive alerts for:</p>  
       <ul style="color:#374151;padding-left:20px">
         <li>Absences with no coverage arranged</li>
         <li>On-call shifts with no backup assigned (required areas only)</li>
