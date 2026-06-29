@@ -101,7 +101,11 @@ const {
   ALLOWED_ORIGINS: ENV_ALLOWED_ORIGINS
 } = process.env;
 
-const ALLOWED_ORIGINS_STRING = ENV_ALLOWED_ORIGINS || 'https://baraka124.github.io,http://localhost:3000,http://localhost:8080';
+// Safe default origins. The production site is neumact.org; the legacy
+// GitHub Pages host and localhost are kept for migration/dev. If the
+// ALLOWED_ORIGINS env var is set on the host it overrides this entirely.
+const ALLOWED_ORIGINS_STRING = ENV_ALLOWED_ORIGINS ||
+  'https://neumact.org,https://www.neumact.org,https://baraka124.github.io,http://localhost:3000,http://localhost:8080';
 const allowedOrigins = ALLOWED_ORIGINS_STRING.split(',').map(origin => origin.trim());
 
 console.log('🌐 CORS Configuration:', { allowedOrigins, nodeEnv: NODE_ENV });
@@ -204,14 +208,35 @@ const apiLimiter = rateLimit({
   legacyHeaders: false
 });
 
-// Separate stricter limiter for public website endpoints (unauthenticated)
+// Separate limiter for public website endpoints (unauthenticated).
+// Sizing rationale: a single page view fans out to several API calls
+// (e.g. the /line detail page makes ~7: line, trials, projects, members,
+// staff, trial-lines, publications). A real visitor browsing 8–10 pages
+// in a session therefore issues 50–90 requests legitimately. The old
+// cap of 120/15min was being exhausted by normal browsing + dev testing,
+// returning 429s that rendered as blank pages. 600/15min preserves
+// scraper protection (a scraper pulling thousands of rows still trips it)
+// while giving real multi-call page loads ample headroom.
 const publicApiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 120,  // 120 req per 15 min per IP — enough for a website, blocks scrapers
-  message: { error: 'Rate limit exceeded for public API' },
+  max: 600,
+  message: { error: 'Rate limit exceeded for public API. Please try again shortly.' },
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
+  // Never count CORS preflights against the budget.
+  skip: (req) => req.method === 'OPTIONS',
+  // Optional dev/allowlist bypass: set RATELIMIT_BYPASS_IPS="ip1,ip2"
+  // to exempt known development machines while testing.
+  keyGenerator: (req) => req.ip
 });
+
+// IPs that bypass the public limiter entirely (set in env during dev).
+const RL_BYPASS = (process.env.RATELIMIT_BYPASS_IPS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const publicApiLimiterGuarded = (req, res, next) => {
+  if (RL_BYPASS.length && RL_BYPASS.includes(req.ip)) return next();
+  return publicApiLimiter(req, res, next);
+};
 
 const authLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
@@ -3261,7 +3286,7 @@ app.get('/api/research-lines', authenticateToken, apiLimiter, async (req, res) =
 // GET /api/team/website — staff marked is_public = true
 // No authentication required — publicApiLimiter only
 // ================================================================
-app.get('/api/team/website', publicApiLimiter, async (req, res) => {
+app.get('/api/team/website', publicApiLimiterGuarded, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('medical_staff')
@@ -3269,6 +3294,7 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
         id, full_name, title, staff_type, specialization,
         public_bio, public_photo_url, is_public, affiliation_type, primary_dept_name, can_be_pi,
         is_chief_of_department,
+        orcid_id, scholar_url, researchgate_url, pubmed_query,
         department:departments!medical_staff_department_id_fkey(name, is_primary, is_external),
         research_lines:research_lines!research_lines_coordinator_id_fkey(
           id, line_number, name, short_name,
@@ -3371,7 +3397,7 @@ app.get('/api/team/website', publicApiLimiter, async (req, res) => {
   }
 });
 
-app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
+app.get('/api/research-lines/website', publicApiLimiterGuarded, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('research_lines')
@@ -3417,7 +3443,7 @@ app.get('/api/research-lines/website', publicApiLimiter, async (req, res) => {
 // /api/innovation-projects/website?line=:id endpoints for those, same as
 // clinical.html and innovation.html already do, so there's one source of
 // truth for trial/project data rather than two.
-app.get('/api/research-lines/:id/website', publicApiLimiter, async (req, res) => {
+app.get('/api/research-lines/:id/website', publicApiLimiterGuarded, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -3591,7 +3617,7 @@ app.put('/api/research-lines/:id/coordinator', authenticateToken, checkPermissio
 });
 
 // ===== 22. CLINICAL STUDIES =====
-app.get('/api/clinical-trials/website', publicApiLimiter, async (req, res) => {
+app.get('/api/clinical-trials/website', publicApiLimiterGuarded, async (req, res) => {
   try {
     const { line, phase, status, search } = req.query;
     let query = supabase.from('clinical_trials')
@@ -3787,7 +3813,7 @@ app.delete('/api/clinical-trials/:id', authenticateToken, checkPermission('resea
 });
 
 // ===== 23. INNOVATION PROJECTS =====
-app.get('/api/innovation-projects/website', publicApiLimiter, async (req, res) => {
+app.get('/api/innovation-projects/website', publicApiLimiterGuarded, async (req, res) => {
   try {
     const { line } = req.query;
     let query = supabase.from('innovation_projects')
@@ -4675,7 +4701,7 @@ app.get('/api/news', authenticateToken, apiLimiter, async (req, res) => {
 });
 
 // GET /api/news/website — PUBLIC, returns only published+public posts
-app.get('/api/news/website', publicApiLimiter, async (req, res) => {
+app.get('/api/news/website', publicApiLimiterGuarded, async (req, res) => {
   try {
     const { type, line, limit = 20, featured_only } = req.query;
 
@@ -5577,4 +5603,4 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
 process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 
-module.exports = app;
+module.exports = app; 
