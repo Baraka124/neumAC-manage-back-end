@@ -5577,7 +5577,107 @@ const server = app.listen(PORT, '0.0.0.0', () => {
     ======================================================
   `);
 });
+// ============================================================================
+//  neumDesk — /api/brain routes  (Grounded agent knowledge editor)
+//  Drop these four handlers into index.js alongside the other resources.
+//  They follow the exact same idiom as /api/announcements:
+//    - authenticateToken (full permission for now, per current decision)
+//    - the service-key `supabase` client already defined at top of index.js
+//    - same error envelopes and PGRST116 -> 404 handling
+//  Backs the `neumdesk_brain` table (kind, intent, content, meta, enabled).
+// ============================================================================
 
+// GET /api/brain — all enabled+disabled rows (the editor needs both).
+// The agent reads this on login and folds it over its embedded defaults.
+app.get('/api/brain', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('neumdesk_brain')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch brain', message: error.message });
+  }
+});
+
+// POST /api/brain — add a knowledge row (pattern | synonym | phrasing | failed_query).
+app.post('/api/brain', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const allowed = ['pattern', 'synonym', 'phrasing', 'failed_query'];
+    if (!allowed.includes(b.kind)) {
+      return res.status(400).json({ error: 'Invalid kind', message: 'kind must be one of ' + allowed.join(', ') });
+    }
+    if (!b.content || !String(b.content).trim()) {
+      return res.status(400).json({ error: 'Missing content' });
+    }
+    // De-dupe failed_query logging so the worklist doesn't fill with repeats.
+    if (b.kind === 'failed_query') {
+      const { data: existing } = await supabase
+        .from('neumdesk_brain')
+        .select('id')
+        .eq('kind', 'failed_query')
+        .eq('content', String(b.content).trim())
+        .limit(1);
+      if (existing && existing.length) return res.status(200).json(existing[0]);
+    }
+    const { data, error } = await supabase
+      .from('neumdesk_brain')
+      .insert([{
+        kind: b.kind,
+        intent: b.intent || null,
+        content: String(b.content).trim(),
+        meta: b.meta || {},
+        enabled: b.enabled !== undefined ? b.enabled : true,
+        created_by: req.user && (req.user.full_name || req.user.id) ? String(req.user.full_name || req.user.id) : null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to add brain entry', message: error.message });
+  }
+});
+
+// PUT /api/brain/:id — edit a row (toggle enabled, fix content/intent, promote a
+// failed_query into a taught pattern, etc.).
+app.put('/api/brain/:id', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const patch = { updated_at: new Date().toISOString() };
+    ['kind', 'intent', 'content', 'meta', 'enabled'].forEach(k => {
+      if (req.body && req.body[k] !== undefined) patch[k] = req.body[k];
+    });
+    const { data, error } = await supabase
+      .from('neumdesk_brain')
+      .update(patch)
+      .eq('id', req.params.id)
+      .select()
+      .single();
+    if (error) {
+      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Brain entry not found' });
+      throw error;
+    }
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update brain entry', message: error.message });
+  }
+});
+
+// DELETE /api/brain/:id
+app.delete('/api/brain/:id', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { error } = await supabase.from('neumdesk_brain').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ message: 'Brain entry deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete brain entry', message: error.message });
+  }
+});
 
 // ── Test notification endpoint ───────────────────────────────────────────
 app.post('/api/notify/test', authenticateToken, async (req, res) => {
