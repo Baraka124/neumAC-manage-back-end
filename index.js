@@ -702,6 +702,11 @@ const checkPermission = (resource, action) => {
   return async (req, res, next) => {
     if (req.method === 'OPTIONS') return next()
     if (!req.user?.id) return res.status(401).json({ error: 'Authentication required' })
+    // Admins (admin_level >= 1) bypass module permission checks. This matches the
+    // system's intent that an administrator can operate every module, and fixes
+    // endpoints guarded by module names that don't exist in user_permissions
+    // (e.g. 'staff_absence', 'departments', 'users') which otherwise 403 everyone.
+    if ((req.user.admin_level ?? 0) >= 1) return next()
     if (!req.permissions) {
       try { req.permissions = await loadUserPermissions(req.user.id) }
       catch (e) { return res.status(500).json({ error: 'Could not load permissions' }) }
@@ -1272,7 +1277,8 @@ app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff'
     const { search, staff_type, employment_status, department_id, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('medical_staff')
-      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)', { count: 'exact' });
+      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)', { count: 'exact' })
+      .is('deleted_at', null);   // never return soft-deleted staff (app-wide + agent)
     if (search) query = query.or(`full_name.ilike.%${search}%,staff_id.ilike.%${search}%,professional_email.ilike.%${search}%`);
     if (staff_type) query = query.eq('staff_type', staff_type);
     // Exclude inactive by default; pass ?employment_status=inactive to retrieve them
@@ -1603,7 +1609,7 @@ app.get('/api/departments/:id/impact', authenticateToken, checkPermission('depar
       { data: activeRotations }
     ] = await Promise.all([
       supabase.from('departments').select('name, code').eq('id', deptId).single(),
-      supabase.from('medical_staff').select('id, full_name, staff_type, employment_status')
+      supabase.from('medical_staff').select('id, full_name, staff_type, employment_status').is('deleted_at', null)
         .eq('department_id', deptId).eq('employment_status', 'active'),
       supabase.from('training_units').select('id, unit_name, unit_status')
         .eq('department_id', deptId).eq('unit_status', 'active'),
@@ -3115,9 +3121,9 @@ app.get('/api/system-stats', authenticateToken, apiLimiter, async (req, res) => 
     const residentKeys  = (staffTypes || []).filter(t =>  t.is_resident_type).map(t => t.type_key);
     const attendingKeys = (staffTypes || []).filter(t => !t.is_resident_type).map(t => t.type_key);
     const [totalStaff, activeAttending, activeResidents, todayOnCall, currentlyAbsent, activeRotations] = await Promise.all([
-      supabase.from('medical_staff').select('*', { count: 'exact', head: true }),
-      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).in('staff_type', attendingKeys.length ? attendingKeys : ['__none__']).eq('employment_status', 'active'),
-      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).in('staff_type', residentKeys.length ? residentKeys : ['__none__']).eq('employment_status', 'active'),
+      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).is('deleted_at', null),
+      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).in('staff_type', attendingKeys.length ? attendingKeys : ['__none__']).eq('employment_status', 'active').is('deleted_at', null),
+      supabase.from('medical_staff').select('*', { count: 'exact', head: true }).in('staff_type', residentKeys.length ? residentKeys : ['__none__']).eq('employment_status', 'active').is('deleted_at', null),
       supabase.from('oncall_schedule').select('*', { count: 'exact', head: true }).eq('duty_date', today),
       supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'currently_absent'),
       supabase.from('resident_rotations').select('*', { count: 'exact', head: true }).eq('rotation_status', 'active')
@@ -3216,7 +3222,7 @@ app.get('/api/available-data', authenticateToken, apiLimiter, async (req, res) =
     const [departments, staffTypes, allActiveStaff, trainingUnits] = await Promise.all([
       supabase.from('departments').select('id, name, code').eq('status', 'active').order('name'),
       supabase.from('staff_types').select('type_key, is_resident_type').eq('is_active', true),
-      supabase.from('medical_staff').select('id, full_name, training_year, specialization, staff_type').eq('employment_status', 'active').order('full_name'),
+      supabase.from('medical_staff').select('id, full_name, training_year, specialization, staff_type').eq('employment_status', 'active').is('deleted_at', null).order('full_name'),
       supabase.from('training_units').select('id, unit_name, unit_code, maximum_residents').eq('unit_status', 'active').order('unit_name')
     ]);
     const residentKeys = new Set((staffTypes.data || []).filter(t => t.is_resident_type).map(t => t.type_key));
@@ -3235,6 +3241,7 @@ app.get('/api/search/medical-staff', authenticateToken, apiLimiter, async (req, 
     const { q } = req.query;
     if (!q || q.length < 2) return res.json([]);
     const { data, error } = await supabase.from('medical_staff').select('id, full_name, professional_email, staff_type, staff_id')
+      .is('deleted_at', null)
       .or(`full_name.ilike.%${q}%,staff_id.ilike.%${q}%,professional_email.ilike.%${q}%`).limit(10);
     if (error) throw error;
     res.json(data || []);
@@ -5703,4 +5710,4 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
 process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 
-module.exports = app;  
+module.exports = app;
