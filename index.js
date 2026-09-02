@@ -5685,7 +5685,7 @@ app.delete('/api/brain/:id', authenticateToken, apiLimiter, async (req, res) => 
     res.status(500).json({ error: 'Failed to delete brain entry', message: error.message });
   }
 });
-
+  
 // ── Test notification endpoint ───────────────────────────────────────────
 app.post('/api/notify/test', authenticateToken, async (req, res) => {
   try {
