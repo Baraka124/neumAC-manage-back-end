@@ -2539,6 +2539,22 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
     // FIX 2: Derive current_status from dates (NOT NULL in DB)
     const currentStatus = deriveAbsenceStatus(startDateStr, endDateStr);
 
+    // FIX 3: recorded_by is a FK to app_users. A token id that isn't a real
+    // app_users row causes a FK violation and the whole insert fails. Resolve it
+    // safely: use req.user.id only if it exists in app_users; else match by email;
+    // else null (the column is nullable, so null is always safe).
+    let recordedBy = null;
+    try {
+      if (req.user && req.user.id) {
+        const { data: byId } = await supabase.from('app_users').select('id').eq('id', req.user.id).limit(1);
+        if (byId && byId.length) recordedBy = byId[0].id;
+      }
+      if (!recordedBy && req.user && req.user.email) {
+        const { data: byEmail } = await supabase.from('app_users').select('id').eq('email', req.user.email).limit(1);
+        if (byEmail && byEmail.length) recordedBy = byEmail[0].id;
+      }
+    } catch (e) { recordedBy = null; }
+
     const absenceData = {
       staff_member_id:      dataSource.staff_member_id,
       absence_type:         dataSource.absence_type,
@@ -2551,7 +2567,7 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
       covering_staff_id:    dataSource.covering_staff_id || null,
       coverage_notes:       dataSource.coverage_notes || '',
       hod_notes:            dataSource.hod_notes || '',
-      recorded_by:          req.user.id || null,
+      recorded_by:          recordedBy,
       recorded_at:          new Date().toISOString(),
       last_updated:         new Date().toISOString(),
       // Recurring fields
