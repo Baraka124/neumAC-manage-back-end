@@ -1074,15 +1074,22 @@ app.put('/api/permissions/:userId/:module', authenticateToken, isAdmin, apiLimit
     if (userId === req.user.id && !can_read && !can_write) {
       return res.status(403).json({ error: 'You cannot revoke your own access to ' + module + '. Ask another admin to do this if needed.' })
     }
-
-    // Safety: admin cannot grant more than they themselves have
-    const adminPerms = await loadUserPermissions(req.user.id)
-    const adminHas = adminPerms.get(module)
-    if (can_read && !adminHas?.can_read) {
-      return res.status(403).json({ error: 'You cannot grant read access to ' + module + ' because you do not have it yourself' })
+    if (userId === req.user.id && ['system_settings','user_management'].includes(module) && !can_write) {
+      return res.status(403).json({ error: 'You cannot reduce your own ' + module + ' access — this would lock you out of administration. Ask another admin.' })
     }
-    if (can_write && !adminHas?.can_write) {
-      return res.status(403).json({ error: 'You cannot grant write access to ' + module + ' because you do not have it yourself' })
+
+    // Safety: admin cannot grant more than they themselves have —
+    // EXCEPT a system_admin / admin_level>=1, who holds every module by role.
+    const isSuperAdmin = req.user.user_role === 'system_admin' || (req.user.admin_level ?? 0) >= 1
+    if (!isSuperAdmin) {
+      const adminPerms = await loadUserPermissions(req.user.id)
+      const adminHas = adminPerms.get(module)
+      if (can_read && !adminHas?.can_read) {
+        return res.status(403).json({ error: 'You cannot grant read access to ' + module + ' because you do not have it yourself' })
+      }
+      if (can_write && !adminHas?.can_write) {
+        return res.status(403).json({ error: 'You cannot grant write access to ' + module + ' because you do not have it yourself' })
+      }
     }
 
     // Upsert — if both false, remove the row entirely (clean revoke)
@@ -1514,13 +1521,16 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
 
 app.delete('/api/medical-staff/:id', authenticateToken, checkPermission('medical_staff', 'delete'), apiLimiter, async (req, res) => {
   try {
+    // True soft-delete: set deleted_at (so it's filtered everywhere) AND mark
+    // inactive. Previously this only set inactive, leaving deleted_at null — so
+    // "deleted" staff still surfaced in scans, lookups, and the agent.
     const { data, error } = await supabase.from('medical_staff')
-      .update({ employment_status: 'inactive', updated_at: new Date().toISOString() })
+      .update({ employment_status: 'inactive', deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
       .eq('id', req.params.id).select('full_name, staff_id').single();
     if (error) throw error;
-    res.json({ message: 'Medical staff deactivated successfully', staff_name: data.full_name });
+    res.json({ message: 'Medical staff deleted successfully', staff_name: data.full_name });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to deactivate medical staff', message: error.message });
+    res.status(500).json({ error: 'Failed to delete medical staff', message: error.message });
   }
 });
 
@@ -5685,7 +5695,7 @@ app.delete('/api/brain/:id', authenticateToken, apiLimiter, async (req, res) => 
     res.status(500).json({ error: 'Failed to delete brain entry', message: error.message });
   }
 });
-  
+
 // ── Test notification endpoint ───────────────────────────────────────────
 app.post('/api/notify/test', authenticateToken, async (req, res) => {
   try {
