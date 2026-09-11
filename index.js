@@ -5301,7 +5301,7 @@ app.get('/api/emergency-callouts', authenticateToken, apiLimiter, async (req, re
 // POST — log a new callout
 app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_schedule', 'create'), validate(schemas.emergencyCallout), async (req, res) => {
   try {
-    const { staff_id, called_at, end_time, reason_category, notes, time_type } = req.body
+    const { staff_id, called_at, end_time, reason_category, notes, time_type, coverage_area_id } = req.body
     if (!staff_id) return res.status(400).json({ error: 'staff_id is required' })
     if (!called_at) return res.status(400).json({ error: 'called_at is required' })
     const { data, error } = await supabase
@@ -5310,7 +5310,7 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
         staff_id,
         called_at,
         end_time: end_time || null,
-        reason_category: reason_category || 'unspecified',
+        reason_category: reason_category || 'other',
         notes: notes || null,
         time_type: time_type || 'night',
         coverage_area_id: coverage_area_id || null,
@@ -5329,10 +5329,10 @@ app.post('/api/emergency-callouts', authenticateToken, checkPermission('oncall_s
 // PUT — edit a callout
 app.put('/api/emergency-callouts/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), validate(schemas.emergencyCallout), async (req, res) => {
   try {
-    const { called_at, end_time, reason_category, notes, time_type } = req.body
+    const { called_at, end_time, reason_category, notes, time_type, coverage_area_id } = req.body
     const { data, error } = await supabase
       .from('emergency_callouts')
-      .update({ called_at, end_time, reason_category, notes, time_type, updated_at: new Date().toISOString() })
+      .update({ called_at, end_time, reason_category, notes, time_type, coverage_area_id, updated_at: new Date().toISOString() })
       .eq('id', req.params.id).select('*, staff:medical_staff(id,full_name,staff_type)').single()
     if (error) throw error
     res.json(data)
