@@ -5574,54 +5574,8 @@ app.post('/api/oncall/batch', authenticateToken, checkPermission('oncall_schedul
 })
 
 // ===== 404 HANDLER =====
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
-});
 
-// ===== GLOBAL ERROR HANDLER =====
-app.use((err, req, res, next) => {
-  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} - Error:`, err.message);
-  if (err.message?.includes('CORS')) return res.status(403).json({ error: 'CORS error', message: 'Request blocked by CORS policy', your_origin: req.headers.origin, allowed_origins: allowedOrigins });
-  if (err.message?.includes('JWT') || err.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Authentication error', message: 'Invalid or expired authentication token' });
-  res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'An unexpected error occurred', timestamp: new Date().toISOString() });
-});
-
-
-// ============ SERVER STARTUP ============
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`
-    ======================================================
-    🏥 NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API v5.4
-    ======================================================
-    ✅ 18 BUGS FIXED (original 9 + 9 new)
-    ✅ FIX 10: auth/me JWT field mismatch — req.user.userId→req.user.id
-    ✅ FIX 11: medical-staff POST+PUT now persist can_be_pi/coi/phd fields
-    ✅ FIX 12: Joi schema includes can_be_pi/coi/phd (no longer stripped)
-    ✅ FIX 13: training-units PUT now updates unit_type + unit_description
-    ✅ FIX 14: training-units PUT refreshes department_name on dept change
-    ✅ FIX 15: rotations DELETE is now soft delete (terminated_early)
-    ✅ FIX 16: analytics project stages aligned to current_stage field
-    ✅ FIX 17: research-lines POST accepts research_line_name + keywords
-    ✅ FIX 18: clinical-trials phase defaults for non-interventional studies
-    ✅ Dynamic staff_types — /api/staff-types CRUD routes
-    ======================================================
-    Server running on port: ${PORT}
-    Environment: ${NODE_ENV}
-    ======================================================
-  `);
-});
-// ============================================================================
-//  neumDesk — /api/brain routes  (Grounded agent knowledge editor)
-//  Drop these four handlers into index.js alongside the other resources.
-//  They follow the exact same idiom as /api/announcements:
-//    - authenticateToken (full permission for now, per current decision)
-//    - the service-key `supabase` client already defined at top of index.js
-//    - same error envelopes and PGRST116 -> 404 handling
-//  Backs the `neumdesk_brain` table (kind, intent, content, meta, enabled).
-// ============================================================================
-
-// GET /api/brain — all enabled+disabled rows (the editor needs both).
-// The agent reads this on login and folds it over its embedded defaults.
+// ===== BRAIN ROUTES (moved above catch-all so they resolve) =====
 app.get('/api/brain', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -5711,6 +5665,55 @@ app.delete('/api/brain/:id', authenticateToken, apiLimiter, async (req, res) => 
     res.status(500).json({ error: 'Failed to delete brain entry', message: error.message });
   }
 });
+
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
+});
+
+// ===== GLOBAL ERROR HANDLER =====
+app.use((err, req, res, next) => {
+  console.error(`[${new Date().toISOString()}] ${req.method} ${req.url} - Error:`, err.message);
+  if (err.message?.includes('CORS')) return res.status(403).json({ error: 'CORS error', message: 'Request blocked by CORS policy', your_origin: req.headers.origin, allowed_origins: allowedOrigins });
+  if (err.message?.includes('JWT') || err.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Authentication error', message: 'Invalid or expired authentication token' });
+  res.status(500).json({ error: 'Internal server error', message: NODE_ENV === 'development' ? err.message : 'An unexpected error occurred', timestamp: new Date().toISOString() });
+});
+
+
+// ============ SERVER STARTUP ============
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+    ======================================================
+    🏥 NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API v5.4
+    ======================================================
+    ✅ 18 BUGS FIXED (original 9 + 9 new)
+    ✅ FIX 10: auth/me JWT field mismatch — req.user.userId→req.user.id
+    ✅ FIX 11: medical-staff POST+PUT now persist can_be_pi/coi/phd fields
+    ✅ FIX 12: Joi schema includes can_be_pi/coi/phd (no longer stripped)
+    ✅ FIX 13: training-units PUT now updates unit_type + unit_description
+    ✅ FIX 14: training-units PUT refreshes department_name on dept change
+    ✅ FIX 15: rotations DELETE is now soft delete (terminated_early)
+    ✅ FIX 16: analytics project stages aligned to current_stage field
+    ✅ FIX 17: research-lines POST accepts research_line_name + keywords
+    ✅ FIX 18: clinical-trials phase defaults for non-interventional studies
+    ✅ Dynamic staff_types — /api/staff-types CRUD routes
+    ======================================================
+    Server running on port: ${PORT}
+    Environment: ${NODE_ENV}
+    ======================================================
+  `);
+});
+// ============================================================================
+//  neumDesk — /api/brain routes  (Grounded agent knowledge editor)
+//  Drop these four handlers into index.js alongside the other resources.
+//  They follow the exact same idiom as /api/announcements:
+//    - authenticateToken (full permission for now, per current decision)
+//    - the service-key `supabase` client already defined at top of index.js
+//    - same error envelopes and PGRST116 -> 404 handling
+//  Backs the `neumdesk_brain` table (kind, intent, content, meta, enabled).
+// ============================================================================
+
+// GET /api/brain — all enabled+disabled rows (the editor needs both).
+// The agent reads this on login and folds it over its embedded defaults.
 
 // ── Test notification endpoint ───────────────────────────────────────────
 app.post('/api/notify/test', authenticateToken, async (req, res) => {
