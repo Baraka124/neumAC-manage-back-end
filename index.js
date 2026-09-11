@@ -5736,7 +5736,7 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
   }
 });
 
-process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
+process.on('SIGTERM', () => { server.close(() => process.exit(0)); });  
 process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 
 module.exports = app;
