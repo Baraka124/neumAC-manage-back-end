@@ -2146,6 +2146,12 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
     res.status(201).json(data);
   } catch (error) {
     console.error('Failed to create rotation:', error);
+    // DB trigger check_no_overlapping_rotations raises a clear message — surface it as a
+    // 409 conflict (not a scary 500), so the UI can show a helpful reason.
+    const em = (error && error.message) || '';
+    if (/overlap/i.test(em) || error?.code === 'P0001') {
+      return res.status(409).json({ error: 'Scheduling conflict', message: 'This resident already has a rotation overlapping these dates — they can\u2019t be in two units at once.' });
+    }
     res.status(500).json({ error: 'Failed to create rotation', message: error.message });
   }
 });
