@@ -566,7 +566,7 @@ const schemas = {
   // ── News / Post ──────────────────────────────────────────────────────
   newsPost: Joi.object({
     title:              Joi.string().min(2).max(400).required(),
-    post_type:          Joi.string().valid('update','article','publication','photo_story').required(),
+    post_type:          Joi.string().valid('update','article','publication','photo_story','highlight','news').required(),
     body:               Joi.string().max(20000).allow('', null).optional(),
     author_id:          Joi.string().uuid().allow('', null).optional(),
     research_line_id:   Joi.string().uuid().allow('', null).optional(),
@@ -5736,7 +5736,7 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
   }
 });
 
-process.on('SIGTERM', () => { server.close(() => process.exit(0)); });  
+process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
 process.on('SIGINT', () => { server.close(() => process.exit(0)); });
 
 module.exports = app;
