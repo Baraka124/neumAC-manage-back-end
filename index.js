@@ -417,7 +417,7 @@ const schemas = {
   // not required from client
   absenceRecord: Joi.object({
     staff_member_id: Joi.string().uuid().required(),
-    absence_type: Joi.string().valid('planned', 'unplanned').required(),
+    absence_type: Joi.string().valid('planned', 'unplanned', 'medical', 'personal', 'administrative').required(),
     absence_reason: Joi.string().valid('vacation', 'conference', 'sick_leave', 'training', 'personal', 'other').required(),
     start_date: Joi.date().required(),
     end_date: Joi.date().required(),
@@ -900,7 +900,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 });
 
 app.post('/api/auth/logout', authenticateToken, apiLimiter, async (req, res) => {
-  res.json({ message: 'Logged out successfully', timestamp: new Date().toISOString() });
+  try { res.json({ message: 'Logged out successfully', timestamp: new Date().toISOString() }); } catch(e) { res.status(500).json({ error: 'Logout failed' }); }
 });
 
 // Token validation endpoint — called on mount to verify session is still valid
@@ -5540,42 +5540,53 @@ app.post('/api/oncall/batch', authenticateToken, checkPermission('oncall_schedul
     if (shifts.length > 200)
       return res.status(400).json({ error: 'Maximum 200 shifts per batch' })
 
-    const rows = shifts.map(s => ({
-      duty_date:            formatDate(new Date(s.duty_date)),
-      shift_type:           ['primary_call','backup_call','float_physician'].includes(s.shift_type) ? s.shift_type : 'primary_call',
-      coverage_area_id:     s.coverage_area_id || null,
-      start_time:           s.start_time || '15:00',
-      end_time:             s.end_time   || '08:00',
-      primary_physician_id: s.primary_physician_id,
-      backup_physician_id:  s.backup_physician_id  || null,
-      coverage_notes:       s.coverage_notes       || null,
-      schedule_id:          generateId('SCH'),
-      created_by:           req.user.id,
-      created_at:           new Date().toISOString(),
-      updated_at:           new Date().toISOString(),
-    }))
-
-    // Validate required fields
-    const invalid = rows.filter(r => !r.primary_physician_id || !r.duty_date)
+    // Validate required fields up front
+    const invalid = shifts.filter(s => !s.primary_physician_id || !s.duty_date)
     if (invalid.length > 0)
-      return res.status(400).json({ error: `${invalid.length} shifts missing required fields (primary_physician_id, duty_date)` })
+      return res.status(400).json({ error: `${invalid.length} shifts missing required fields` })
 
-    const { data, error } = await supabase
-      .from('oncall_schedule')
-      .insert(rows)
-      .select()
+    // Get all existing shifts for the date range to detect duplicates
+    const dates = [...new Set(shifts.map(s => formatDate(new Date(s.duty_date))))]
+    const { data: existing } = await supabase.from('oncall_schedule')
+      .select('id, duty_date, primary_physician_id')
+      .in('duty_date', dates)
 
-    if (error) throw error
-    res.status(201).json({ success: true, count: data.length, data })
+    const existingMap = {}
+    ;(existing || []).forEach(e => { existingMap[`${e.duty_date}|${e.primary_physician_id}`] = e.id })
+
+    let inserted = 0, updated = 0
+    for (const s of shifts) {
+      const dd = formatDate(new Date(s.duty_date))
+      const key = `${dd}|${s.primary_physician_id}`
+      const row = {
+        duty_date:            dd,
+        shift_type:           ['primary_call','backup_call','float_physician','on_call_home','on_call_mixed','on_call_present'].includes(s.shift_type) ? s.shift_type : 'primary_call',
+        coverage_area_id:     s.coverage_area_id || null,
+        start_time:           s.start_time || '15:00',
+        end_time:             s.end_time   || '08:00',
+        primary_physician_id: s.primary_physician_id,
+        backup_physician_id:  s.backup_physician_id  || null,
+        coverage_notes:       s.coverage_notes       || null,
+        updated_at:           new Date().toISOString(),
+      }
+      if (existingMap[key]) {
+        // UPDATE existing shift
+        await supabase.from('oncall_schedule').update(row).eq('id', existingMap[key])
+        updated++
+      } else {
+        // INSERT new shift
+        row.schedule_id = generateId('SCH')
+        row.created_by  = req.user.id
+        row.created_at  = new Date().toISOString()
+        const { error } = await supabase.from('oncall_schedule').insert(row)
+        if (error) throw error
+        inserted++
+      }
+    }
+
+    res.status(201).json({ success: true, inserted, updated, total: inserted + updated })
   } catch (err) {
-    // Unique constraint violation — one primary per area per day
-    if (err.code === '23505')
-      return res.status(409).json({
-        error: 'Duplicate primary call',
-        message: 'One or more dates already have a primary call for the same area. Review conflicts and retry.',
-        detail: err.detail
-      })
-    res.status(500).json({ error: 'Batch insert failed', message: err.message })
+    res.status(500).json({ error: 'Batch sync failed', message: err.message })
   }
 })
 
