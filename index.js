@@ -5721,7 +5721,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 // GET /api/brain — all enabled+disabled rows (the editor needs both).
 // The agent reads this on login and folds it over its embedded defaults.
 
-// ── Test notification endpoint ───────────────────────────────────────────  
+// ── Test notification endpoint ───────────────────────────────────────────
 app.post('/api/notify/test', authenticateToken, async (req, res) => {
   try {
     await sendNotification(
