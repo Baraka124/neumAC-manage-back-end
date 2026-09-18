@@ -1,5 +1,5 @@
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
-// VERSION 5.4 - ALL BUGS FIXED
+// VERSION 5.5 - SYNC UPSERT + PARTIAL UPDATES + EXPANDED TYPES
 // --- ORIGINAL FIXES --- 
 // FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
