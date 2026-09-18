@@ -399,10 +399,23 @@ const schemas = {
     goals: Joi.string().optional().allow(''),
     notes: Joi.string().optional().allow('')
   }),
+  rotationUpdate: Joi.object({
+    resident_id: Joi.string().uuid().optional(),
+    training_unit_id: Joi.string().uuid().optional(),
+    start_date: Joi.date().optional(),
+    end_date: Joi.date().optional(),
+    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early').optional(),
+    rotation_category: Joi.string().valid('clinical_rotation', 'elective_rotation', 'research_block', 'administrative_duty').optional(),
+    supervising_attending_id: Joi.string().uuid().optional(),
+    clinical_notes: Joi.string().optional().allow(''),
+    supervisor_evaluation: Joi.string().optional().allow(''),
+    goals: Joi.string().optional().allow(''),
+    notes: Joi.string().optional().allow('')
+  }).min(1),
 
   onCall: Joi.object({
     duty_date: Joi.date().required(),
-    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician').default('primary_call'),
+    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'on_call_home', 'on_call_mixed', 'on_call_present').default('primary_call'),
     coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
     start_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
     end_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
@@ -426,6 +439,18 @@ const schemas = {
     coverage_notes: Joi.string().optional().allow(''),
     hod_notes: Joi.string().optional().allow('')
   }),
+  absenceRecordUpdate: Joi.object({
+    staff_member_id: Joi.string().uuid().optional(),
+    absence_type: Joi.string().valid('planned', 'unplanned', 'medical', 'personal', 'administrative').optional(),
+    absence_reason: Joi.string().valid('vacation', 'conference', 'sick_leave', 'training', 'personal', 'other').optional(),
+    start_date: Joi.date().optional(),
+    end_date: Joi.date().optional(),
+    coverage_arranged: Joi.boolean().optional(),
+    covering_staff_id: Joi.string().uuid().optional().allow(null),
+    coverage_notes: Joi.string().optional().allow(''),
+    hod_notes: Joi.string().optional().allow(''),
+    current_status: Joi.string().optional()
+  }).min(1),
 
   register: Joi.object({
     email: Joi.string().email().required(),
@@ -2157,7 +2182,7 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
 });
 
 // FIX 1: PUT /api/rotations/:id — same formatDate() fix
-app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotations', 'update'), validate(schemas.rotation), async (req, res) => {
+app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotations', 'update'), validate(schemas.rotationUpdate), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
 
@@ -2364,7 +2389,7 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
   }
 });
 
-app.put('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), validate(schemas.onCall), async (req, res) => {
+app.put('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), validate(schemas.onCallUpdate), async (req, res) => {
   try {
     const d = req.validatedData || req.body;
     const scheduleData = {
@@ -2675,7 +2700,7 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
 });
 
 // FIX 9: PUT /api/absence-records/:id — recalculates total_days and current_status on update
-app.put('/api/absence-records/:id', authenticateToken, checkPermission('staff_absence', 'update'), validate(schemas.absenceRecord), async (req, res) => {
+app.put('/api/absence-records/:id', authenticateToken, checkPermission('staff_absence', 'update'), validate(schemas.absenceRecordUpdate), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
 
@@ -2694,11 +2719,11 @@ app.put('/api/absence-records/:id', authenticateToken, checkPermission('staff_ab
     const currentStatus = deriveAbsenceStatus(startDateStr, endDateStr);
 
     const updateData = {
-      staff_member_id:   dataSource.staff_member_id,
-      absence_type:      dataSource.absence_type,
-      absence_reason:    dataSource.absence_reason,
-      start_date:        startDateStr,
-      end_date:          endDateStr,
+      staff_member_id:   dataSource.staff_member_id || currentRecord.staff_member_id,
+      absence_type:      dataSource.absence_type || currentRecord.absence_type,
+      absence_reason:    dataSource.absence_reason || currentRecord.absence_reason,
+      start_date:        startDateStr || currentRecord.start_date,
+      end_date:          endDateStr || currentRecord.end_date,
       total_days:        totalDays,       // FIX 9
       current_status:    currentStatus,   // FIX 9
       coverage_arranged: dataSource.coverage_arranged,
@@ -5554,7 +5579,20 @@ app.post('/api/oncall/batch', authenticateToken, checkPermission('oncall_schedul
     const existingMap = {}
     ;(existing || []).forEach(e => { existingMap[`${e.duty_date}|${e.primary_physician_id}`] = e.id })
 
-    let inserted = 0, updated = 0
+    const force = req.body.force_override === true
+    let inserted = 0, updated = 0, skipped = 0
+    const conflicts = []
+    
+    // Also check for OTHER physicians on the same dates (different person, same date)
+    const { data: allOnDates } = await supabase.from('oncall_schedule')
+      .select('id, duty_date, primary_physician_id')
+      .in('duty_date', dates)
+    const datePhysMap = {}
+    ;(allOnDates || []).forEach(e => {
+      if (!datePhysMap[e.duty_date]) datePhysMap[e.duty_date] = []
+      datePhysMap[e.duty_date].push({ id: e.id, physician_id: e.primary_physician_id })
+    })
+    
     for (const s of shifts) {
       const dd = formatDate(new Date(s.duty_date))
       const key = `${dd}|${s.primary_physician_id}`
@@ -5566,25 +5604,49 @@ app.post('/api/oncall/batch', authenticateToken, checkPermission('oncall_schedul
         end_time:             s.end_time   || '08:00',
         primary_physician_id: s.primary_physician_id,
         backup_physician_id:  s.backup_physician_id  || null,
-        coverage_notes:       s.coverage_notes       || null,
+        coverage_notes:       s.coverage_notes       || (s.source_file ? `Synced from ${s.source_file}` : null),
         updated_at:           new Date().toISOString(),
       }
+      
       if (existingMap[key]) {
-        // UPDATE existing shift
+        // Same person, same date — UPDATE
         await supabase.from('oncall_schedule').update(row).eq('id', existingMap[key])
         updated++
       } else {
+        // Check: is there a DIFFERENT physician already on this date?
+        const othersOnDate = (datePhysMap[dd] || []).filter(e => e.physician_id !== s.primary_physician_id)
+        if (othersOnDate.length > 0 && !force) {
+          // There's already someone else on this date — flag as conflict but still insert
+          // (a date can have multiple physicians with different shift types)
+        }
         // INSERT new shift
         row.schedule_id = generateId('SCH')
         row.created_by  = req.user.id
         row.created_at  = new Date().toISOString()
         const { error } = await supabase.from('oncall_schedule').insert(row)
-        if (error) throw error
+        if (error) {
+          // If insert fails (e.g. schedule_id collision), retry with new ID
+          row.schedule_id = generateId('SCH')
+          const { error: err2 } = await supabase.from('oncall_schedule').insert(row)
+          if (err2) {
+            conflicts.push({ date: dd, physician_id: s.primary_physician_id, error: err2.message })
+            skipped++
+            continue
+          }
+        }
         inserted++
       }
     }
 
-    res.status(201).json({ success: true, inserted, updated, total: inserted + updated })
+    res.status(201).json({
+      success: true,
+      inserted,
+      updated,
+      skipped,
+      total: inserted + updated,
+      conflicts: conflicts.length > 0 ? conflicts : undefined,
+      message: `Synced ${inserted + updated} shifts (${inserted} new, ${updated} updated${skipped ? ', ' + skipped + ' skipped' : ''}).`
+    })
   } catch (err) {
     res.status(500).json({ error: 'Batch sync failed', message: err.message })
   }
@@ -5754,6 +5816,6 @@ app.post('/api/notify/test', authenticateToken, async (req, res) => {
 });
 
 process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
-process.on('SIGINT', () => { server.close(() => process.exit(0)); });
+process.on('SIGINT', () => { server.close(() => process.exit(0)); });  
 
-module.exports = app; 
+module.exports = app;
