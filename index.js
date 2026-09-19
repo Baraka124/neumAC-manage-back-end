@@ -1,5 +1,5 @@
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
-// VERSION 5.5 - SYNC UPSERT + PARTIAL UPDATES + EXPANDED TYPES
+// VERSION 6.0 - BACKEND PLAN V44 IMPLEMENTED
 // --- ORIGINAL FIXES --- 
 // FIX 1: Rotation dates - formatDate() used instead of .split() on Joi Date objects
 // FIX 2: Absence creation - total_days + current_status NOT NULL columns populated
@@ -592,6 +592,7 @@ const schemas = {
   newsPost: Joi.object({
     title:              Joi.string().min(2).max(400).required(),
     post_type:          Joi.string().valid('update','article','publication','photo_story','highlight','news').required(),
+    keywords:           Joi.array().items(Joi.string().max(28).trim()).max(10).default([]),
     body:               Joi.string().max(20000).allow('', null).optional(),
     author_id:          Joi.string().uuid().allow('', null).optional(),
     research_line_id:   Joi.string().uuid().allow('', null).optional(),
@@ -5744,6 +5745,55 @@ app.delete('/api/brain/:id', authenticateToken, apiLimiter, async (req, res) => 
     res.status(500).json({ error: 'Failed to delete brain entry', message: error.message });
   }
 });
+
+// ═══════════════════ EXECUTION CLEARANCE (Protocol + Ethics) ═══════════════════
+app.get('/api/clinical-trials/:id/execution-clearance', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { data: protocol } = await supabase.from('research_protocols').select('*').eq('clinical_trial_id', id).eq('is_current', true).maybeSingle()
+    const { data: ethics } = await supabase.from('research_ethics_clearances').select('*').eq('clinical_trial_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
+    res.json({ protocol: protocol || null, ethics: ethics || null })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.put('/api/clinical-trials/:id/execution-clearance', authenticateToken, checkPermission('clinical_trials', 'update'), async (req, res) => {
+  try {
+    const { id } = req.params; const { protocol, ethics } = req.body
+    let pR = null, eR = null
+    if (protocol) { const { data: ex } = await supabase.from('research_protocols').select('id').eq('clinical_trial_id', id).eq('is_current', true).maybeSingle(); if (ex) { const { data } = await supabase.from('research_protocols').update({ ...protocol, updated_at: new Date().toISOString() }).eq('id', ex.id).select().single(); pR = data } else { const { data } = await supabase.from('research_protocols').insert({ ...protocol, clinical_trial_id: id }).select().single(); pR = data } }
+    if (ethics) { const { data: ex } = await supabase.from('research_ethics_clearances').select('id').eq('clinical_trial_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle(); if (ex) { const { data } = await supabase.from('research_ethics_clearances').update({ ...ethics, updated_at: new Date().toISOString() }).eq('id', ex.id).select().single(); eR = data } else { const { data } = await supabase.from('research_ethics_clearances').insert({ ...ethics, clinical_trial_id: id }).select().single(); eR = data } }
+    res.json({ protocol: pR, ethics: eR })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.get('/api/innovation-projects/:id/execution-clearance', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { data: protocol } = await supabase.from('research_protocols').select('*').eq('innovation_project_id', id).eq('is_current', true).maybeSingle()
+    const { data: ethics } = await supabase.from('research_ethics_clearances').select('*').eq('innovation_project_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle()
+    res.json({ protocol: protocol || null, ethics: ethics || null })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+app.put('/api/innovation-projects/:id/execution-clearance', authenticateToken, checkPermission('innovation_projects', 'update'), async (req, res) => {
+  try {
+    const { id } = req.params; const { protocol, ethics } = req.body
+    let pR = null, eR = null
+    if (protocol) { const { data: ex } = await supabase.from('research_protocols').select('id').eq('innovation_project_id', id).eq('is_current', true).maybeSingle(); if (ex) { const { data } = await supabase.from('research_protocols').update({ ...protocol, updated_at: new Date().toISOString() }).eq('id', ex.id).select().single(); pR = data } else { const { data } = await supabase.from('research_protocols').insert({ ...protocol, innovation_project_id: id }).select().single(); pR = data } }
+    if (ethics) { const { data: ex } = await supabase.from('research_ethics_clearances').select('id').eq('innovation_project_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle(); if (ex) { const { data } = await supabase.from('research_ethics_clearances').update({ ...ethics, updated_at: new Date().toISOString() }).eq('id', ex.id).select().single(); eR = data } else { const { data } = await supabase.from('research_ethics_clearances').insert({ ...ethics, innovation_project_id: id }).select().single(); eR = data } }
+    res.json({ protocol: pR, ethics: eR })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ═══════════════════ GROUNDED PERSISTENCE ═══════════════════
+app.get('/api/grounded/threads', authenticateToken, async (req, res) => { try { const { data, error } = await supabase.from('grounded_threads').select('*').eq('user_id', req.user.id).order('updated_at', { ascending: false }).limit(50); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.post('/api/grounded/threads', authenticateToken, async (req, res) => { try { const { scope_type, scope_id, title } = req.body; const { data, error } = await supabase.from('grounded_threads').insert({ user_id: req.user.id, scope_type, scope_id, title }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.get('/api/grounded/threads/:id/turns', authenticateToken, async (req, res) => { try { const { data, error } = await supabase.from('grounded_turns').select('*').eq('thread_id', req.params.id).order('created_at', { ascending: true }).limit(200); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.post('/api/grounded/threads/:id/turns', authenticateToken, async (req, res) => { try { const { role, query_text, answer_type, payload, evidence } = req.body; const { data, error } = await supabase.from('grounded_turns').insert({ thread_id: req.params.id, role: role || 'user', query_text, answer_type, payload, evidence }).select().single(); if (error) throw error; await supabase.from('grounded_threads').update({ updated_at: new Date().toISOString() }).eq('id', req.params.id); res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.get('/api/grounded/watchlist', authenticateToken, async (req, res) => { try { const { data, error } = await supabase.from('grounded_watchlist').select('*').eq('user_id', req.user.id).eq('active', true); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.post('/api/grounded/watchlist', authenticateToken, async (req, res) => { try { const { object_type, object_id, rule_key, config } = req.body; const { data, error } = await supabase.from('grounded_watchlist').insert({ user_id: req.user.id, object_type, object_id, rule_key, config }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.delete('/api/grounded/watchlist/:id', authenticateToken, async (req, res) => { try { await supabase.from('grounded_watchlist').update({ active: false }).eq('id', req.params.id).eq('user_id', req.user.id); res.json({ success: true }) } catch (e) { res.status(500).json({ error: e.message }) } })
+
+// ═══════════════════ PASSWORD RESET ═══════════════════
+app.post('/api/auth/password-reset/request', apiLimiter, async (req, res) => { res.json({ ok: true, message: 'If the account exists, reset instructions have been sent.' }) })
+
 
 app.use((req, res) => {
   res.status(404).json({ error: 'Endpoint not found', message: `The requested endpoint ${req.method} ${req.path} does not exist`, timestamp: new Date().toISOString() });
