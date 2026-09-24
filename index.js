@@ -33,6 +33,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const Decision51 = require('./decision51.js');
 require('dotenv').config();
 
 // ── Notification system (Resend API — free, no extra npm install) ────────
@@ -380,6 +381,13 @@ const schemas = {
     publish_end_date: Joi.date().optional()
   }),
 
+  decisionOverride: Joi.object({
+    accepted: Joi.boolean().valid(true).required(),
+    reason: Joi.string().trim().min(8).max(2000).required(),
+    review_contract: Joi.string().optional(),
+    finding_codes: Joi.array().items(Joi.string()).optional()
+  }),
+
   // FIX 4: rotation_category values now match the DB CHECK constraint exactly:
   // DB allows: 'clinical_rotation', 'elective_rotation', 'research_block', 'administrative_duty'
   // Old Joi had 'research_rotation' (not in DB) and was missing 'research_block' + 'administrative_duty'
@@ -388,7 +396,10 @@ const schemas = {
     training_unit_id: Joi.string().uuid().required(),
     start_date: Joi.date().required(),
     end_date: Joi.date().required(),
-    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early').optional().default('scheduled'),
+    actual_start_date: Joi.date().optional().allow(null),
+    actual_end_date: Joi.date().optional().allow(null),
+    termination_reason: Joi.string().max(2000).optional().allow('', null),
+    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early', 'cancelled').optional().default('scheduled'),
     rotation_category: Joi.string()
       .valid('clinical_rotation', 'elective_rotation', 'research_block', 'administrative_duty')
       .optional().default('clinical_rotation'),
@@ -397,20 +408,25 @@ const schemas = {
     clinical_notes: Joi.string().optional().allow(''),
     supervisor_evaluation: Joi.string().optional().allow(''),
     goals: Joi.string().optional().allow(''),
-    notes: Joi.string().optional().allow('')
+    notes: Joi.string().optional().allow(''),
+    decision_override: Joi.object({ accepted: Joi.boolean().valid(true).required(), reason: Joi.string().trim().min(8).max(2000).required(), review_contract: Joi.string().optional(), finding_codes: Joi.array().items(Joi.string()).optional() }).optional()
   }),
   rotationUpdate: Joi.object({
     resident_id: Joi.string().uuid().optional(),
     training_unit_id: Joi.string().uuid().optional(),
     start_date: Joi.date().optional(),
     end_date: Joi.date().optional(),
-    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early').optional(),
+    actual_start_date: Joi.date().optional().allow(null),
+    actual_end_date: Joi.date().optional().allow(null),
+    termination_reason: Joi.string().max(2000).optional().allow('', null),
+    rotation_status: Joi.string().valid('scheduled', 'active', 'completed', 'extended', 'terminated_early', 'cancelled').optional(),
     rotation_category: Joi.string().valid('clinical_rotation', 'elective_rotation', 'research_block', 'administrative_duty').optional(),
     supervising_attending_id: Joi.string().uuid().optional(),
     clinical_notes: Joi.string().optional().allow(''),
     supervisor_evaluation: Joi.string().optional().allow(''),
     goals: Joi.string().optional().allow(''),
-    notes: Joi.string().optional().allow('')
+    notes: Joi.string().optional().allow(''),
+    decision_override: Joi.object({ accepted: Joi.boolean().valid(true).required(), reason: Joi.string().trim().min(8).max(2000).required(), review_contract: Joi.string().optional(), finding_codes: Joi.array().items(Joi.string()).optional() }).optional()
   }).min(1),
 
   onCall: Joi.object({
@@ -434,6 +450,8 @@ const schemas = {
     absence_reason: Joi.string().valid('vacation', 'conference', 'sick_leave', 'training', 'personal', 'other').required(),
     start_date: Joi.date().required(),
     end_date: Joi.date().required(),
+    actual_start_date: Joi.date().optional().allow(null),
+    actual_return_date: Joi.date().optional().allow(null),
     coverage_arranged: Joi.boolean().default(false),
     covering_staff_id: Joi.string().uuid().optional().allow(null),
     coverage_notes: Joi.string().optional().allow(''),
@@ -445,6 +463,8 @@ const schemas = {
     absence_reason: Joi.string().valid('vacation', 'conference', 'sick_leave', 'training', 'personal', 'other').optional(),
     start_date: Joi.date().optional(),
     end_date: Joi.date().optional(),
+    actual_start_date: Joi.date().optional().allow(null),
+    actual_return_date: Joi.date().optional().allow(null),
     coverage_arranged: Joi.boolean().optional(),
     covering_staff_id: Joi.string().uuid().optional().allow(null),
     coverage_notes: Joi.string().optional().allow(''),
@@ -1900,12 +1920,13 @@ app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
         supervising_attending:medical_staff!resident_rotations_supervising_attending_id_fkey(full_name, professional_email),
         training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name, unit_code)
       `, { count: 'exact' });
+    query = query.is('deleted_at', null);
     if (resident_id) query = query.eq('resident_id', resident_id);
     // Exclude terminated_early by default; pass ?rotation_status=terminated_early to retrieve them
     if (rotation_status) {
       query = query.eq('rotation_status', rotation_status);
     } else {
-      query = query.neq('rotation_status', 'terminated_early');
+      query = query.not('rotation_status', 'in', '(terminated_early,cancelled)');
     }
     if (training_unit_id) query = query.eq('training_unit_id', training_unit_id);
     if (start_date) query = query.gte('start_date', start_date);
@@ -2090,6 +2111,89 @@ app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {
 });
 
 
+// ============ PHASE 5.1 · OPERATIONAL DECISION INTELLIGENCE ============
+// The decision engine is shared with the browser/Grounded surface. The backend
+// always rebuilds the review from authoritative records immediately before a write.
+const canOverrideRotationDecision = async (req) => {
+  if (!req?.user?.id) return false;
+  const { data:user } = await supabase.from('app_users').select('admin_level,user_role').eq('id', req.user.id).maybeSingle();
+  if ((user?.admin_level ?? 0) >= 1 || user?.user_role === 'system_admin') return true;
+  const { data:perm } = await supabase.from('user_permissions').select('can_write').eq('user_id', req.user.id).eq('module','rotation_exceptions').maybeSingle();
+  return perm?.can_write === true;
+};
+
+const loadRotationDecisionState = async ({residentId,unitId,supervisorId,start,end,excludeId=null}) => {
+  const ids=[residentId,supervisorId].filter(Boolean);
+  const [staffR, unitR, rotationsR, absencesR, oncallR] = await Promise.all([
+    ids.length ? supabase.from('medical_staff').select('id,full_name,staff_type,employment_status,can_supervise_residents').in('id',ids) : Promise.resolve({data:[]}),
+    unitId ? supabase.from('training_units').select('id,unit_name,unit_status,maximum_residents,department_id').eq('id',unitId).maybeSingle() : Promise.resolve({data:null}),
+    supabase.from('resident_rotations').select('id,resident_id,training_unit_id,supervising_attending_id,start_date,end_date,actual_start_date,actual_end_date,rotation_status,rotation_category,training_unit:training_units(unit_name)').in('rotation_status',['scheduled','active','extended']).lte('start_date',end).gte('end_date',start),
+    ids.length ? supabase.from('staff_absence_records').select('id,staff_member_id,start_date,end_date,actual_start_date,actual_return_date,current_status,absence_reason,absence_type').in('staff_member_id',ids).neq('current_status','cancelled').lte('start_date',end).gte('end_date',start) : Promise.resolve({data:[]}),
+    residentId ? supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,duty_date,shift_type').or(`primary_physician_id.eq.${residentId},backup_physician_id.eq.${residentId}`).gte('duty_date',start).lte('duty_date',end).is('deleted_at',null) : Promise.resolve({data:[]})
+  ]);
+  for (const r of [staffR,unitR,rotationsR,absencesR,oncallR]) if (r?.error) throw r.error;
+  const staff=staffR.data||[];
+  return {
+    resident: staff.find(x=>String(x.id)===String(residentId))||null,
+    supervisor: staff.find(x=>String(x.id)===String(supervisorId))||null,
+    unit: unitR.data||null,
+    rotations:(rotationsR.data||[]).filter(r=>!excludeId||String(r.id)!==String(excludeId)),
+    absences:absencesR.data||[],
+    oncall:oncallR.data||[]
+  };
+};
+
+const buildRotationDecision = async (payload, {excludeId=null,action='assign'}={}) => {
+  const start=formatDate(payload.start_date), end=formatDate(payload.end_date);
+  const state=await loadRotationDecisionState({residentId:payload.resident_id,unitId:payload.training_unit_id,supervisorId:payload.supervising_attending_id,start,end,excludeId});
+  return Decision51.reviewRotation({
+    proposal:{residentId:payload.resident_id,unitId:payload.training_unit_id,supervisorId:payload.supervising_attending_id,start,end,excludeId,category:payload.rotation_category||'clinical_rotation'},
+    ...state, action,
+    sourceState:{staff:'authoritative',units:'authoritative',rotations:'authoritative',leave:'authoritative',oncall:'authoritative'}
+  });
+};
+
+const recordDecisionEvent = async ({decision,req,action,recordId=null,status='reviewed',override=null}) => {
+  try {
+    const { data, error } = await supabase.from('operational_decision_events').insert({
+      domain:'resident_rotations', action, subject_type:'medical_staff', subject_id:decision?.proposal?.residentId||null,
+      proposed_state:decision?.proposal||{}, findings:decision?.findings||[], decision:decision?.decision||'pass',
+      review_contract:decision?.contract||null, override_required:!!decision?.requiresOverride,
+      override_used:!!override, override_reason:override?.reason||null, override_by:override?req?.user?.id:null,
+      override_at:override?new Date().toISOString():null, committed_record_id:recordId,
+      event_status:status, created_by:req?.user?.id||null, created_at:new Date().toISOString(), committed_at:recordId?new Date().toISOString():null
+    }).select('id').single();
+    if(error) throw error;
+    return data?.id||null;
+  } catch(e) { console.warn('[Decision51] event audit failed:',e.message); return null; }
+};
+
+const enforceRotationDecision = async ({decision,override,req,action}) => {
+  if(!decision.canCommit){
+    await recordDecisionEvent({decision,req,action,status:'blocked'});
+    return {ok:false,status:409,body:{error:'Rotation blocked',code:'ROTATION_DECISION_BLOCKED',message:'A non-overridable rotation constraint must be resolved before this assignment can be saved.',decision}};
+  }
+  if(decision.requiresOverride){
+    const allowed=await canOverrideRotationDecision(req);
+    if(!override?.accepted){
+      await recordDecisionEvent({decision,req,action,status:'exception_required'});
+      return {ok:false,status:409,body:{error:'Exception approval required',code:'ROTATION_OVERRIDE_REQUIRED',message:'This rotation can continue only with an authorised exception and recorded reason.',override_allowed:allowed,decision}};
+    }
+    if(!allowed) return {ok:false,status:403,body:{error:'Exception approval required',code:'ROTATION_OVERRIDE_NOT_AUTHORIZED',message:'You can edit rotations but do not have permission to approve rotation exceptions.',decision}};
+    if(!override.reason || String(override.reason).trim().length<8) return {ok:false,status:400,body:{error:'Override reason required',code:'ROTATION_OVERRIDE_REASON_REQUIRED',message:'Record a short reason for continuing with this exception.',decision}};
+  }
+  return {ok:true,override:decision.requiresOverride?override:null};
+};
+
+app.post('/api/rotations/review', authenticateToken, checkPermission('resident_rotations','create'), async (req,res)=>{
+  try{
+    const b=req.body||{}; const start=formatDate(b.start_date),end=formatDate(b.end_date);
+    if(!b.resident_id||!b.training_unit_id||!b.supervising_attending_id||!start||!end) return res.status(400).json({error:'Incomplete review request',message:'Resident, unit, supervisor, start and end are required.'});
+    const decision=await buildRotationDecision({...b,start_date:start,end_date:end},{excludeId:b.exclude_id||null,action:b.exclude_id?'update':'assign'});
+    const override_allowed=await canOverrideRotationDecision(req);
+    res.json({success:true,decision,override_allowed});
+  }catch(e){console.error('[Decision51] review failed',e);res.status(500).json({error:'Decision review failed',message:e.message});}
+});
 
 app.post('/api/rotations', authenticateToken, checkPermission('resident_rotations', 'create'), validate(schemas.rotation), async (req, res) => {
   try {
@@ -2098,13 +2202,29 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
     // FIX 1: Joi.date() turns strings into Date objects. Use formatDate() which handles both.
     const startDate = formatDate(dataSource.start_date);
     const endDate   = formatDate(dataSource.end_date);
+    const actualStartDate = dataSource.actual_start_date ? formatDate(dataSource.actual_start_date) : null;
+    const actualEndDate   = dataSource.actual_end_date ? formatDate(dataSource.actual_end_date) : null;
 
-    if (!startDate || !endDate) {
-      return res.status(400).json({ error: 'Invalid date format', message: 'start_date and end_date must be valid dates' });
+    if (!startDate || !endDate || endDate < startDate) {
+      return res.status(400).json({ error: 'Invalid date format', message: 'start_date and end_date must define a valid rotation window' });
+    }
+    if (actualEndDate && actualEndDate < (actualStartDate || startDate)) {
+      return res.status(400).json({ error: 'Invalid actual date window', message: 'actual_end_date cannot be before the effective rotation start' });
+    }
+    if ((dataSource.rotation_status === 'terminated_early') && actualEndDate && actualEndDate > endDate) {
+      return res.status(400).json({ error:'Invalid early termination date', message:'An early termination date cannot be later than the planned rotation end.' });
     }
 
-    console.log('Creating rotation with dates:', { startDate, endDate });
+    const decision = await buildRotationDecision({ ...dataSource, start_date:startDate, end_date:endDate }, { action:'assign' });
+    const enforcement = await enforceRotationDecision({ decision, override:dataSource.decision_override, req, action:'assign' });
+    if (!enforcement.ok) return res.status(enforcement.status).json(enforcement.body);
 
+    console.log('Creating rotation with dates:', { startDate, endDate, actualStartDate, actualEndDate, decision:decision.decision });
+
+    // Phase 5.1: resident overlap and capacity are no longer separate binary checks here.
+    // The shared Decision51 review above classifies overlap as a hard invariant and
+    // configured capacity as an explainable warning that may require an authorised exception.
+    /* legacy checks removed
     // Overlap check
     // FIX: Only 'scheduled', 'active', 'extended' are truly blocking — completed/terminated/cancelled are not
     const { data: existingRotations, error: checkError } = await supabase.from('resident_rotations')
@@ -2141,11 +2261,27 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
         });
       }
     }
+    */
 
+    // Temporal state is derived for ordinary scheduled/active records so UI and
+    // Grounded cannot disagree about a rotation that already started or ended.
+    // Explicit historical/terminal states remain deliberate inputs.
+    const today = formatDate(new Date());
+    let rotationStatus = dataSource.rotation_status || 'scheduled';
+    if (['scheduled','active'].includes(rotationStatus)) {
+      rotationStatus = startDate > today ? 'scheduled' : (endDate < today ? 'completed' : 'active');
+    }
+
+    const { decision_override: _decisionOverride, ...persistedSource } = dataSource;
     const rotationData = {
-      ...dataSource,
+      ...persistedSource,
       start_date: startDate,
       end_date: endDate,
+      actual_start_date: actualStartDate,
+      actual_end_date: actualEndDate,
+      rotation_status: rotationStatus,
+      termination_recorded_at: rotationStatus === 'terminated_early' ? new Date().toISOString() : null,
+      termination_reason: dataSource.termination_reason || null,
       rotation_id: dataSource.rotation_id || generateId('ROT'),
       clinical_notes: dataSource.clinical_notes || '',
       supervisor_evaluation: dataSource.supervisor_evaluation || '',
@@ -2155,21 +2291,10 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
       updated_at: new Date().toISOString()
     };
 
-    // Auto-fill supervisor from unit default if not explicitly provided
-    if (!rotationData.supervising_attending_id && unitForCap) {
-      const { data: unitFull } = await supabase
-        .from('training_units')
-        .select('default_supervisor_id')
-        .eq('id', dataSource.training_unit_id)
-        .single();
-      if (unitFull?.default_supervisor_id) {
-        rotationData.supervising_attending_id = unitFull.default_supervisor_id;
-      }
-    }
-
     const { data, error } = await supabase.from('resident_rotations').insert([rotationData]).select().single();
     if (error) throw error;
-    res.status(201).json(data);
+    const decisionEventId = await recordDecisionEvent({decision,req,action:'assign',recordId:data.id,status:'committed',override:enforcement.override});
+    res.status(201).json({...data, decision_event_id:decisionEventId, decision_review:decision});
   } catch (error) {
     console.error('Failed to create rotation:', error);
     // DB trigger check_no_overlapping_rotations raises a clear message — surface it as a
@@ -2182,55 +2307,109 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
   }
 });
 
-// FIX 1: PUT /api/rotations/:id — same formatDate() fix
+// Phase 5.0: PUT /api/rotations/:id — temporal-integrity aware partial update.
+// start_date/end_date remain the planned window. actual_* dates are separate evidence.
 app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotations', 'update'), validate(schemas.rotationUpdate), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
-
-    // FIX 1: Joi.date() gives Date objects — use formatDate() not .split()
-    const startDate = formatDate(dataSource.start_date);
-    const endDate   = formatDate(dataSource.end_date);
-
-    if (!startDate || !endDate) {
-      return res.status(400).json({ error: 'Invalid date format', message: 'start_date and end_date must be valid dates' });
+    const { data: currentRecord, error: fetchError } = await supabase.from('resident_rotations').select('*').eq('id', req.params.id).single();
+    if (fetchError) {
+      if (fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Rotation not found' });
+      throw fetchError;
     }
 
+    // Merge partial updates with the persisted planned window; never require callers
+    // changing only one boundary to resend the other boundary.
+    const startDate = dataSource.start_date !== undefined ? formatDate(dataSource.start_date) : formatDate(currentRecord.start_date);
+    const endDate   = dataSource.end_date !== undefined ? formatDate(dataSource.end_date) : formatDate(currentRecord.end_date);
+    let actualStartDate = dataSource.actual_start_date !== undefined
+      ? (dataSource.actual_start_date ? formatDate(dataSource.actual_start_date) : null)
+      : (currentRecord.actual_start_date ? formatDate(currentRecord.actual_start_date) : null);
+    let actualEndDate = dataSource.actual_end_date !== undefined
+      ? (dataSource.actual_end_date ? formatDate(dataSource.actual_end_date) : null)
+      : (currentRecord.actual_end_date ? formatDate(currentRecord.actual_end_date) : null);
+
+    if (!startDate || !endDate || endDate < startDate) {
+      return res.status(400).json({ error: 'Invalid date window', message: 'The planned rotation end cannot be before its start.' });
+    }
+
+    const nextStatus = dataSource.rotation_status || currentRecord.rotation_status;
+    const nowIso = new Date().toISOString();
+    let terminationRecordedAt = currentRecord.termination_recorded_at || null;
+    let terminationReason = dataSource.termination_reason !== undefined ? (dataSource.termination_reason || null) : (currentRecord.termination_reason || null);
+
+    // Generic status edits must never invent an effective end date. Lifecycle actions
+    // that mean "end now" use DELETE /api/rotations/:id, which records today
+    // explicitly. Retroactive/historical termination through PUT must carry the
+    // actual end date supplied by the user. Legacy records remain NULL until reviewed.
+    if (nextStatus === 'terminated_early' && currentRecord.rotation_status !== 'terminated_early') {
+      if (!actualEndDate) {
+        return res.status(400).json({ error:'Actual end date required', message:'Recording an early termination requires the date the rotation actually ended.' });
+      }
+      terminationRecordedAt = nowIso;
+    }
+    if (actualEndDate && actualEndDate < (actualStartDate || startDate)) {
+      return res.status(400).json({ error: 'Invalid actual date window', message: 'The actual rotation end cannot be before the effective rotation start.' });
+    }
+    if (nextStatus === 'terminated_early' && actualEndDate && actualEndDate > endDate) {
+      return res.status(400).json({ error:'Invalid early termination date', message:'An early termination date cannot be later than the planned rotation end.' });
+    }
+
+    let decision = null, enforcement = {ok:true,override:null};
+    const schedulingFields = ['resident_id','training_unit_id','supervising_attending_id','start_date','end_date','rotation_category'];
+    const needsDecision = ['scheduled','active','extended'].includes(nextStatus) && schedulingFields.some(k => dataSource[k] !== undefined);
+    if (needsDecision) {
+      const reviewPayload = {
+        resident_id: dataSource.resident_id || currentRecord.resident_id,
+        training_unit_id: dataSource.training_unit_id || currentRecord.training_unit_id,
+        supervising_attending_id: dataSource.supervising_attending_id || currentRecord.supervising_attending_id,
+        start_date: startDate, end_date: endDate,
+        rotation_category: dataSource.rotation_category || currentRecord.rotation_category || 'clinical_rotation'
+      };
+      decision = await buildRotationDecision(reviewPayload,{excludeId:req.params.id,action:'update'});
+      enforcement = await enforceRotationDecision({decision,override:dataSource.decision_override,req,action:'update'});
+      if (!enforcement.ok) return res.status(enforcement.status).json(enforcement.body);
+    }
+
+    const { decision_override: _decisionOverride, ...persistedChanges } = dataSource;
     const rotationData = {
-      ...dataSource,
+      ...persistedChanges,
       start_date: startDate,
       end_date: endDate,
-      clinical_notes: dataSource.clinical_notes || '',
-      supervisor_evaluation: dataSource.supervisor_evaluation || '',
-      goals: dataSource.goals || '',
-      notes: dataSource.notes || '',
-      updated_at: new Date().toISOString()
+      actual_start_date: actualStartDate,
+      actual_end_date: actualEndDate,
+      termination_recorded_at: terminationRecordedAt,
+      termination_reason: terminationReason,
+      clinical_notes: dataSource.clinical_notes !== undefined ? (dataSource.clinical_notes || '') : (currentRecord.clinical_notes || ''),
+      supervisor_evaluation: dataSource.supervisor_evaluation !== undefined ? (dataSource.supervisor_evaluation || '') : (currentRecord.supervisor_evaluation || ''),
+      goals: dataSource.goals !== undefined ? (dataSource.goals || '') : (currentRecord.goals || ''),
+      notes: dataSource.notes !== undefined ? (dataSource.notes || '') : (currentRecord.notes || ''),
+      updated_at: nowIso
     };
 
     const { data, error } = await supabase.from('resident_rotations').update(rotationData).eq('id', req.params.id).select().single();
-    if (error) {
-      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Rotation not found' });
-      throw error;
-    }
+    if (error) throw error;
 
     // ── NOTIFICATION: Rotation ending soon with no successor scheduled ───
     try {
-      const endDate = new Date(rotationData.end_date + 'T00:00:00');
-      const today   = new Date(); today.setHours(0,0,0,0);
-      const daysLeft = Math.round((endDate - today) / 86400000);
-      if (daysLeft >= 0 && daysLeft <= 7) {
-        // Check if a replacement rotation exists for this unit after end_date
+      const effectivePlannedEnd = new Date(rotationData.end_date + 'T00:00:00');
+      const today = new Date(); today.setHours(0,0,0,0);
+      const daysLeft = Math.round((effectivePlannedEnd - today) / 86400000);
+      if (nextStatus !== 'terminated_early' && daysLeft >= 0 && daysLeft <= 7) {
         const { data: nextRots } = await supabase.from('resident_rotations')
-          .select('id').eq('training_unit_id', rotationData.training_unit_id)
+          .select('id').eq('training_unit_id', rotationData.training_unit_id || currentRecord.training_unit_id)
           .in('rotation_status', ['scheduled','active'])
           .gte('start_date', rotationData.end_date).limit(1);
         if (!nextRots || nextRots.length === 0) {
-          const resName = await getPhysicianName(rotationData.resident_id);
-          const { data: unit } = await supabase.from('training_units').select('unit_name').eq('id', rotationData.training_unit_id).single();
+          const residentId = rotationData.resident_id || currentRecord.resident_id;
+          const unitId = rotationData.training_unit_id || currentRecord.training_unit_id;
+          const resName = await getPhysicianName(residentId);
+          const { data: unit } = await supabase.from('training_units').select('unit_name').eq('id', unitId).single();
           const unitName = unit?.unit_name || 'Unknown unit';
           sendNotification(
             `Rotation ending soon — no successor: ${unitName}`,
             `<h2 style="margin:0 0 12px;color:#0a1628">Rotation slot opening soon</h2>
-            <p style="color:#374151"><strong>${resName}</strong>'s rotation at <strong>${unitName}</strong> 
+            <p style="color:#374151"><strong>${resName}</strong>'s rotation at <strong>${unitName}</strong>
             ends on <strong>${rotationData.end_date}</strong> (${daysLeft} day${daysLeft!==1?'s':''} from today).</p>
             <p style="color:#f59e0b;font-weight:600">⚠ No successor has been scheduled for this unit.</p>
             <a href="${APP_URL}" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Assign rotation →</a>`,
@@ -2242,28 +2421,77 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
       console.error('[NOTIFY] Rotation check error:', notifErr.message);
     }
 
-    res.json(data);
+    let decisionEventId = null;
+    if (decision) decisionEventId = await recordDecisionEvent({decision,req,action:'update',recordId:data.id,status:'committed',override:enforcement.override});
+    res.json({...data, ...(decision?{decision_event_id:decisionEventId,decision_review:decision}:{})});
   } catch (error) {
     console.error('Failed to update rotation:', error);
+    const em=(error&&error.message)||'';
+    if (/overlap/i.test(em) || error?.code === 'P0001') return res.status(409).json({ error:'Scheduling conflict', message:em || 'Rotation overlaps another assignment.' });
     res.status(500).json({ error: 'Failed to update rotation', message: error.message });
   }
 });
 
+// Phase 5.0: DELETE is a lifecycle transition, not a blind status flip.
+// A future scheduled rotation is cancelled; an in-progress rotation is terminated
+// with an effective end; a completed historical record is only soft-hidden.
 app.delete('/api/rotations/:id', authenticateToken, checkPermission('resident_rotations', 'delete'), apiLimiter, async (req, res) => {
   try {
-    // Soft delete — preserve audit history by marking as terminated_early
-    const { data, error } = await supabase.from('resident_rotations')
-      .update({ rotation_status: 'terminated_early', updated_at: new Date().toISOString() })
-      .eq('id', req.params.id)
-      .select('rotation_id')
-      .single();
-    if (error) {
-      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Rotation not found' });
-      throw error;
+    const { data: currentRecord, error: fetchError } = await supabase.from('resident_rotations').select('*').eq('id', req.params.id).single();
+    if (fetchError) {
+      if (fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Rotation not found' });
+      throw fetchError;
     }
-    res.json({ message: 'Rotation terminated successfully', rotation_id: data.rotation_id });
+    const recordedAt = new Date().toISOString();
+    const today = formatDate(new Date());
+    const plannedStart = formatDate(currentRecord.start_date);
+    const plannedEnd = formatDate(currentRecord.end_date);
+    const existingStatus = currentRecord.rotation_status;
+
+    // Not started yet: cancellation is not an early termination and must not
+    // manufacture an actual_end_date before the resident ever started.
+    if (existingStatus === 'scheduled' || (plannedStart && plannedStart > today)) {
+      const { data, error } = await supabase.from('resident_rotations')
+        .update({ rotation_status:'cancelled', deleted_at:recordedAt, updated_at:recordedAt })
+        .eq('id', req.params.id)
+        .select('rotation_id, rotation_status, deleted_at')
+        .single();
+      if (error) throw error;
+      return res.json({ message:'Scheduled rotation cancelled successfully', ...data });
+    }
+
+    // Completed/previously terminal records are historical evidence. "Remove"
+    // hides them from operational lists without rewriting what happened.
+    if (['completed','terminated_early','cancelled'].includes(existingStatus) || (plannedEnd && plannedEnd < today)) {
+      const { data, error } = await supabase.from('resident_rotations')
+        .update({ deleted_at:recordedAt, updated_at:recordedAt })
+        .eq('id', req.params.id)
+        .select('rotation_id, rotation_status, deleted_at, actual_end_date')
+        .single();
+      if (error) throw error;
+      return res.json({ message:'Rotation record hidden from operational lists; history preserved', ...data });
+    }
+
+    const actualEndDate = req.body?.actual_end_date ? formatDate(req.body.actual_end_date) : today;
+    const effectiveStart = formatDate(currentRecord.actual_start_date || currentRecord.start_date);
+    if (!actualEndDate || !effectiveStart || actualEndDate < effectiveStart) {
+      return res.status(400).json({ error:'Invalid termination date', message:'The actual end date cannot be before the rotation start.' });
+    }
+    const { data, error } = await supabase.from('resident_rotations')
+      .update({
+        rotation_status: 'terminated_early',
+        actual_end_date: actualEndDate,
+        termination_recorded_at: recordedAt,
+        termination_reason: req.body?.termination_reason || currentRecord.termination_reason || null,
+        updated_at: recordedAt
+      })
+      .eq('id', req.params.id)
+      .select('rotation_id, rotation_status, actual_end_date, termination_recorded_at')
+      .single();
+    if (error) throw error;
+    res.json({ message: 'Rotation terminated successfully', ...data });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to terminate rotation', message: error.message });
+    res.status(500).json({ error: 'Failed to update rotation lifecycle', message: error.message });
   }
 });
 
@@ -2550,26 +2778,22 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
     const dataSource = req.validatedData || req.body;
     console.log('📝 Creating absence record:', dataSource);
 
-    // FIX 1 applied: Joi.date() converts start/end to Date objects — use formatDate()
+    // Phase 5.0: planned dates and observed/effective dates are separate facts.
     const startDateStr = formatDate(dataSource.start_date);
     const endDateStr   = formatDate(dataSource.end_date);
+    const actualStartDate = dataSource.actual_start_date ? formatDate(dataSource.actual_start_date) : null;
+    const actualReturnDate = dataSource.actual_return_date ? formatDate(dataSource.actual_return_date) : null;
 
-    if (!startDateStr || !endDateStr) {
-      return res.status(400).json({ error: 'Invalid date format', message: 'start_date and end_date must be valid dates' });
+    if (!startDateStr || !endDateStr || endDateStr < startDateStr) {
+      return res.status(400).json({ error: 'Invalid date range', message: 'start_date and end_date must define a valid leave period' });
+    }
+    if (actualReturnDate && actualReturnDate < (actualStartDate || startDateStr)) {
+      return res.status(400).json({ error:'Invalid actual absence window', message:'actual_return_date cannot be before the effective absence start' });
     }
 
-    const startDate = new Date(startDateStr);
-    const endDate   = new Date(endDateStr);
-
-    if (endDate < startDate) {
-      return res.status(400).json({ error: 'Invalid date range', message: 'End date must be after start date' });
-    }
-
-    // FIX 2: Calculate total_days (NOT NULL in DB)
-    const totalDays = calculateDays(startDateStr, endDateStr);
-
-    // FIX 2: Derive current_status from dates (NOT NULL in DB)
-    const currentStatus = deriveAbsenceStatus(startDateStr, endDateStr);
+    const totalDays = calculateDays(startDateStr, endDateStr); // planned duration
+    const actualDays = actualReturnDate ? calculateDays(actualStartDate || startDateStr, actualReturnDate) : null;
+    const currentStatus = actualReturnDate ? 'returned_to_duty' : deriveAbsenceStatus(startDateStr, endDateStr);
 
     // FIX 3: recorded_by is a FK to app_users. A token id that isn't a real
     // app_users row causes a FK violation and the whole insert fails. Resolve it
@@ -2593,6 +2817,10 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
       absence_reason:       dataSource.absence_reason,
       start_date:           startDateStr,
       end_date:             endDateStr,
+      actual_start_date:    actualStartDate,
+      actual_return_date:   actualReturnDate,
+      return_recorded_at:   actualReturnDate ? new Date().toISOString() : null,
+      actual_days:          actualDays,
       total_days:           totalDays,
       current_status:       currentStatus,
       coverage_arranged:    dataSource.coverage_arranged || false,
@@ -2700,58 +2928,76 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
   }
 });
 
-// FIX 9: PUT /api/absence-records/:id — recalculates total_days and current_status on update
+// Phase 5.0: absence updates preserve the planned window and merge partial edits safely.
 app.put('/api/absence-records/:id', authenticateToken, checkPermission('staff_absence', 'update'), validate(schemas.absenceRecordUpdate), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
-
     const { data: currentRecord, error: fetchError } = await supabase.from('staff_absence_records').select('*').eq('id', req.params.id).single();
     if (fetchError) {
       if (fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Absence record not found' });
       throw fetchError;
     }
 
-    // FIX 1: formatDate handles Joi Date objects
-    const startDateStr = formatDate(dataSource.start_date);
-    const endDateStr   = formatDate(dataSource.end_date);
+    const startDateStr = dataSource.start_date !== undefined ? formatDate(dataSource.start_date) : formatDate(currentRecord.start_date);
+    const endDateStr   = dataSource.end_date !== undefined ? formatDate(dataSource.end_date) : formatDate(currentRecord.end_date);
+    const actualStartDate = dataSource.actual_start_date !== undefined
+      ? (dataSource.actual_start_date ? formatDate(dataSource.actual_start_date) : null)
+      : (currentRecord.actual_start_date ? formatDate(currentRecord.actual_start_date) : null);
+    const actualReturnDate = dataSource.actual_return_date !== undefined
+      ? (dataSource.actual_return_date ? formatDate(dataSource.actual_return_date) : null)
+      : (currentRecord.actual_return_date ? formatDate(currentRecord.actual_return_date) : null);
 
-    // FIX 9: Recalculate total_days and current_status when dates may have changed
-    const totalDays    = calculateDays(startDateStr, endDateStr);
-    const currentStatus = deriveAbsenceStatus(startDateStr, endDateStr);
+    if (!startDateStr || !endDateStr || endDateStr < startDateStr) {
+      return res.status(400).json({ error:'Invalid date range', message:'The planned leave end cannot be before its start.' });
+    }
+    if (actualReturnDate && actualReturnDate < (actualStartDate || startDateStr)) {
+      return res.status(400).json({ error:'Invalid actual absence window', message:'The actual return cannot be before the effective absence start.' });
+    }
+
+    const plannedDays = calculateDays(startDateStr, endDateStr);
+    const actualDays = actualReturnDate ? calculateDays(actualStartDate || startDateStr, actualReturnDate) : null;
+    let currentStatus;
+    if (dataSource.current_status !== undefined) currentStatus = dataSource.current_status;
+    else if (currentRecord.current_status === 'cancelled') currentStatus = 'cancelled';
+    else if (actualReturnDate) currentStatus = 'returned_to_duty';
+    else currentStatus = deriveAbsenceStatus(startDateStr, endDateStr);
 
     const updateData = {
-      staff_member_id:   dataSource.staff_member_id || currentRecord.staff_member_id,
-      absence_type:      dataSource.absence_type || currentRecord.absence_type,
-      absence_reason:    dataSource.absence_reason || currentRecord.absence_reason,
-      start_date:        startDateStr || currentRecord.start_date,
-      end_date:          endDateStr || currentRecord.end_date,
-      total_days:        totalDays,       // FIX 9
-      current_status:    currentStatus,   // FIX 9
-      coverage_arranged: dataSource.coverage_arranged,
-      covering_staff_id: dataSource.covering_staff_id || null,
-      coverage_notes:    dataSource.coverage_notes || '',
-      hod_notes:         dataSource.hod_notes || '',
-      last_updated:      new Date().toISOString()
+      staff_member_id: dataSource.staff_member_id !== undefined ? dataSource.staff_member_id : currentRecord.staff_member_id,
+      absence_type: dataSource.absence_type !== undefined ? dataSource.absence_type : currentRecord.absence_type,
+      absence_reason: dataSource.absence_reason !== undefined ? dataSource.absence_reason : currentRecord.absence_reason,
+      start_date: startDateStr,
+      end_date: endDateStr,
+      actual_start_date: actualStartDate,
+      actual_return_date: actualReturnDate,
+      return_recorded_at: currentRecord.return_recorded_at || (actualReturnDate ? new Date().toISOString() : null),
+      actual_days: actualDays,
+      total_days: plannedDays,
+      current_status: currentStatus,
+      coverage_arranged: dataSource.coverage_arranged !== undefined ? dataSource.coverage_arranged : !!currentRecord.coverage_arranged,
+      covering_staff_id: dataSource.covering_staff_id !== undefined ? (dataSource.covering_staff_id || null) : (currentRecord.covering_staff_id || null),
+      coverage_notes: dataSource.coverage_notes !== undefined ? (dataSource.coverage_notes || '') : (currentRecord.coverage_notes || ''),
+      hod_notes: dataSource.hod_notes !== undefined ? (dataSource.hod_notes || '') : (currentRecord.hod_notes || ''),
+      last_updated: new Date().toISOString()
     };
 
     const { data, error } = await supabase.from('staff_absence_records').update(updateData).eq('id', req.params.id).select().single();
     if (error) throw error;
 
-    // Audit changed fields
     const changedFields = [];
-    const fieldsToCheck = ['staff_member_id','absence_type','absence_reason','start_date','end_date','coverage_arranged','covering_staff_id','coverage_notes','hod_notes'];
+    const fieldsToCheck = ['staff_member_id','absence_type','absence_reason','start_date','end_date','actual_start_date','actual_return_date','coverage_arranged','covering_staff_id','coverage_notes','hod_notes','current_status'];
     for (const field of fieldsToCheck) {
-      if (String(currentRecord[field] || '') !== String(dataSource[field] || '')) {
-        changedFields.push({ absence_record_id: req.params.id, changed_field: field, old_value: String(currentRecord[field] || ''), new_value: String(dataSource[field] || ''), change_type: 'updated', changed_by: req.user.id || null, changed_at: new Date().toISOString() });
+      if (String(currentRecord[field] ?? '') !== String(updateData[field] ?? '')) {
+        changedFields.push({ absence_record_id:req.params.id, changed_field:field, old_value:String(currentRecord[field] ?? ''), new_value:String(updateData[field] ?? ''), change_type: field==='current_status'?'status_changed':'updated', changed_by:req.user.id||null, changed_at:new Date().toISOString() });
       }
     }
-    if (changedFields.length > 0) {
+    if (changedFields.length) {
       try { await supabase.from('absence_audit_log').insert(changedFields); } catch (e) { console.warn('Audit log failed:', e.message); }
     }
 
-    res.json({ success: true, data, message: 'Absence record updated successfully' });
+    res.json({ success:true, data, message:'Absence record updated successfully' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to update absence record', message: error.message });
+    res.status(500).json({ error:'Failed to update absence record', message:error.message });
   }
 });
 
@@ -2763,25 +3009,38 @@ app.put('/api/absence-records/:id/return', authenticateToken, checkPermission('s
       if (fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Absence record not found' });
       throw fetchError;
     }
-    if (currentRecord.current_status === 'returned_to_duty') return res.status(400).json({ error: 'Already returned', message: 'Staff has already been marked as returned' });
-    const effectiveReturnDate = return_date || formatDate(new Date());
-    const returnNoteText = `[RETURNED EARLY: ${new Date().toISOString()}] ${notes || 'Staff returned early'}`;
-    // FIX 9 applied: recalculate total_days for the new end date
-    const newTotalDays = calculateDays(currentRecord.start_date, effectiveReturnDate);
+    if (currentRecord.current_status === 'returned_to_duty' && currentRecord.actual_return_date) {
+      return res.status(400).json({ error: 'Already returned', message: 'Staff has already been marked as returned' });
+    }
+    const effectiveReturnDate = return_date ? formatDate(return_date) : formatDate(new Date());
+    const effectiveStart = currentRecord.actual_start_date || currentRecord.start_date;
+    if (!effectiveReturnDate || effectiveReturnDate < effectiveStart) {
+      return res.status(400).json({ error:'Invalid return date', message:'Return date cannot be before the effective leave start.' });
+    }
+    const recordedAt = new Date().toISOString();
+    const actualDays = calculateDays(effectiveStart, effectiveReturnDate);
+    const returnNoteText = `[RETURNED: ${recordedAt}; effective ${effectiveReturnDate}] ${notes || 'Staff returned to duty'}`;
+
+    // Critical Phase 5.0 invariant: preserve planned end_date. The observed return
+    // belongs in actual_return_date, otherwise the original plan is destroyed.
     const { data, error } = await supabase.from('staff_absence_records').update({
-      end_date: effectiveReturnDate,
-      total_days: newTotalDays,
+      actual_return_date: effectiveReturnDate,
+      return_recorded_at: recordedAt,
+      actual_days: actualDays,
       current_status: 'returned_to_duty',
       hod_notes: currentRecord.hod_notes ? `${currentRecord.hod_notes}\n${returnNoteText}` : returnNoteText,
-      last_updated: new Date().toISOString()
+      last_updated: recordedAt
     }).eq('id', req.params.id).select().single();
     if (error) throw error;
     try {
-      await supabase.from('absence_audit_log').insert({ absence_record_id: req.params.id, changed_field: 'current_status', old_value: currentRecord.current_status, new_value: 'returned_to_duty', change_type: 'status_changed', changed_by: req.user.id || null, changed_at: new Date().toISOString() });
+      await supabase.from('absence_audit_log').insert([
+        { absence_record_id:req.params.id, changed_field:'actual_return_date', old_value:String(currentRecord.actual_return_date||''), new_value:effectiveReturnDate, change_type:'updated', changed_by:req.user.id||null, changed_at:recordedAt },
+        { absence_record_id:req.params.id, changed_field:'current_status', old_value:currentRecord.current_status, new_value:'returned_to_duty', change_type:'status_changed', changed_by:req.user.id||null, changed_at:recordedAt }
+      ]);
     } catch (e) { console.warn('Audit log failed:', e.message); }
-    res.json({ success: true, data, message: 'Staff marked as returned successfully' });
+    res.json({ success:true, data, message:'Staff marked as returned successfully' });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to mark staff as returned', message: error.message });
+    res.status(500).json({ error:'Failed to mark staff as returned', message:error.message });
   }
 });
 
