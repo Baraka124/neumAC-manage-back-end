@@ -1,4 +1,5 @@
-// neumDesk V46.14 · Phase 5.2 · Leave + On-call Decision Intelligence · Production backend · 2026-09-24
+// neumDesk V46.14 · Phase 5.3E · Grounded permission-aware retrieval · Production backend · 2026-09-24
+// Stable production filename: index.js. Release identifiers live in comments, not filenames.
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
 // VERSION 6.0 - BACKEND PLAN V44 IMPLEMENTED
 // --- ORIGINAL FIXES --- 
@@ -35,6 +36,8 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const Decision51 = require('./decision51.js');
+const Authority = require('./authority.js');
+const Projection = require('./projection.js');
 require('dotenv').config();
 
 // ── Notification system (Resend API — free, no extra npm install) ────────
@@ -43,6 +46,7 @@ const NOTIFY_EMAIL  = process.env.NOTIFY_EMAIL  || '';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL    = 'neumDesk <notifications@neumac.health>';
 const APP_URL       = process.env.APP_URL || process.env.FRONTEND_URL || 'https://baraka124.github.io/neumAC-manage-Frontend-end';
+const IDENTITY_INVITES_ENABLED = String(process.env.IDENTITY_INVITES_ENABLED || 'false').toLowerCase() === 'true';
 
 async function sendNotification(subject, html, urgent = false) {
   if (!NOTIFY_EMAIL) return;  // silently skip if not configured
@@ -78,6 +82,41 @@ async function sendNotification(subject, html, urgent = false) {
     console.error('[NOTIFY] Error:', e.message);
   }
 }
+
+
+// Identity/security email transport. Unlike operational notifications, these
+// messages are sent to the account's registered email address and never to the
+// department notification mailbox. Secrets are never logged in production.
+async function sendAccountEmail(to, subject, html) {
+  if (!to) throw new Error('Recipient email is required');
+  if (!RESEND_API_KEY) {
+    if (NODE_ENV !== 'production') {
+      console.log(`[ACCOUNT EMAIL:dev] ${to} · ${subject}`);
+      return { delivered: false, mode: 'development_no_provider' };
+    }
+    throw new Error('Account email provider is not configured');
+  }
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: FROM_EMAIL,
+      to: [to],
+      subject,
+      html: `<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+        <div style="background:#0a1628;padding:16px 20px;border-radius:8px 8px 0 0">
+          <span style="color:#48cae4;font-weight:700;font-size:16px">neumDesk</span>
+          <span style="color:rgba(255,255,255,.4);font-size:12px;margin-left:8px">Secure account access</span>
+        </div>
+        <div style="background:#fff;padding:20px 24px;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px">${html}</div>
+      </div>`
+    })
+  });
+  if (!response.ok) throw new Error(`Account email failed (${response.status})`);
+  return { delivered: true, mode: 'email' };
+}
+
+const tokenDigest = (value) => crypto.createHash('sha256').update(String(value || '')).digest('hex');
 
 // Helper: get physician name from DB
 async function getPhysicianName(id) {
@@ -487,13 +526,54 @@ const schemas = {
     decision_override: Joi.object({ accepted: Joi.boolean().valid(true).required(), reason: Joi.string().trim().min(8).max(2000).required(), review_contract: Joi.string().optional(), finding_codes: Joi.array().items(Joi.string()).optional() }).optional()
   }).min(1),
 
+  // Legacy direct-create schema remains for backward compatibility while the
+  // Access & Identity Center is built. New human accounts should use the
+  // invitation lifecycle below rather than administrator-chosen passwords.
   register: Joi.object({
     email: Joi.string().email().required(),
-    password: Joi.string().min(8).required(),
+    password: Joi.string().min(10).required(),
     full_name: Joi.string().required(),
-    user_role: Joi.string().valid('system_admin', 'department_head', 'resident_manager', 'medical_resident', 'attending_physician').required(),
-    department_id: Joi.string().uuid().optional(),
-    phone_number: Joi.string().optional()
+    user_role: Joi.string().valid(
+      'system_admin', 'department_head', 'coordinator', 'clinician', 'resident',
+      'resident_manager', 'medical_resident', 'attending_physician', 'viewing_doctor'
+    ).required(),
+    department_id: Joi.string().uuid().optional().allow(null),
+    medical_staff_id: Joi.string().uuid().optional().allow(null),
+    job_title: Joi.string().max(160).optional().allow('', null),
+    phone_number: Joi.string().optional().allow('', null)
+  }),
+
+  identityInvite: Joi.object({
+    medical_staff_id: Joi.string().uuid().required(),
+    email: Joi.string().email().optional().allow('', null),
+    user_role: Joi.string().valid('system_admin', 'department_head', 'coordinator', 'clinician', 'resident').required(),
+    department_id: Joi.string().uuid().optional().allow(null),
+    reason: Joi.string().trim().max(500).optional().allow('', null)
+  }),
+
+  identityLifecycleReason: Joi.object({
+    reason: Joi.string().trim().min(5).max(1000).required()
+  }),
+
+  identityUpdate: Joi.object({
+    user_role: Joi.string().valid('system_admin', 'department_head', 'coordinator', 'clinician', 'resident').optional(),
+    medical_staff_id: Joi.string().uuid().optional().allow(null),
+    department_id: Joi.string().uuid().optional().allow(null),
+    job_title: Joi.string().max(160).optional().allow('', null)
+  }).min(1),
+
+  authorityOverride: Joi.object({
+    permission_key: Joi.string().trim().max(120).required(),
+    effect: Joi.string().valid('allow', 'deny').required(),
+    scope: Joi.string().valid('own', 'supervisees', 'unit', 'department', 'all').required(),
+    visibility: Joi.string().valid('summary', 'operational', 'full').default('full'),
+    reason: Joi.string().trim().min(8).max(1000).required(),
+    expires_at: Joi.date().iso().optional().allow(null)
+  }),
+
+  acceptInvitation: Joi.object({
+    token: Joi.string().min(20).required(),
+    new_password: Joi.string().min(10).required()
   }),
 
   userProfile: Joi.object({
@@ -506,7 +586,7 @@ const schemas = {
 
   changePassword: Joi.object({
     current_password: Joi.string().required(),
-    new_password: Joi.string().min(8).required()
+    new_password: Joi.string().min(10).required()
   }),
 
   forgotPassword: Joi.object({
@@ -515,7 +595,7 @@ const schemas = {
 
   resetPassword: Joi.object({
     token: Joi.string().required(),
-    new_password: Joi.string().min(8).required()
+    new_password: Joi.string().min(10).required()
   }),
 
   department: Joi.object({
@@ -695,18 +775,58 @@ const validate = (schema) => (req, res, next) => {
 };
 
 // ============ AUTHENTICATION MIDDLEWARE ============
-const authenticateToken = (req, res, next) => {
+// Phase 5.3B: a valid signature is no longer enough. Every protected request
+// resolves the current account lifecycle state from app_users. Suspension,
+// lock, archive, password change or explicit session revocation therefore takes
+// effect immediately instead of waiting for the JWT to expire.
+const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
   if (!token) {
     if (req.method === 'OPTIONS') return next();
     return res.status(401).json({ error: 'Authentication required', message: 'No access token provided' });
   }
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Invalid token', message: 'Access token is invalid or expired' });
-    req.user = user;
+  let decoded;
+  try {
+    decoded = jwt.verify(token, JWT_SECRET);
+  } catch {
+    return res.status(403).json({ error: 'Invalid token', message: 'Access token is invalid or expired' });
+  }
+  try {
+    const { data: identity, error } = await supabase
+      .from('app_users')
+      .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, auth_version')
+      .eq('id', decoded.id)
+      .maybeSingle();
+    if (error || !identity) return res.status(401).json({ error: 'Account unavailable', message: 'This account no longer exists' });
+    if (identity.account_status !== 'active') {
+      return res.status(403).json({
+        error: 'Account unavailable',
+        account_status: identity.account_status,
+        message: `This account is ${identity.account_status}. Contact an administrator if access should be restored.`
+      });
+    }
+    const currentVersion = Number(identity.auth_version || 1);
+    const tokenVersion = Number(decoded.auth_version || 1);
+    if (currentVersion !== tokenVersion) {
+      return res.status(401).json({ error: 'Session revoked', message: 'Your session is no longer valid. Please sign in again.' });
+    }
+    req.user = {
+      id: identity.id,
+      email: identity.email,
+      full_name: identity.full_name,
+      role: identity.user_role,
+      user_role: identity.user_role,
+      admin_level: Number(identity.admin_level || 0),
+      medical_staff_id: identity.medical_staff_id || null,
+      department_id: identity.department_id || null,
+      auth_version: currentVersion
+    };
     next();
-  });
+  } catch (e) {
+    console.error('Identity validation failed:', e.message);
+    return res.status(500).json({ error: 'Identity validation failed' });
+  }
 };
 
 // B-SEC5: /uploads served only to authenticated users — must be after authenticateToken is defined
@@ -738,15 +858,16 @@ app.use('/api', async (req, res, next) => {
   if (header?.startsWith('Bearer ')) {
     try { user = jwt.verify(header.slice(7), JWT_SECRET) } catch { /* not authenticated */ }
   }
-  if (user?.admin_level >= 1) { req.user = user; return next() }
+  if (['system_admin','department_head'].includes(Authority.normalizeRole(user?.role || user?.user_role))) { req.user = user; return next() }
   if (req.path === '/api/auth/me') return next()
   return res.status(503).json({ error: 'maintenance', message: 'System is under scheduled maintenance. Please try again shortly.' })
 })
 
-// ============ PERMISSION SYSTEM ============
-// Per-user, per-module permissions stored in user_permissions table.
-// No presets, no role inheritance — every permission is explicit.
-// admin_level on app_users controls who CAN assign permissions (not what they have).
+// ============ AUTHORITY + LEGACY PERMISSION BRIDGE ============
+// Phase 5.3C introduced the canonical Authority Resolver. Phase 5.3D adds
+// protected field projections and migrates the core Staff / Rotations / Leave /
+// On-call read paths. checkPermission(resource, action) remains only as a
+// temporary bridge for write/admin/export routes not yet migrated to action+scope rules.
 
 const loadUserPermissions = async (userId) => {
   const { data, error } = await supabase
@@ -759,15 +880,177 @@ const loadUserPermissions = async (userId) => {
   return map
 }
 
+const loadAuthorityOverrides = async (userId) => {
+  const { data, error } = await supabase
+    .from('authority_overrides')
+    .select('id, user_id, permission_key, effect, scope, visibility, reason, granted_by, expires_at, created_at, updated_at')
+    .eq('user_id', userId)
+  if (error) throw error
+  return data || []
+}
+
+const resolveRequestAuthority = async (req, permissionKey, context = {}) => {
+  if (!req.authority_overrides) req.authority_overrides = await loadAuthorityOverrides(req.user.id)
+  return Authority.resolveAuthority({
+    actor: req.user,
+    permission: permissionKey,
+    context,
+    overrides: req.authority_overrides
+  })
+}
+
+const requireAuthority = (permissionKey, contextBuilder = null, options = {}) => {
+  const allowLimited = options.allowLimited === true
+  return async (req, res, next) => {
+    if (req.method === 'OPTIONS') return next()
+    if (!req.user?.id) return res.status(401).json({ error: 'Authentication required' })
+    try {
+      const context = typeof contextBuilder === 'function'
+        ? (await contextBuilder(req))
+        : (contextBuilder || { scopes: ['all'] })
+      const authority = await resolveRequestAuthority(req, permissionKey, context)
+      req.authority = authority
+      if (authority.decision === Authority.DECISIONS.DENY) {
+        return res.status(403).json({
+          error: 'Authority denied',
+          code: 'AUTHORITY_DENIED',
+          permission: permissionKey,
+          decision: authority.decision,
+          role: authority.canonical_role,
+          source: authority.source,
+          reason: authority.reason
+        })
+      }
+      if (authority.decision === Authority.DECISIONS.ALLOW_LIMITED && !allowLimited) {
+        return res.status(403).json({
+          error: 'Limited authority requires a protected projection',
+          code: 'AUTHORITY_PROJECTION_REQUIRED',
+          permission: permissionKey,
+          decision: authority.decision,
+          visibility: authority.visibility,
+          reason: 'This route returns a full record and has not been migrated to a protected projection. Limited authority is not sufficient here.'
+        })
+      }
+      next()
+    } catch (e) {
+      console.error('Authority resolution failed:', e.message)
+      res.status(500).json({ error: 'Authority resolution failed' })
+    }
+  }
+}
+
+// ============ PHASE 5.3D · PROTECTED FIELD PROJECTIONS ============
+// Authority answers whether an actor may access a resource. Projection answers
+// which fields may leave this process. ALLOW_LIMITED is safe only when a route
+// serializes through projection.js; full database rows must never be returned.
+
+const sendAuthorityDenied = (res, permissionKey, authority) => res.status(403).json({
+  error: 'Authority denied',
+  code: 'AUTHORITY_DENIED',
+  permission: permissionKey,
+  decision: authority?.decision || Authority.DECISIONS.DENY,
+  role: authority?.canonical_role || null,
+  source: authority?.source || null,
+  reason: authority?.reason || 'Access is not allowed for this resource.'
+});
+
+const setProjectionHeaders = (res, authority, domain) => {
+  if (!authority) return;
+  res.setHeader('X-neumDesk-Authority', authority.decision || 'UNKNOWN');
+  res.setHeader('X-neumDesk-Visibility', authority.visibility || 'none');
+  if (authority.matched_scope) res.setHeader('X-neumDesk-Scope', authority.matched_scope);
+  if (domain) res.setHeader('X-neumDesk-Projection', domain);
+};
+
+const targetScopesForStaff = (req, staff) => {
+  const scopes = [];
+  const actorStaffId = req?.user?.medical_staff_id;
+  const actorDepartmentId = req?.user?.department_id;
+  if (actorStaffId && staff?.id && String(actorStaffId) === String(staff.id)) scopes.push('own');
+  if (actorDepartmentId && staff?.department_id && String(actorDepartmentId) === String(staff.department_id)) scopes.push('department');
+  return { scopes };
+};
+
+const loadStaffScopeRecord = async (staffId) => {
+  if (!staffId) return null;
+  const { data, error } = await supabase.from('medical_staff')
+    .select('id, department_id')
+    .eq('id', staffId)
+    .is('deleted_at', null)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+};
+
+const loadDepartmentStaffIds = async (departmentId) => {
+  if (!departmentId) return [];
+  const { data, error } = await supabase.from('medical_staff')
+    .select('id')
+    .eq('department_id', departmentId)
+    .is('deleted_at', null);
+  if (error) throw error;
+  return (data || []).map(row => row.id).filter(Boolean);
+};
+
+// Collection access chooses the broadest role-appropriate scope without using
+// "all" as a shortcut around an explicit departmental denial.
+const resolveCollectionAuthority = async (req, permissionKey) => {
+  const attempts = [];
+  if (req?.user?.department_id) attempts.push('department');
+  if (req?.user?.medical_staff_id) attempts.push('own');
+  attempts.push('all');
+  let last = null;
+  for (const scope of [...new Set(attempts)]) {
+    const authority = await resolveRequestAuthority(req, permissionKey, { scopes: [scope] });
+    last = authority;
+    if (authority.decision !== Authority.DECISIONS.DENY) {
+      return { authority, scope: authority.matched_scope || scope };
+    }
+    if (authority.source === 'user_override_deny') return { authority, scope };
+  }
+  return { authority: last, scope: 'none' };
+};
+
+const resolveStaffTargetAuthority = async (req, permissionKey, staff) => {
+  return resolveRequestAuthority(req, permissionKey, targetScopesForStaff(req, staff));
+};
+
+const filterRowsForCollectionScope = async (req, plan, rows, staffIdGetter) => {
+  if (!Array.isArray(rows)) return [];
+  if (plan.scope === 'all') return rows;
+  if (plan.scope === 'own') {
+    const own = req?.user?.medical_staff_id;
+    return own ? rows.filter(row => staffIdGetter(row).some(id => id && String(id) === String(own))) : [];
+  }
+  if (plan.scope === 'department') {
+    const ids = new Set((await loadDepartmentStaffIds(req?.user?.department_id)).map(String));
+    return rows.filter(row => staffIdGetter(row).some(id => id && ids.has(String(id))));
+  }
+  return [];
+};
+
+const constrainQueryByStaffScope = async (query, req, plan, fieldName) => {
+  if (plan.scope === 'all') return { query, empty: false };
+  if (plan.scope === 'own') {
+    if (!req?.user?.medical_staff_id) return { query, empty: true };
+    return { query: query.eq(fieldName, req.user.medical_staff_id), empty: false };
+  }
+  if (plan.scope === 'department') {
+    const ids = await loadDepartmentStaffIds(req?.user?.department_id);
+    if (!ids.length) return { query, empty: true };
+    return { query: query.in(fieldName, ids), empty: false };
+  }
+  return { query, empty: true };
+};
+
+// Legacy middleware retained only for routes not yet migrated to the canonical
+// resource/action/scope model. admin_level remains a temporary compatibility
+// bridge here; it is not consulted by requireAuthority().
 const checkPermission = (resource, action) => {
   return async (req, res, next) => {
     if (req.method === 'OPTIONS') return next()
     if (!req.user?.id) return res.status(401).json({ error: 'Authentication required' })
-    // Admins (admin_level >= 1) bypass module permission checks. This matches the
-    // system's intent that an administrator can operate every module, and fixes
-    // endpoints guarded by module names that don't exist in user_permissions
-    // (e.g. 'staff_absence', 'departments', 'users') which otherwise 403 everyone.
-    if ((req.user.admin_level ?? 0) >= 1) return next()
+    if (['system_admin','department_head'].includes(Authority.normalizeRole(req.user.user_role))) return next()
     if (!req.permissions) {
       try { req.permissions = await loadUserPermissions(req.user.id) }
       catch (e) { return res.status(500).json({ error: 'Could not load permissions' }) }
@@ -778,6 +1061,7 @@ const checkPermission = (resource, action) => {
     if (!allowed) {
       return res.status(403).json({
         error: 'Insufficient permissions',
+        code: 'LEGACY_PERMISSION_DENIED',
         message: `You do not have ${action} access to ${resource}`
       })
     }
@@ -785,21 +1069,111 @@ const checkPermission = (resource, action) => {
   }
 }
 
+// Legacy-only guard. Do not add this to new routes.
 const isAdmin = async (req, res, next) => {
+  // Legacy-only guard for routes not yet migrated. Canonical authority is role-
+  // based; an arbitrary admin_level value no longer creates administrator power.
   try {
     const { data } = await supabase
       .from('app_users')
-      .select('admin_level')
+      .select('user_role, admin_level')
       .eq('id', req.user.id)
       .single()
-    if (!data || data.admin_level < 1) {
+    const canonicalRole = Authority.normalizeRole(data?.user_role)
+    if (!['system_admin','department_head'].includes(canonicalRole)) {
       return res.status(403).json({ error: 'Admin access required' })
     }
-    req.user.admin_level = data.admin_level
+    req.user.user_role = data.user_role
+    req.user.role = data.user_role
+    req.user.admin_level = Number(data.admin_level || 0)
     next()
   } catch (e) {
     res.status(500).json({ error: 'Could not verify admin status' })
   }
+}
+
+// ============ IDENTITY LIFECYCLE HELPERS ============
+const ACCOUNT_STATUSES = new Set(['invited', 'active', 'suspended', 'locked', 'archived']);
+
+async function recordIdentityEvent(actorUserId, subjectUserId, eventType, reason = null, metadata = {}) {
+  try {
+    await supabase.from('identity_events').insert({
+      actor_user_id: actorUserId || null,
+      subject_user_id: subjectUserId || null,
+      event_type: eventType,
+      reason: reason || null,
+      metadata: metadata || {},
+      created_at: new Date().toISOString()
+    });
+  } catch (e) {
+    console.error('Identity event logging failed (non-fatal):', e.message);
+  }
+}
+
+async function getIdentityUser(userId) {
+  const { data, error } = await supabase.from('app_users')
+    .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, auth_version, password_hash, invited_at, activated_at, suspended_at, locked_at, archived_at')
+    .eq('id', userId).maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function ensureStaffIdentityAvailable(medicalStaffId, excludeUserId = null) {
+  if (!medicalStaffId) return null;
+  let query = supabase.from('app_users').select('id, email, account_status').eq('medical_staff_id', medicalStaffId);
+  if (excludeUserId) query = query.neq('id', excludeUserId);
+  const { data, error } = await query.limit(1);
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
+async function ensureAnotherActiveAdmin(targetUser) {
+  if (!targetUser || Authority.normalizeRole(targetUser.user_role) !== 'system_admin') return true;
+  const { data, error } = await supabase.from('app_users')
+    .select('id, user_role')
+    .eq('account_status', 'active')
+    .neq('id', targetUser.id);
+  if (error) throw error;
+  return (data || []).some(u => Authority.normalizeRole(u.user_role) === 'system_admin');
+}
+
+async function transitionIdentity(req, res, targetId, targetStatus, reason, eventType) {
+  if (!ACCOUNT_STATUSES.has(targetStatus)) return res.status(400).json({ error: 'Invalid account state' });
+  if (targetId === req.user.id && targetStatus !== 'active') {
+    return res.status(403).json({ error: 'Self-protection', message: 'You cannot suspend, lock or archive your own account.' });
+  }
+  const target = await getIdentityUser(targetId);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (['suspended', 'locked', 'archived'].includes(targetStatus)) {
+    const adminSafe = await ensureAnotherActiveAdmin(target);
+    if (!adminSafe) return res.status(409).json({ error: 'Last active administrator', message: 'Another active administrator must exist before this account can be restricted.' });
+  }
+  const now = new Date().toISOString();
+  const patch = {
+    account_status: targetStatus,
+    lifecycle_reason: reason || null,
+    updated_at: now,
+    auth_version: Number(target.auth_version || 1) + 1
+  };
+  if (targetStatus === 'suspended') { patch.suspended_at = now; patch.suspended_by = req.user.id; }
+  if (targetStatus === 'locked') { patch.locked_at = now; patch.locked_by = req.user.id; }
+  if (targetStatus === 'archived') {
+    patch.archived_at = now; patch.archived_by = req.user.id;
+    patch.invitation_token_hash = null; patch.invitation_expires_at = null;
+    patch.reset_token = null; patch.reset_token_expires_at = null;
+  }
+  if (targetStatus === 'active') {
+    patch.suspended_at = null; patch.suspended_by = null;
+    patch.locked_at = null; patch.locked_by = null;
+    patch.lifecycle_reason = null;
+  }
+  const { data, error } = await supabase.from('app_users').update(patch)
+    .eq('id', targetId)
+    .select('id, email, full_name, user_role, account_status, medical_staff_id, auth_version, updated_at')
+    .single();
+  if (error) throw error;
+  await recordIdentityEvent(req.user.id, targetId, eventType, reason, { from: target.account_status, to: targetStatus });
+  return res.json({ success: true, user: data });
 }
 
 // ============ AUDIT LOGGING ============
@@ -915,7 +1289,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
     const { data: user, error } = await supabase
       .from('app_users')
-      .select('id, email, full_name, user_role, job_title, admin_level, department_id, password_hash, account_status, medical_staff_id')
+      .select('id, email, full_name, user_role, job_title, admin_level, department_id, password_hash, account_status, medical_staff_id, auth_version, last_login_at')
       .eq('email', email.toLowerCase()).single();
 
     if (error || !user) {
@@ -923,7 +1297,11 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     }
 
     if (user.account_status !== 'active') {
-      return res.status(403).json({ error: 'Account disabled', message: 'Your account has been deactivated' });
+      return res.status(403).json({
+        error: 'Account unavailable',
+        account_status: user.account_status,
+        message: `This account is ${user.account_status}. Contact an administrator if access should be restored.`
+      });
     }
 
     const validPassword = await bcrypt.compare(password, user.password_hash || '');
@@ -947,12 +1325,24 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       linkedStaff = staffRow || null;
     }
 
+    const authVersion = Number(user.auth_version || 1);
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.user_role, full_name: user.full_name },
+      {
+        id: user.id,
+        email: user.email,
+        role: user.user_role,
+        full_name: user.full_name,
+        admin_level: Number(user.admin_level || 0),
+        medical_staff_id: user.medical_staff_id || null,
+        auth_version: authVersion
+      },
       JWT_SECRET, { expiresIn: '24h' }
     );
+    const loginAt = new Date().toISOString();
+    await supabase.from('app_users').update({ last_login_at: loginAt, updated_at: loginAt }).eq('id', user.id);
+    await recordIdentityEvent(user.id, user.id, 'login_success', null, { auth_version: authVersion });
     const { password_hash, ...userWithoutPassword } = user;
-    res.json({ token, user: { ...userWithoutPassword, permissions, linked_staff: linkedStaff }, expires_in: '24h' });
+    res.json({ token, user: { ...userWithoutPassword, auth_version: authVersion, last_login_at: loginAt, permissions, linked_staff: linkedStaff }, expires_in: '24h' });
 
   } catch (error) {
     console.error('Login error:', error);
@@ -969,7 +1359,7 @@ app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('app_users')
-      .select('id, email, full_name, user_role, job_title, admin_level, account_status, department_id, medical_staff_id')
+      .select('id, email, full_name, user_role, job_title, admin_level, account_status, department_id, medical_staff_id, auth_version, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at')
       .eq('id', req.user.id)
       .single()
     if (error || !data) return res.status(401).json({ error: 'User not found' })
@@ -989,10 +1379,10 @@ app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
   } catch (e) { res.status(401).json({ error: 'Session validation failed' }) }
 });
 
-app.post('/api/auth/register', authenticateToken, checkPermission('users', 'create'), validate(schemas.register), async (req, res) => {
+app.post('/api/auth/register', authenticateToken, requireAuthority('identity.users.manage', { scopes: ['all'] }), validate(schemas.register), async (req, res) => {
   try {
     const { email, password, ...userData } = req.validatedData || req.body;
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await bcrypt.hash(password, 12);
     const { data, error } = await supabase.from('app_users')
       .insert([{ ...userData, email: email.toLowerCase(), password_hash: passwordHash, account_status: 'active', created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
       .select('id, email, full_name, user_role, department_id').single();
@@ -1009,26 +1399,33 @@ app.post('/api/auth/register', authenticateToken, checkPermission('users', 'crea
 app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPassword), async (req, res) => {
   try {
     const { email } = req.validatedData || req.body;
-    const { data: user } = await supabase.from('app_users').select('id, email, full_name').eq('email', email.toLowerCase()).single();
+    const { data: user } = await supabase.from('app_users').select('id, email, full_name, account_status').eq('email', email.toLowerCase()).single();
     // Always return 200 — never reveal whether the email exists (prevents enumeration)
-    if (user) {
+    if (user && user.account_status === 'active') {
       const resetToken = jwt.sign({ userId: user.id, email: user.email, purpose: 'password_reset' }, JWT_SECRET, { expiresIn: '1h' });
       const tokenExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
       // Store token hash in DB so it can be invalidated after use
       await supabase.from('app_users').update({
-        reset_token: resetToken,
+        reset_token: tokenDigest(resetToken),
         reset_token_expires_at: tokenExpiry,
         updated_at: new Date().toISOString()
       }).eq('id', user.id);
       const resetLink = `${APP_URL}?reset_token=${resetToken}`;
-      await sendNotification(
-        'Password reset request — neumDesk',
-        `<h2 style="margin:0 0 12px;color:#0a1628">Password Reset</h2>
-        <p style="color:#374151">Hello <strong>${user.full_name || user.email}</strong>,</p>
-        <p style="color:#374151">A password reset was requested for your neumDesk account. Click the link below to set a new password. This link expires in <strong>1 hour</strong>.</p>
-        <a href="${resetLink}" style="display:inline-block;margin:12px 0;padding:10px 20px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px;font-weight:600">Reset my password →</a>
-        <p style="color:#9ca3af;font-size:12px;margin-top:16px">If you did not request this reset, you can safely ignore this email. Your password will not change.</p>`
-      );
+      try {
+        await sendAccountEmail(
+          user.email,
+          'Password reset request — neumDesk',
+          `<h2 style="margin:0 0 12px;color:#0a1628">Password Reset</h2>
+          <p style="color:#374151">Hello <strong>${user.full_name || user.email}</strong>,</p>
+          <p style="color:#374151">A password reset was requested for your neumDesk account. Click the link below to set a new password. This link expires in <strong>1 hour</strong>.</p>
+          <a href="${resetLink}" style="display:inline-block;margin:12px 0;padding:10px 20px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px;font-weight:600">Reset my password →</a>
+          <p style="color:#9ca3af;font-size:12px;margin-top:16px">If you did not request this reset, you can safely ignore this email. Your password will not change.</p>`
+        );
+      } catch (mailError) {
+        // Keep the public response indistinguishable whether or not the account
+        // exists or delivery succeeds. This preserves anti-enumeration behavior.
+        console.error('Password reset email delivery failed:', mailError.message);
+      }
     }
     res.json({ message: 'If an account with that email exists, a reset link has been sent.' });
   } catch (error) {
@@ -1050,20 +1447,21 @@ app.post('/api/auth/reset-password', authLimiter, validate(schemas.resetPassword
     }
     // Verify token matches what's stored (prevents token reuse after a new reset was requested)
     const { data: user } = await supabase.from('app_users')
-      .select('id, reset_token, reset_token_expires_at')
+      .select('id, reset_token, reset_token_expires_at, auth_version')
       .eq('email', decoded.email).single();
-    if (!user || user.reset_token !== token) {
+    if (!user || ![token, tokenDigest(token)].includes(user.reset_token)) {
       return res.status(400).json({ error: 'Token already used', message: 'This reset link has already been used or superseded. Please request a new one.' });
     }
     if (new Date(user.reset_token_expires_at) < new Date()) {
       return res.status(400).json({ error: 'Token expired', message: 'This reset link has expired. Please request a new one.' });
     }
-    const passwordHash = await bcrypt.hash(new_password, 10);
+    const passwordHash = await bcrypt.hash(new_password, 12);
     const { error } = await supabase.from('app_users')
       .update({
         password_hash: passwordHash,
         reset_token: null,
         reset_token_expires_at: null,
+        auth_version: Number(user.auth_version || 1) + 1,
         updated_at: new Date().toISOString()
       })
       .eq('email', decoded.email);
@@ -1076,7 +1474,7 @@ app.post('/api/auth/reset-password', authLimiter, validate(schemas.resetPassword
 
 // ===== 2b. PERMISSION MANAGEMENT =====
 // GET /api/permissions/users — list all users with their current permission tags (admin only)
-app.get('/api/permissions/users', authenticateToken, isAdmin, apiLimiter, async (req, res) => {
+app.get('/api/permissions/users', authenticateToken, requireAuthority('identity.users.view', { scopes: ['all'] }), apiLimiter, async (req, res) => {
   try {
     const { data: users, error } = await supabase
       .from('app_users')
@@ -1122,7 +1520,7 @@ app.get('/api/permissions/users', authenticateToken, isAdmin, apiLimiter, async 
 // PUT /api/permissions/:userId/:module — grant or revoke a specific module permission
 // Body: { can_read: bool, can_write: bool }
 // Constraint: admin cannot grant more than they themselves have
-app.put('/api/permissions/:userId/:module', authenticateToken, isAdmin, apiLimiter, async (req, res) => {
+app.put('/api/permissions/:userId/:module', authenticateToken, requireAuthority('identity.overrides.manage', { scopes: ['all'] }), apiLimiter, async (req, res) => {
   try {
     const { userId, module } = req.params
     const { can_read = false, can_write = false } = req.body
@@ -1139,9 +1537,9 @@ app.put('/api/permissions/:userId/:module', authenticateToken, isAdmin, apiLimit
       return res.status(403).json({ error: 'You cannot reduce your own ' + module + ' access — this would lock you out of administration. Ask another admin.' })
     }
 
-    // Safety: admin cannot grant more than they themselves have —
-    // EXCEPT a system_admin / admin_level>=1, who holds every module by role.
-    const isSuperAdmin = req.user.user_role === 'system_admin' || (req.user.admin_level ?? 0) >= 1
+    // This legacy module-permission endpoint is now callable only by a
+    // system administrator through identity.overrides.manage.
+    const isSuperAdmin = Authority.normalizeRole(req.user.user_role) === 'system_admin'
     if (!isSuperAdmin) {
       const adminPerms = await loadUserPermissions(req.user.id)
       const adminHas = adminPerms.get(module)
@@ -1178,32 +1576,373 @@ app.put('/api/permissions/:userId/:module', authenticateToken, isAdmin, apiLimit
   }
 })
 
-// PUT /api/permissions/:userId/admin — toggle admin_level (admin only, cannot self-demote)
-app.put('/api/permissions/:userId/admin-level', authenticateToken, isAdmin, apiLimiter, async (req, res) => {
+// Legacy admin_level escalation is retired in Phase 5.3C. Administrative
+// authority comes from canonical roles + explicit authority overrides, never a
+// standalone integer flag. Keep the route as an explicit compatibility error so
+// an older frontend cannot silently recreate broad access.
+app.put('/api/permissions/:userId/admin-level', authenticateToken,
+  requireAuthority('identity.users.manage', { scopes: ['all'] }), apiLimiter, async (req, res) => {
+  return res.status(410).json({
+    error: 'Legacy admin level retired',
+    code: 'LEGACY_ADMIN_LEVEL_RETIRED',
+    message: 'Change the user role or explicit authority overrides instead of admin_level.'
+  });
+});
+
+// ===== 2c. CANONICAL AUTHORITY RESOLVER (Phase 5.3C) =====
+// These endpoints expose the actor's effective policy contract and allow a
+// system administrator to maintain deliberate per-user deviations. They do not
+// replace the Access & Identity Center UI; that arrives later in the 5.3 track.
+
+async function authoritySnapshot(userId) {
+  const { data: user, error } = await supabase.from('app_users')
+    .select('id, email, full_name, user_role, account_status, medical_staff_id, department_id, job_title')
+    .eq('id', userId).maybeSingle();
+  if (error) throw error;
+  if (!user) return null;
+  const overrides = await loadAuthorityOverrides(user.id);
+  return {
+    user,
+    canonical_role: Authority.normalizeRole(user.user_role),
+    role_policy: Authority.rolePolicy(user.user_role),
+    overrides
+  };
+}
+
+app.get('/api/authority/catalog', authenticateToken, apiLimiter, async (req, res) => {
+  res.json({
+    success: true,
+    decisions: Authority.DECISIONS,
+    scopes: Authority.SCOPES.filter(s => s !== 'none'),
+    visibilities: Authority.VISIBILITIES.filter(v => v !== 'none'),
+    permissions: Authority.catalogEntries(),
+    projections: Projection.catalog()
+  });
+});
+
+app.get('/api/authority/me', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { userId } = req.params
-    const { admin_level } = req.body
-    if (userId === req.user.id) {
-      return res.status(403).json({ error: 'You cannot change your own admin level' })
-    }
-    const { error } = await supabase
-      .from('app_users')
-      .update({ admin_level: admin_level ? 1 : 0, updated_at: new Date().toISOString() })
-      .eq('id', userId)
-    if (error) throw error
-    res.json({ success: true, admin_level })
+    const snapshot = await authoritySnapshot(req.user.id);
+    if (!snapshot) return res.status(404).json({ error: 'Identity not found' });
+    res.json({ success: true, ...snapshot });
   } catch (e) {
-    res.status(500).json({ error: e.message })
+    res.status(500).json({ error: 'Failed to load authority', message: e.message });
   }
-})
+});
+
+app.get('/api/authority/users/:id', authenticateToken,
+  requireAuthority('identity.users.view', { scopes: ['all'] }), apiLimiter, async (req, res) => {
+  try {
+    const snapshot = await authoritySnapshot(req.params.id);
+    if (!snapshot) return res.status(404).json({ error: 'Identity not found' });
+    res.json({ success: true, ...snapshot });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load user authority', message: e.message });
+  }
+});
+
+app.put('/api/authority/users/:id/overrides', authenticateToken,
+  requireAuthority('identity.overrides.manage', { scopes: ['all'] }), apiLimiter,
+  validate(schemas.authorityOverride), async (req, res) => {
+  try {
+    const targetUserId = req.params.id;
+    if (targetUserId === req.user.id) {
+      return res.status(403).json({
+        error: 'Self-protection',
+        message: 'You cannot alter your own explicit authority overrides. Another system administrator must make that change.'
+      });
+    }
+    const target = await getIdentityUser(targetUserId);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    const input = req.validatedData;
+    if (!Authority.PERMISSION_CATALOG[input.permission_key]) {
+      return res.status(400).json({ error: 'Unknown permission key', permission_key: input.permission_key });
+    }
+    if (input.expires_at && new Date(input.expires_at) <= new Date()) {
+      return res.status(400).json({ error: 'Invalid expiry', message: 'expires_at must be in the future.' });
+    }
+    const now = new Date().toISOString();
+    const { data, error } = await supabase.from('authority_overrides').upsert({
+      user_id: targetUserId,
+      permission_key: input.permission_key,
+      effect: input.effect,
+      scope: input.scope,
+      visibility: input.visibility || 'full',
+      reason: input.reason,
+      granted_by: req.user.id,
+      expires_at: input.expires_at || null,
+      updated_at: now
+    }, { onConflict: 'user_id,permission_key,scope' })
+      .select('id, user_id, permission_key, effect, scope, visibility, reason, granted_by, expires_at, created_at, updated_at')
+      .single();
+    if (error) throw error;
+    await recordIdentityEvent(req.user.id, targetUserId, 'authority_override_set', input.reason, {
+      permission_key: input.permission_key,
+      effect: input.effect,
+      scope: input.scope,
+      visibility: input.visibility || 'full',
+      expires_at: input.expires_at || null
+    });
+    res.json({ success: true, override: data });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to set authority override', message: e.message });
+  }
+});
+
+app.delete('/api/authority/users/:userId/overrides/:overrideId', authenticateToken,
+  requireAuthority('identity.overrides.manage', { scopes: ['all'] }), apiLimiter, async (req, res) => {
+  try {
+    const { userId, overrideId } = req.params;
+    if (userId === req.user.id) {
+      return res.status(403).json({
+        error: 'Self-protection',
+        message: 'You cannot remove your own explicit authority overrides. Another system administrator must make that change.'
+      });
+    }
+    const { data: existing, error: fetchError } = await supabase.from('authority_overrides')
+      .select('id, user_id, permission_key, effect, scope, visibility, reason')
+      .eq('id', overrideId).eq('user_id', userId).maybeSingle();
+    if (fetchError) throw fetchError;
+    if (!existing) return res.status(404).json({ error: 'Authority override not found' });
+    const { error } = await supabase.from('authority_overrides').delete()
+      .eq('id', overrideId).eq('user_id', userId);
+    if (error) throw error;
+    await recordIdentityEvent(req.user.id, userId, 'authority_override_removed', existing.reason, {
+      permission_key: existing.permission_key,
+      effect: existing.effect,
+      scope: existing.scope,
+      visibility: existing.visibility
+    });
+    res.json({ success: true, removed: overrideId });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to remove authority override', message: e.message });
+  }
+});
+
+// ===== 2c. IDENTITY & ACCOUNT LIFECYCLE + AUTHORITY =====
+// Identity administration is enforced by the shared Authority Resolver. Core
+// operational read paths now use 5.3D protected projections; remaining legacy
+// writes continue through checkPermission until their scoped action migration.
+app.get('/api/identity/users', authenticateToken, requireAuthority('identity.users.view', { scopes: ['all'] }), apiLimiter, async (req, res) => {
+  try {
+    const { data: users, error } = await supabase.from('app_users')
+      .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, job_title, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at')
+      .order('full_name');
+    if (error) throw error;
+    const staffIds = [...new Set((users || []).map(u => u.medical_staff_id).filter(Boolean))];
+    let staffById = {};
+    if (staffIds.length) {
+      const { data: staffRows, error: staffError } = await supabase.from('medical_staff')
+        .select('id, full_name, professional_email, staff_type, specialization, employment_status, department_id')
+        .in('id', staffIds);
+      if (staffError) throw staffError;
+      staffById = Object.fromEntries((staffRows || []).map(s => [s.id, s]));
+    }
+    res.json({
+      success: true,
+      data: (users || []).map(u => ({ ...u, linked_staff: u.medical_staff_id ? (staffById[u.medical_staff_id] || null) : null }))
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load identities', message: e.message });
+  }
+});
+
+app.post('/api/identity/invitations', authenticateToken, requireAuthority('identity.users.invite', { scopes: ['all'] }), apiLimiter, validate(schemas.identityInvite), async (req, res) => {
+  try {
+    if (!IDENTITY_INVITES_ENABLED) return res.status(503).json({ error: 'Invitations not enabled', message: 'Account invitation delivery remains disabled until the invitation setup screen is deployed.' });
+    const input = req.validatedData || req.body;
+    const { data: staff, error: staffError } = await supabase.from('medical_staff')
+      .select('id, full_name, professional_email, department_id, employment_status')
+      .eq('id', input.medical_staff_id).maybeSingle();
+    if (staffError) throw staffError;
+    if (!staff) return res.status(404).json({ error: 'Staff profile not found' });
+    if (staff.employment_status && staff.employment_status !== 'active') {
+      return res.status(409).json({ error: 'Staff profile is not active', message: 'Account access should only be granted to an active staff profile.' });
+    }
+    const existingForStaff = await ensureStaffIdentityAvailable(staff.id);
+    if (existingForStaff) {
+      return res.status(409).json({
+        error: 'Identity already exists',
+        message: 'This staff profile is already linked to an account. Reactivate or manage that identity instead of creating another.',
+        existing_user: existingForStaff
+      });
+    }
+    const accountEmail = String(input.email || staff.professional_email || '').trim().toLowerCase();
+    if (!accountEmail) return res.status(400).json({ error: 'Registered email required', message: 'The staff profile has no professional email. Provide the approved account email explicitly.' });
+    const { data: emailOwner } = await supabase.from('app_users').select('id, medical_staff_id, account_status').eq('email', accountEmail).maybeSingle();
+    if (emailOwner) return res.status(409).json({ error: 'Email already registered', existing_user_id: emailOwner.id, account_status: emailOwner.account_status });
+
+    const rawToken = jwt.sign({ purpose: 'account_invitation', email: accountEmail, staff_id: staff.id }, JWT_SECRET, { expiresIn: '48h' });
+    const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+    const now = new Date().toISOString();
+    // Temporary legacy bridge until Phase 5.3C replaces admin_level with the Authority Resolver.
+    const adminLevel = ['system_admin', 'department_head'].includes(input.user_role) ? 1 : 0;
+    const { data: created, error } = await supabase.from('app_users').insert({
+      email: accountEmail,
+      full_name: staff.full_name,
+      user_role: input.user_role,
+      admin_level: adminLevel,
+      account_status: 'invited',
+      medical_staff_id: staff.id,
+      department_id: input.department_id || staff.department_id || null,
+      password_hash: null,
+      invited_at: now,
+      invited_by: req.user.id,
+      invitation_token_hash: tokenDigest(rawToken),
+      invitation_expires_at: expiresAt,
+      auth_version: 1,
+      created_at: now,
+      updated_at: now
+    }).select('id, email, full_name, user_role, account_status, medical_staff_id, invited_at, invitation_expires_at').single();
+    if (error) throw error;
+
+    let delivery = { delivered: false, mode: 'not_attempted' };
+    const inviteLink = `${APP_URL}?invite_token=${encodeURIComponent(rawToken)}`;
+    try {
+      delivery = await sendAccountEmail(accountEmail, 'Your neumDesk account invitation',
+        `<h2 style="margin:0 0 12px;color:#0a1628">Your neumDesk account</h2>
+         <p style="color:#374151">Hello <strong>${staff.full_name}</strong>,</p>
+         <p style="color:#374151">Access has been granted to your neumDesk account. Use the secure link below to choose your password. The link expires in <strong>48 hours</strong>.</p>
+         <a href="${inviteLink}" style="display:inline-block;margin:12px 0;padding:10px 20px;background:#2f80b7;color:#fff;text-decoration:none;border-radius:6px;font-size:13px;font-weight:600">Set up neumDesk access →</a>
+         <p style="color:#9ca3af;font-size:12px">If you were not expecting this invitation, contact the department administrator.</p>`);
+    } catch (mailError) {
+      delivery = { delivered: false, mode: 'delivery_failed', error: mailError.message };
+    }
+    await recordIdentityEvent(req.user.id, created.id, 'invitation_created', input.reason || null, { email: accountEmail, role: input.user_role, delivery: delivery.mode });
+    res.status(201).json({ success: true, user: created, delivery });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to create invitation', message: e.message });
+  }
+});
+
+app.post('/api/identity/users/:id/resend-invitation', authenticateToken, requireAuthority('identity.users.invite', { scopes: ['all'] }), apiLimiter, async (req, res) => {
+  try {
+    if (!IDENTITY_INVITES_ENABLED) return res.status(503).json({ error: 'Invitations not enabled', message: 'Account invitation delivery remains disabled until the invitation setup screen is deployed.' });
+    const target = await getIdentityUser(req.params.id);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (target.account_status !== 'invited') return res.status(409).json({ error: 'Account is not awaiting activation' });
+    const rawToken = jwt.sign({ purpose: 'account_invitation', userId: target.id, email: target.email, staff_id: target.medical_staff_id }, JWT_SECRET, { expiresIn: '48h' });
+    const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+    const now = new Date().toISOString();
+    const { error } = await supabase.from('app_users').update({
+      invitation_token_hash: tokenDigest(rawToken), invitation_expires_at: expiresAt,
+      invited_at: now, invited_by: req.user.id, updated_at: now,
+      auth_version: Number(target.auth_version || 1) + 1
+    }).eq('id', target.id);
+    if (error) throw error;
+    const inviteLink = `${APP_URL}?invite_token=${encodeURIComponent(rawToken)}`;
+    let delivery;
+    try {
+      delivery = await sendAccountEmail(target.email, 'Your neumDesk account invitation',
+        `<h2 style="margin:0 0 12px;color:#0a1628">Complete your neumDesk access</h2>
+         <p style="color:#374151">Hello <strong>${target.full_name}</strong>,</p>
+         <p style="color:#374151">A fresh invitation link has been issued. The previous link no longer works. This link expires in <strong>48 hours</strong>.</p>
+         <a href="${inviteLink}" style="display:inline-block;margin:12px 0;padding:10px 20px;background:#2f80b7;color:#fff;text-decoration:none;border-radius:6px;font-size:13px;font-weight:600">Set up neumDesk access →</a>`);
+    } catch (mailError) {
+      delivery = { delivered: false, mode: 'delivery_failed', error: mailError.message };
+    }
+    await recordIdentityEvent(req.user.id, target.id, 'invitation_resent', null, { delivery: delivery.mode });
+    res.json({ success: true, invitation_expires_at: expiresAt, delivery });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to resend invitation', message: e.message });
+  }
+});
+
+app.post('/api/auth/accept-invitation', authLimiter, validate(schemas.acceptInvitation), async (req, res) => {
+  try {
+    const { token, new_password } = req.validatedData || req.body;
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); }
+    catch { return res.status(400).json({ error: 'Invalid or expired invitation' }); }
+    if (decoded.purpose !== 'account_invitation') return res.status(400).json({ error: 'Invalid invitation token' });
+    let query = supabase.from('app_users')
+      .select('id, email, full_name, account_status, invitation_token_hash, invitation_expires_at, auth_version')
+      .eq('email', String(decoded.email || '').toLowerCase());
+    if (decoded.userId) query = query.eq('id', decoded.userId);
+    const { data: target, error } = await query.maybeSingle();
+    if (error) throw error;
+    if (!target || target.account_status !== 'invited') return res.status(400).json({ error: 'Invitation is no longer active' });
+    if (!target.invitation_token_hash || target.invitation_token_hash !== tokenDigest(token)) return res.status(400).json({ error: 'Invitation has been superseded' });
+    if (!target.invitation_expires_at || new Date(target.invitation_expires_at) < new Date()) return res.status(400).json({ error: 'Invitation expired' });
+    const passwordHash = await bcrypt.hash(new_password, 12);
+    const now = new Date().toISOString();
+    const { data: activated, error: updateError } = await supabase.from('app_users').update({
+      password_hash: passwordHash,
+      account_status: 'active',
+      activated_at: now,
+      invitation_token_hash: null,
+      invitation_expires_at: null,
+      lifecycle_reason: null,
+      auth_version: Number(target.auth_version || 1) + 1,
+      updated_at: now
+    }).eq('id', target.id).select('id, email, full_name, user_role, account_status, medical_staff_id, activated_at').single();
+    if (updateError) throw updateError;
+    await recordIdentityEvent(target.id, target.id, 'account_activated', null, { method: 'invitation' });
+    res.json({ success: true, message: 'Account activated. You can now sign in.', user: activated });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to activate account', message: e.message });
+  }
+});
+
+app.post('/api/identity/users/:id/suspend', authenticateToken, requireAuthority('identity.users.lifecycle', { scopes: ['all'] }), apiLimiter, validate(schemas.identityLifecycleReason), async (req, res) => {
+  try { return await transitionIdentity(req, res, req.params.id, 'suspended', req.validatedData.reason, 'account_suspended'); }
+  catch (e) { res.status(500).json({ error: 'Failed to suspend account', message: e.message }); }
+});
+app.post('/api/identity/users/:id/lock', authenticateToken, requireAuthority('identity.users.lifecycle', { scopes: ['all'] }), apiLimiter, validate(schemas.identityLifecycleReason), async (req, res) => {
+  try { return await transitionIdentity(req, res, req.params.id, 'locked', req.validatedData.reason, 'account_locked'); }
+  catch (e) { res.status(500).json({ error: 'Failed to lock account', message: e.message }); }
+});
+app.post('/api/identity/users/:id/reactivate', authenticateToken, requireAuthority('identity.users.lifecycle', { scopes: ['all'] }), apiLimiter, async (req, res) => {
+  try {
+    const target = await getIdentityUser(req.params.id);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (!['suspended', 'locked'].includes(target.account_status)) return res.status(409).json({ error: 'Only suspended or locked accounts can be reactivated' });
+    if (!target.password_hash) return res.status(409).json({ error: 'Account has no password', message: 'Resend the invitation instead.' });
+    return await transitionIdentity(req, res, req.params.id, 'active', null, 'account_reactivated');
+  } catch (e) { res.status(500).json({ error: 'Failed to reactivate account', message: e.message }); }
+});
+app.post('/api/identity/users/:id/archive', authenticateToken, requireAuthority('identity.users.lifecycle', { scopes: ['all'] }), apiLimiter, validate(schemas.identityLifecycleReason), async (req, res) => {
+  try { return await transitionIdentity(req, res, req.params.id, 'archived', req.validatedData.reason, 'account_archived'); }
+  catch (e) { res.status(500).json({ error: 'Failed to archive account', message: e.message }); }
+});
+
+app.put('/api/identity/users/:id', authenticateToken, requireAuthority('identity.users.manage', { scopes: ['all'] }), apiLimiter, validate(schemas.identityUpdate), async (req, res) => {
+  try {
+    const target = await getIdentityUser(req.params.id);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    const patch = { ...req.validatedData, updated_at: new Date().toISOString() };
+    const identityBindingChanged =
+      (Object.prototype.hasOwnProperty.call(patch, 'user_role') && patch.user_role !== target.user_role) ||
+      (Object.prototype.hasOwnProperty.call(patch, 'medical_staff_id') && patch.medical_staff_id !== target.medical_staff_id);
+    if (identityBindingChanged) patch.auth_version = Number(target.auth_version || 1) + 1;
+    if (Object.prototype.hasOwnProperty.call(patch, 'medical_staff_id') && patch.medical_staff_id) {
+      const conflict = await ensureStaffIdentityAvailable(patch.medical_staff_id, target.id);
+      if (conflict) return res.status(409).json({ error: 'Staff profile already linked', existing_user: conflict });
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'user_role')) {
+      if (target.id === req.user.id && patch.user_role !== target.user_role) return res.status(403).json({ error: 'You cannot change your own role' });
+      // Temporary legacy bridge until Phase 5.3C.
+      patch.admin_level = ['system_admin', 'department_head'].includes(patch.user_role) ? 1 : 0;
+    }
+    const { data, error } = await supabase.from('app_users').update(patch)
+      .eq('id', target.id)
+      .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, job_title, updated_at').single();
+    if (error) throw error;
+    if (patch.user_role && patch.user_role !== target.user_role) await recordIdentityEvent(req.user.id, target.id, 'role_changed', null, { from: target.user_role, to: patch.user_role });
+    if (Object.prototype.hasOwnProperty.call(patch, 'medical_staff_id') && patch.medical_staff_id !== target.medical_staff_id) await recordIdentityEvent(req.user.id, target.id, 'staff_link_changed', null, { from: target.medical_staff_id, to: patch.medical_staff_id });
+    res.json({ success: true, user: data });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to update identity', message: e.message });
+  }
+});
 
 // ===== 3. USER MANAGEMENT =====
-app.get('/api/users', authenticateToken, checkPermission('users', 'read'), apiLimiter, async (req, res) => {
+app.get('/api/users', authenticateToken, requireAuthority('identity.users.view', { scopes: ['all'] }), apiLimiter, async (req, res) => {
   try {
     const { page = 1, limit = 20, role, department_id, status } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('app_users')
-      .select('id, email, full_name, user_role, department_id, phone_number, account_status, created_at, updated_at', { count: 'exact' });
+      .select('id, email, full_name, user_role, department_id, medical_staff_id, phone_number, account_status, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at', { count: 'exact' });
     if (role) query = query.eq('user_role', role);
     if (department_id) query = query.eq('department_id', department_id);
     if (status) query = query.eq('account_status', status);
@@ -1246,12 +1985,12 @@ app.put('/api/users/profile', authenticateToken, validate(schemas.userProfile), 
 app.put('/api/users/change-password', authenticateToken, validate(schemas.changePassword), async (req, res) => {
   try {
     const { current_password, new_password } = req.validatedData || req.body;
-    const { data: user, error: fetchError } = await supabase.from('app_users').select('password_hash').eq('id', req.user.id).single();
+    const { data: user, error: fetchError } = await supabase.from('app_users').select('password_hash, auth_version').eq('id', req.user.id).single();
     if (fetchError) throw fetchError;
     const validPassword = await bcrypt.compare(current_password, user.password_hash || '');
     if (!validPassword) return res.status(401).json({ error: 'Current password is incorrect' });
-    const passwordHash = await bcrypt.hash(new_password, 10);
-    const { error } = await supabase.from('app_users').update({ password_hash: passwordHash, updated_at: new Date().toISOString() }).eq('id', req.user.id);
+    const passwordHash = await bcrypt.hash(new_password, 12);
+    const { error } = await supabase.from('app_users').update({ password_hash: passwordHash, auth_version: Number(user.auth_version || 1) + 1, updated_at: new Date().toISOString() }).eq('id', req.user.id);
     if (error) throw error;
     res.json({ message: 'Password changed successfully' });
   } catch (error) {
@@ -1259,7 +1998,7 @@ app.put('/api/users/change-password', authenticateToken, validate(schemas.change
   }
 });
 
-app.get('/api/users/:id', authenticateToken, checkPermission('users', 'read'), apiLimiter, async (req, res) => {
+app.get('/api/users/:id', authenticateToken, requireAuthority('identity.users.view', { scopes: ['all'] }), apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('app_users')
       .select('id, email, full_name, user_role, department_id, phone_number, account_status, created_at, updated_at')
@@ -1274,10 +2013,10 @@ app.get('/api/users/:id', authenticateToken, checkPermission('users', 'read'), a
   }
 });
 
-app.post('/api/users', authenticateToken, checkPermission('users', 'create'), validate(schemas.register), async (req, res) => {
+app.post('/api/users', authenticateToken, requireAuthority('identity.users.manage', { scopes: ['all'] }), validate(schemas.register), async (req, res) => {
   try {
     const { email, password, ...userData } = req.validatedData || req.body;
-    const passwordHash = await bcrypt.hash(password, 10);
+    const passwordHash = await bcrypt.hash(password, 12);
     const { data, error } = await supabase.from('app_users')
       .insert([{ ...userData, email: email.toLowerCase(), password_hash: passwordHash, account_status: 'active', created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
       .select('id, email, full_name, user_role, department_id').single();
@@ -1291,7 +2030,7 @@ app.post('/api/users', authenticateToken, checkPermission('users', 'create'), va
   }
 });
 
-app.put('/api/users/:id', authenticateToken, checkPermission('users', 'update'), validate(schemas.userProfile), async (req, res) => {
+app.put('/api/users/:id', authenticateToken, requireAuthority('identity.users.manage', { scopes: ['all'] }), validate(schemas.userProfile), async (req, res) => {
   try {
     const { data, error } = await supabase.from('app_users')
       .update({ ...(req.validatedData || req.body), updated_at: new Date().toISOString() })
@@ -1306,81 +2045,95 @@ app.put('/api/users/:id', authenticateToken, checkPermission('users', 'update'),
   }
 });
 
-app.delete('/api/users/:id', authenticateToken, checkPermission('users', 'delete'), apiLimiter, async (req, res) => {
+app.delete('/api/users/:id', authenticateToken, requireAuthority('identity.users.lifecycle', { scopes: ['all'] }), apiLimiter, async (req, res) => {
   try {
-    const { error } = await supabase.from('app_users')
-      .update({ account_status: 'inactive', updated_at: new Date().toISOString() }).eq('id', req.params.id);
-    if (error) throw error;
-    res.json({ message: 'User deactivated successfully' });
+    // Legacy compatibility route: deletion is archival, never physical deletion.
+    return await transitionIdentity(req, res, req.params.id, 'archived', 'Archived through legacy user-management endpoint', 'account_archived');
   } catch (error) {
-    res.status(500).json({ error: 'Failed to delete user', message: error.message });
+    res.status(500).json({ error: 'Failed to archive user', message: error.message });
   }
 });
 
-app.put('/api/users/:id/activate', authenticateToken, checkPermission('users', 'update'), apiLimiter, async (req, res) => {
+app.put('/api/users/:id/activate', authenticateToken, requireAuthority('identity.users.lifecycle', { scopes: ['all'] }), apiLimiter, async (req, res) => {
   try {
-    const { error } = await supabase.from('app_users').update({ account_status: 'active', updated_at: new Date().toISOString() }).eq('id', req.params.id);
-    if (error) throw error;
-    res.json({ message: 'User activated successfully' });
+    const target = await getIdentityUser(req.params.id);
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (!['suspended', 'locked'].includes(target.account_status)) return res.status(409).json({ error: 'Account cannot be activated from its current state' });
+    return await transitionIdentity(req, res, req.params.id, 'active', null, 'account_reactivated');
   } catch (error) {
     res.status(500).json({ error: 'Failed to activate user', message: error.message });
   }
 });
 
-app.put('/api/users/:id/deactivate', authenticateToken, checkPermission('users', 'update'), apiLimiter, async (req, res) => {
+app.put('/api/users/:id/deactivate', authenticateToken, requireAuthority('identity.users.lifecycle', { scopes: ['all'] }), apiLimiter, async (req, res) => {
   try {
-    const { error } = await supabase.from('app_users').update({ account_status: 'inactive', updated_at: new Date().toISOString() }).eq('id', req.params.id);
-    if (error) throw error;
-    res.json({ message: 'User deactivated successfully' });
+    return await transitionIdentity(req, res, req.params.id, 'suspended', 'Suspended through legacy user-management endpoint', 'account_suspended');
   } catch (error) {
-    res.status(500).json({ error: 'Failed to deactivate user', message: error.message });
+    res.status(500).json({ error: 'Failed to suspend user', message: error.message });
   }
 });
 
 
 
 // ===== 5. MEDICAL STAFF =====
-app.get('/api/medical-staff', authenticateToken, checkPermission('medical_staff', 'read'), apiLimiter, async (req, res) => {
+app.get('/api/medical-staff', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'staff.directory.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'staff.directory.view', plan.authority);
+
     const { search, staff_type, employment_status, department_id, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('medical_staff')
-      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)', { count: 'exact' })
-      .is('deleted_at', null);   // never return soft-deleted staff (app-wide + agent)
+      .select('*, departments!medical_staff_department_id_fkey(id, name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)', { count: 'exact' })
+      .is('deleted_at', null);
+
+    // Constrain retrieval to the authorised collection scope wherever the
+    // schema permits it. System administrators resolve to matched_scope=all.
+    if (plan.scope === 'department') query = query.eq('department_id', req.user.department_id);
+    if (plan.scope === 'own') query = query.eq('id', req.user.medical_staff_id);
+
     if (search) query = query.or(`full_name.ilike.%${search}%,staff_id.ilike.%${search}%,professional_email.ilike.%${search}%`);
     if (staff_type) query = query.eq('staff_type', staff_type);
-    // Exclude inactive by default; pass ?employment_status=inactive to retrieve them
     if (employment_status) {
-      if (employment_status === 'all') {
-        // no filter — return everyone including inactive (used for name-resolution lookups)
-      } else {
-        query = query.eq('employment_status', employment_status);
-      }
+      if (employment_status !== 'all') query = query.eq('employment_status', employment_status);
     } else {
       query = query.neq('employment_status', 'inactive');
     }
-    if (department_id) query = query.eq('department_id', department_id);
+    // A limited user cannot widen the authorised collection by supplying a
+    // different department_id query parameter.
+    if (department_id && plan.scope === 'all') query = query.eq('department_id', department_id);
+    if (department_id && plan.scope === 'department' && String(department_id) !== String(req.user.department_id)) {
+      return res.status(403).json({ error: 'Authority denied', code: 'AUTHORITY_SCOPE_MISMATCH', message: 'The requested department is outside your authorised scope.' });
+    }
+
     const { data, error, count } = await query.order('full_name').range(offset, offset + limit - 1);
     if (error) throw error;
     const transformedData = (data || []).map(item => ({
       ...item,
-      department: item.departments ? { name: item.departments.name, code: item.departments.code } : null
+      department: item.departments ? { id: item.departments.id, name: item.departments.name, code: item.departments.code } : null
     }));
-    res.json({ data: transformedData, pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
+    const projected = transformedData.map(item => Projection.projectStaff(item, plan.authority.visibility));
+    setProjectionHeaders(res, plan.authority, 'staff');
+    res.json({ data: projected, pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch medical staff', message: error.message });
   }
 });
 
-app.get('/api/medical-staff/:id', authenticateToken, checkPermission('medical_staff', 'read'), apiLimiter, async (req, res) => {
+app.get('/api/medical-staff/:id', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('medical_staff')
-      .select('*, departments!medical_staff_department_id_fkey(name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)').eq('id', req.params.id).single();
+      .select('*, departments!medical_staff_department_id_fkey(id, name, code), hospitals!medical_staff_hospital_id_fkey(id, name, code, parent_complex), home_dept:departments!medical_staff_home_department_id_fkey(id, name, code), degree:academic_degrees!medical_staff_academic_degree_id_fkey(id, name, abbreviation)')
+      .eq('id', req.params.id).is('deleted_at', null).single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Medical staff not found' });
       throw error;
     }
-    res.json({ ...data, department: data.departments ? { name: data.departments.name, code: data.departments.code } : null });
+    const authority = await resolveStaffTargetAuthority(req, 'staff.profile.view', data);
+    if (authority.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'staff.profile.view', authority);
+    const fullRecord = { ...data, department: data.departments ? { id: data.departments.id, name: data.departments.name, code: data.departments.code } : null };
+    setProjectionHeaders(res, authority, 'staff');
+    res.json(Projection.projectStaff(fullRecord, authority.visibility));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch staff details', message: error.message });
   }
@@ -1928,35 +2681,52 @@ app.delete('/api/training-units/:id', authenticateToken, checkPermission('traini
 // ===== 8. RESIDENT ROTATIONS =====
 app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'rotation.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'rotation.view', plan.authority);
+
     const { resident_id, rotation_status, training_unit_id, start_date, end_date, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('resident_rotations').select(`
-        *, resident:medical_staff!resident_rotations_resident_id_fkey(full_name, professional_email, staff_type),
-        supervising_attending:medical_staff!resident_rotations_supervising_attending_id_fkey(full_name, professional_email),
-        training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name, unit_code)
-      `, { count: 'exact' });
-    query = query.is('deleted_at', null);
-    if (resident_id) query = query.eq('resident_id', resident_id);
-    // Exclude terminated_early by default; pass ?rotation_status=terminated_early to retrieve them
-    if (rotation_status) {
-      query = query.eq('rotation_status', rotation_status);
-    } else {
-      query = query.not('rotation_status', 'in', '(terminated_early,cancelled)');
+        *, resident:medical_staff!resident_rotations_resident_id_fkey(id, full_name, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url, department_id),
+        supervising_attending:medical_staff!resident_rotations_supervising_attending_id_fkey(id, full_name, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url),
+        training_unit:training_units!resident_rotations_training_unit_id_fkey(id, unit_name, unit_code)
+      `, { count: 'exact' }).is('deleted_at', null);
+
+    if (plan.scope === 'own') query = query.eq('resident_id', req.user.medical_staff_id);
+    if (plan.scope === 'department') {
+      const departmentStaffIds = await loadDepartmentStaffIds(req.user.department_id);
+      if (!departmentStaffIds.length) {
+        setProjectionHeaders(res, plan.authority, 'rotation');
+        return res.json({ data: [], pagination: { page: parseInt(page), limit: parseInt(limit), total: 0, totalPages: 0 } });
+      }
+      query = query.in('resident_id', departmentStaffIds);
     }
+
+    if (resident_id) {
+      if (plan.scope === 'own' && String(resident_id) !== String(req.user.medical_staff_id)) {
+        return res.status(403).json({ error: 'Authority denied', code: 'AUTHORITY_SCOPE_MISMATCH', message: 'You may only view your own rotations.' });
+      }
+      if (plan.scope === 'department') {
+        const target = await loadStaffScopeRecord(resident_id);
+        if (!target || String(target.department_id || '') !== String(req.user.department_id || '')) {
+          return res.status(403).json({ error: 'Authority denied', code: 'AUTHORITY_SCOPE_MISMATCH', message: 'The requested resident is outside your authorised department scope.' });
+        }
+      }
+      query = query.eq('resident_id', resident_id);
+    }
+    if (rotation_status) query = query.eq('rotation_status', rotation_status);
+    else query = query.not('rotation_status', 'in', '(terminated_early,cancelled)');
     if (training_unit_id) query = query.eq('training_unit_id', training_unit_id);
     if (start_date) query = query.gte('start_date', start_date);
     if (end_date) query = query.lte('end_date', end_date);
+
     const { data, error, count } = await query.order('start_date', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    // Filter out orphan rotations where the resident record no longer exists
     const cleanData = (data || []).filter(item => item.resident !== null);
+    const projected = cleanData.map(item => Projection.projectRotation(item, plan.authority.visibility));
+    setProjectionHeaders(res, plan.authority, 'rotation');
     res.json({
-      data: cleanData.map(item => ({
-        ...item,
-        resident: { full_name: item.resident.full_name, professional_email: item.resident.professional_email, staff_type: item.resident.staff_type },
-        supervising_attending: item.supervising_attending ? { full_name: item.supervising_attending.full_name } : null,
-        training_unit: item.training_unit ? { unit_name: item.training_unit.unit_name, unit_code: item.training_unit.unit_code } : null
-      })),
+      data: projected,
       pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) }
     });
   } catch (error) {
@@ -1966,12 +2736,25 @@ app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
 
 app.get('/api/rotations/current', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'rotation.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'rotation.view', plan.authority);
     const today = formatDate(new Date());
-    const { data, error } = await supabase.from('resident_rotations')
-      .select('*, resident:medical_staff!resident_rotations_resident_id_fkey(full_name), training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name)')
-      .lte('start_date', today).gte('end_date', today).eq('rotation_status', 'active').order('start_date');
+    let query = supabase.from('resident_rotations')
+      .select('*, resident:medical_staff!resident_rotations_resident_id_fkey(id, full_name, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id), supervising_attending:medical_staff!resident_rotations_supervising_attending_id_fkey(id, full_name, staff_type, specialization, public_photo_url), training_unit:training_units!resident_rotations_training_unit_id_fkey(id, unit_name, unit_code)')
+      .is('deleted_at', null).lte('start_date', today).gte('end_date', today).eq('rotation_status', 'active');
+    if (plan.scope === 'own') query = query.eq('resident_id', req.user.medical_staff_id);
+    if (plan.scope === 'department') {
+      const ids = await loadDepartmentStaffIds(req.user.department_id);
+      if (!ids.length) {
+        setProjectionHeaders(res, plan.authority, 'rotation');
+        return res.json([]);
+      }
+      query = query.in('resident_id', ids);
+    }
+    const { data, error } = await query.order('start_date');
     if (error) throw error;
-    res.json(data || []);
+    setProjectionHeaders(res, plan.authority, 'rotation');
+    res.json((data || []).filter(item => item.resident !== null).map(item => Projection.projectRotation(item, plan.authority.visibility)));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch current rotations', message: error.message });
   }
@@ -1983,17 +2766,29 @@ app.get('/api/rotations/current', authenticateToken, apiLimiter, async (req, res
 // Query params: training_unit_id (required), start_date, end_date, exclude_id
 app.get('/api/rotations/availability', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'rotation.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'rotation.view', plan.authority);
+    // Capacity is a unit/department operational view. Own-only rotation access
+    // does not implicitly grant visibility into other residents' occupancy.
+    if (plan.scope === 'own') {
+      return res.status(403).json({ error: 'Authority denied', code: 'AUTHORITY_SCOPE_MISMATCH', message: 'Unit capacity requires department-level rotation visibility.' });
+    }
+
     const { training_unit_id, start_date, end_date, exclude_id } = req.query
     if (!training_unit_id) return res.status(400).json({ error: 'training_unit_id is required' })
 
-    // Fetch the unit to get its capacity
+    // Fetch the unit to get its capacity and enforce department scope.
     const { data: unit, error: unitErr } = await supabase
       .from('training_units')
-      .select('id, unit_name, maximum_residents, current_resident_count')
+      .select('id, unit_name, maximum_residents, current_resident_count, department_id')
       .eq('id', training_unit_id)
       .single()
     if (unitErr) throw unitErr
     if (!unit) return res.status(404).json({ error: 'Training unit not found' })
+    if (plan.scope === 'department' && String(unit.department_id || '') !== String(req.user.department_id || '')) {
+      return res.status(403).json({ error: 'Authority denied', code: 'AUTHORITY_SCOPE_MISMATCH', message: 'The requested unit is outside your authorised department scope.' });
+    }
+    setProjectionHeaders(res, plan.authority, 'rotation');
 
     const capacity = unit.maximum_residents || 999
 
@@ -2107,6 +2902,10 @@ app.delete('/api/training-units/:unitId/staff/:staffId', authenticateToken,
 // Which units does a staff member belong to? (used in staff profile + absence impact)
 app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {
   try {
+    const target = await loadStaffScopeRecord(req.params.id);
+    if (!target) return res.status(404).json({ error: 'Medical staff not found' });
+    const authority = await resolveStaffTargetAuthority(req, 'staff.profile.view', target);
+    if (authority.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'staff.profile.view', authority);
     const { data, error } = await supabase
       .from('unit_staff')
       .select(`
@@ -2119,6 +2918,7 @@ app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {
       .is('assigned_until', null)
       .order('role');
     if (error) throw error;
+    setProjectionHeaders(res, authority, 'staff');
     res.json({ success: true, data: data || [] });
   } catch (e) {
     res.status(500).json({ error: 'Failed to fetch staff units', message: e.message });
@@ -2703,27 +3503,34 @@ app.post('/api/oncall/review', authenticateToken, checkPermission('oncall_schedu
 // FIX 6: Duplicate on-call route block removed. Only one set of handlers here.
 app.get('/api/oncall', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'oncall.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'oncall.view', plan.authority);
+
     const { start_date, end_date, physician_id } = req.query;
+    if (physician_id) {
+      const target = await loadStaffScopeRecord(physician_id);
+      if (!target) return res.status(404).json({ error: 'Medical staff not found' });
+      if (plan.scope === 'own' && String(physician_id) !== String(req.user.medical_staff_id)) {
+        return res.status(403).json({ error: 'Authority denied', code: 'AUTHORITY_SCOPE_MISMATCH', message: 'You may only view your own on-call assignments.' });
+      }
+      if (plan.scope === 'department' && String(target.department_id || '') !== String(req.user.department_id || '')) {
+        return res.status(403).json({ error: 'Authority denied', code: 'AUTHORITY_SCOPE_MISMATCH', message: 'The requested clinician is outside your authorised department scope.' });
+      }
+    }
+
     let query = supabase.from('oncall_schedule').select(`
-        *, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name, professional_email, mobile_phone),
-        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(full_name, professional_email, mobile_phone),
+        *, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
+        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
         coverage_area:coverage_areas(id,name,code,color)
-      `).order('duty_date');
+      `).is('deleted_at', null).order('duty_date');
     if (start_date) query = query.gte('duty_date', start_date);
     if (end_date) query = query.lte('duty_date', end_date);
     if (physician_id) query = query.or(`primary_physician_id.eq.${physician_id},backup_physician_id.eq.${physician_id}`);
     const { data, error } = await query;
     if (error) throw error;
-    res.json((data || []).map(item => ({
-      id: item.id, duty_date: item.duty_date, shift_type: item.shift_type,
-      start_time: item.start_time, end_time: item.end_time,
-      primary_physician_id: item.primary_physician_id, backup_physician_id: item.backup_physician_id,
-      coverage_area_id: item.coverage_area_id || null,
-      coverage_area: item.coverage_area || null, coverage_notes: item.coverage_notes || '',
-      schedule_id: item.schedule_id, created_at: item.created_at,
-      primary_physician: item.primary_physician ? { full_name: item.primary_physician.full_name, professional_email: item.primary_physician.professional_email, mobile_phone: item.primary_physician.mobile_phone } : null,
-      backup_physician: item.backup_physician ? { full_name: item.backup_physician.full_name, professional_email: item.backup_physician.professional_email } : null
-    })));
+    const scoped = await filterRowsForCollectionScope(req, plan, data || [], row => [row.primary_physician_id, row.backup_physician_id]);
+    setProjectionHeaders(res, plan.authority, 'oncall');
+    res.json(scoped.map(item => Projection.projectOnCall(item, plan.authority.visibility)));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch on-call schedule', message: error.message });
   }
@@ -2731,13 +3538,18 @@ app.get('/api/oncall', authenticateToken, apiLimiter, async (req, res) => {
 
 app.get('/api/oncall/today', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'oncall.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'oncall.view', plan.authority);
     const today = formatDate(new Date());
     const { data, error } = await supabase.from('oncall_schedule').select(`
-        *, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name, professional_email, mobile_phone, staff_type),
-        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(full_name, professional_email, mobile_phone)
-      `).eq('duty_date', today);
+        *, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
+        backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
+        coverage_area:coverage_areas(id,name,code,color)
+      `).eq('duty_date', today).is('deleted_at', null);
     if (error) throw error;
-    res.json(data || []);
+    const scoped = await filterRowsForCollectionScope(req, plan, data || [], row => [row.primary_physician_id, row.backup_physician_id]);
+    setProjectionHeaders(res, plan.authority, 'oncall');
+    res.json(scoped.map(item => Projection.projectOnCall(item, plan.authority.visibility)));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch today\'s on-call', message: error.message });
   }
@@ -2745,13 +3557,17 @@ app.get('/api/oncall/today', authenticateToken, apiLimiter, async (req, res) => 
 
 app.get('/api/oncall/upcoming', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'oncall.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'oncall.view', plan.authority);
     const today = formatDate(new Date());
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     const { data, error } = await supabase.from('oncall_schedule')
-      .select('*, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name, professional_email)')
-      .gte('duty_date', today).lte('duty_date', nextWeek).order('duty_date');
+      .select('*, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id), backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id), coverage_area:coverage_areas(id,name,code,color)')
+      .gte('duty_date', today).lte('duty_date', nextWeek).is('deleted_at', null).order('duty_date');
     if (error) throw error;
-    res.json(data || []);
+    const scoped = await filterRowsForCollectionScope(req, plan, data || [], row => [row.primary_physician_id, row.backup_physician_id]);
+    setProjectionHeaders(res, plan.authority, 'oncall');
+    res.json(scoped.map(item => Projection.projectOnCall(item, plan.authority.visibility)));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch upcoming on-call', message: error.message });
   }
@@ -2883,32 +3699,58 @@ app.delete('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedul
 });
 
 // ===== 10. STAFF ABSENCE RECORDS =====
-app.get('/api/absence-records', authenticateToken, checkPermission('staff_absence', 'read'), apiLimiter, async (req, res) => {
+app.get('/api/absence-records', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'leave.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', plan.authority);
+
     const { staff_member_id, absence_type, current_status, start_date, end_date, coverage_arranged, absence_reason, page = 1, limit = 500 } = req.query;
     const offset = (page - 1) * limit;
+
+    if (staff_member_id) {
+      const target = await loadStaffScopeRecord(staff_member_id);
+      if (!target) return res.status(404).json({ error: 'Medical staff not found' });
+      if (plan.scope === 'own' && String(staff_member_id) !== String(req.user.medical_staff_id)) {
+        return res.status(403).json({ error: 'Authority denied', code: 'AUTHORITY_SCOPE_MISMATCH', message: 'You may only view your own leave records.' });
+      }
+      if (plan.scope === 'department' && String(target.department_id || '') !== String(req.user.department_id || '')) {
+        return res.status(403).json({ error: 'Authority denied', code: 'AUTHORITY_SCOPE_MISMATCH', message: 'The requested staff member is outside your authorised department scope.' });
+      }
+    }
+
     let query = supabase.from('staff_absence_records').select(`
-        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, professional_email, staff_type, department_id),
-        covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, professional_email),
+        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url, department_id),
+        covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url, department_id),
         recorded_by_user:app_users!staff_absence_records_recorded_by_fkey(id, full_name, email)
       `, { count: 'exact' });
+    const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
+    if (constrained.empty) {
+      setProjectionHeaders(res, plan.authority, 'leave');
+      return res.json({ success: true, data: [], pagination: { page: parseInt(page), limit: parseInt(limit), total: 0, totalPages: 0 } });
+    }
+    query = constrained.query;
+
     if (staff_member_id) query = query.eq('staff_member_id', staff_member_id);
     if (absence_type) query = query.eq('absence_type', absence_type);
-    // Exclude cancelled (soft-deleted) records by default; pass ?current_status=cancelled to retrieve them
-    if (current_status) {
-      query = query.eq('current_status', current_status);
-    } else {
-      query = query.neq('current_status', 'cancelled');
-    }
+    if (current_status) query = query.eq('current_status', current_status);
+    else query = query.neq('current_status', 'cancelled');
     if (coverage_arranged) query = query.eq('coverage_arranged', coverage_arranged === 'true');
     if (absence_reason) query = query.eq('absence_reason', absence_reason);
     if (start_date) query = query.gte('start_date', start_date);
     if (end_date) query = query.lte('end_date', end_date);
+
     const { data, error, count } = await query.order('start_date', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
+    const projected = (data || []).map(item => Projection.projectLeave({
+      ...item,
+      staff_member: item.staff_member || null,
+      covering_staff: item.covering_staff || null,
+      recorded_by: item.recorded_by_user || null
+    }, plan.authority.visibility));
+    setProjectionHeaders(res, plan.authority, 'leave');
     res.json({
       success: true,
-      data: (data || []).map(item => ({ ...item, staff_member: item.staff_member || null, covering_staff: item.covering_staff || null, recorded_by: item.recorded_by_user || null })),
+      data: projected,
       pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) }
     });
   } catch (error) {
@@ -2918,12 +3760,23 @@ app.get('/api/absence-records', authenticateToken, checkPermission('staff_absenc
 
 app.get('/api/absence-records/current', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('staff_absence_records').select(`
-        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, professional_email, staff_type),
-        covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name)
-      `).eq('current_status', 'currently_absent').order('start_date');
+    const plan = await resolveCollectionAuthority(req, 'leave.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', plan.authority);
+    let query = supabase.from('staff_absence_records').select(`
+        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
+        covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
+      `).eq('current_status', 'currently_absent');
+    const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
+    if (constrained.empty) {
+      setProjectionHeaders(res, plan.authority, 'leave');
+      return res.json({ success: true, data: [], count: 0 });
+    }
+    query = constrained.query;
+    const { data, error } = await query.order('start_date');
     if (error) throw error;
-    res.json({ success: true, data: data || [], count: data?.length || 0 });
+    const projected = (data || []).map(item => Projection.projectLeave(item, plan.authority.visibility));
+    setProjectionHeaders(res, plan.authority, 'leave');
+    res.json({ success: true, data: projected, count: projected.length });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch current absences', message: error.message });
   }
@@ -2931,28 +3784,49 @@ app.get('/api/absence-records/current', authenticateToken, apiLimiter, async (re
 
 app.get('/api/absence-records/upcoming', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'leave.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', plan.authority);
     const today = formatDate(new Date());
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
-    const { data, error } = await supabase.from('staff_absence_records').select(`
-        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, professional_email, staff_type)
-      `).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek).order('start_date');
+    let query = supabase.from('staff_absence_records').select(`
+        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
+        covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
+      `).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek);
+    const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
+    if (constrained.empty) {
+      setProjectionHeaders(res, plan.authority, 'leave');
+      return res.json({ success: true, data: [], count: 0 });
+    }
+    query = constrained.query;
+    const { data, error } = await query.order('start_date');
     if (error) throw error;
-    res.json({ success: true, data: data || [], count: data?.length || 0 });
+    const projected = (data || []).map(item => Projection.projectLeave(item, plan.authority.visibility));
+    setProjectionHeaders(res, plan.authority, 'leave');
+    res.json({ success: true, data: projected, count: projected.length });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch upcoming absences', message: error.message });
   }
 });
 
-// B4 FIX: Static sub-routes must come before /:id to avoid Express matching
-// 'staff', 'dashboard' etc. as the :id param
+// Static sub-routes remain before /:id to avoid Express matching them as IDs.
 app.get('/api/absence-records/staff/:staffId', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const target = await loadStaffScopeRecord(req.params.staffId);
+    if (!target) return res.status(404).json({ error: 'Medical staff not found' });
+    const authority = await resolveStaffTargetAuthority(req, 'leave.view', target);
+    if (authority.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', authority);
+
     const { limit = 20, page = 1 } = req.query;
     const offset = (page - 1) * limit;
-    const { data, error, count } = await supabase.from('staff_absence_records').select('*', { count: 'exact' })
+    const { data, error, count } = await supabase.from('staff_absence_records').select(`
+        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
+        covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
+      `, { count: 'exact' })
       .eq('staff_member_id', req.params.staffId).order('start_date', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
-    res.json({ success: true, data: data || [], pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
+    const projected = (data || []).map(item => Projection.projectLeave(item, authority.visibility));
+    setProjectionHeaders(res, authority, 'leave');
+    res.json({ success: true, data: projected, pagination: { page: parseInt(page), limit: parseInt(limit), total: count || 0, totalPages: Math.ceil((count || 0) / limit) } });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch staff absence history', message: error.message });
   }
@@ -2960,37 +3834,60 @@ app.get('/api/absence-records/staff/:staffId', authenticateToken, apiLimiter, as
 
 app.get('/api/absence-records/dashboard/stats', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const plan = await resolveCollectionAuthority(req, 'leave.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', plan.authority);
     const today = formatDate(new Date());
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
-    const [total, current, upcoming, withoutCoverage, byType, byReason] = await Promise.all([
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }),
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'currently_absent'),
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek),
-      supabase.from('staff_absence_records').select('*', { count: 'exact', head: true }).eq('coverage_arranged', false).eq('current_status', 'currently_absent'),
-      supabase.from('staff_absence_records').select('absence_type'),
-      supabase.from('staff_absence_records').select('absence_reason')
-    ]);
-    const typeCounts = {}, reasonCounts = {};
-    byType.data?.forEach(i => { typeCounts[i.absence_type] = (typeCounts[i.absence_type] || 0) + 1; });
-    byReason.data?.forEach(i => { reasonCounts[i.absence_reason] = (reasonCounts[i.absence_reason] || 0) + 1; });
-    res.json({ success: true, data: { total: total.count || 0, currently_absent: current.count || 0, upcoming: upcoming.count || 0, without_coverage: withoutCoverage.count || 0, by_type: typeCounts, by_reason: reasonCounts, coverage_rate: total.count ? Math.round(((total.count - withoutCoverage.count) / total.count) * 100) : 100 } });
+    let query = supabase.from('staff_absence_records')
+      .select('staff_member_id,current_status,coverage_arranged,absence_type,absence_reason,start_date');
+    const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
+    let rows = [];
+    if (!constrained.empty) {
+      const { data, error } = await constrained.query;
+      if (error) throw error;
+      rows = data || [];
+    }
+    const activeRows = rows.filter(r => r.current_status !== 'cancelled');
+    const currentRows = activeRows.filter(r => r.current_status === 'currently_absent');
+    const upcomingRows = activeRows.filter(r => r.current_status === 'planned_leave' && r.start_date >= today && r.start_date <= nextWeek);
+    const withoutCoverageRows = currentRows.filter(r => r.coverage_arranged !== true);
+    const byType = {}, byReason = {};
+    activeRows.forEach(r => {
+      if (r.absence_type) byType[r.absence_type] = (byType[r.absence_type] || 0) + 1;
+      if (r.absence_reason) byReason[r.absence_reason] = (byReason[r.absence_reason] || 0) + 1;
+    });
+    const fullStats = {
+      total: activeRows.length,
+      currently_absent: currentRows.length,
+      upcoming: upcomingRows.length,
+      without_coverage: withoutCoverageRows.length,
+      by_type: byType,
+      by_reason: byReason,
+      coverage_rate: activeRows.length ? Math.round(((activeRows.length - withoutCoverageRows.length) / activeRows.length) * 100) : 100
+    };
+    setProjectionHeaders(res, plan.authority, 'leave');
+    res.json({ success: true, data: Projection.projectLeaveStats(fullStats, plan.authority.visibility) });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch absence stats', message: error.message });
   }
 });
 
-app.get('/api/absence-records/:id', authenticateToken, checkPermission('staff_absence', 'read'), apiLimiter, async (req, res) => {
+app.get('/api/absence-records/:id', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const { data, error } = await supabase.from('staff_absence_records').select(`
-        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, professional_email, staff_type, department_id),
-        covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, professional_email),
+        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url, department_id),
+        covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url, department_id),
         recorded_by_user:app_users!staff_absence_records_recorded_by_fkey(id, full_name, email)
       `).eq('id', req.params.id).single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Absence record not found' });
       throw error;
     }
-    res.json({ success: true, data: { ...data, recorded_by: data.recorded_by_user || null } });
+    const authority = await resolveStaffTargetAuthority(req, 'leave.view', data.staff_member || { id: data.staff_member_id, department_id: null });
+    if (authority.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', authority);
+    const record = { ...data, recorded_by: data.recorded_by_user || null };
+    setProjectionHeaders(res, authority, 'leave');
+    res.json({ success: true, data: Projection.projectLeave(record, authority.visibility) });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch absence record', message: error.message });
   }
@@ -3350,10 +4247,29 @@ app.delete('/api/absence-records/:id/purge', authenticateToken, checkPermission(
   }
 });
 
-app.get('/api/absence-records/:id/audit-log', authenticateToken, checkPermission('staff_absence', 'read'), apiLimiter, async (req, res) => {
+app.get('/api/absence-records/:id/audit-log', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const { data, error } = await supabase.from('absence_audit_log').select(`*, changed_by_user:app_users!absence_audit_log_changed_by_fkey(id, full_name, email)`).eq('absence_record_id', req.params.id).order('changed_at', { ascending: false });
+    const { data: absence, error: absenceError } = await supabase.from('staff_absence_records')
+      .select('id, staff_member_id, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, department_id)')
+      .eq('id', req.params.id).maybeSingle();
+    if (absenceError) throw absenceError;
+    if (!absence) return res.status(404).json({ error: 'Absence record not found' });
+    const authority = await resolveStaffTargetAuthority(req, 'leave.view', absence.staff_member || { id: absence.staff_member_id, department_id: null });
+    if (authority.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', authority);
+    if (authority.visibility !== 'full') {
+      return res.status(403).json({
+        error: 'Full leave authority required',
+        code: 'AUTHORITY_PROJECTION_REQUIRED',
+        permission: 'leave.view',
+        visibility: authority.visibility,
+        reason: 'Leave audit history is excluded from operational and summary projections.'
+      });
+    }
+    const { data, error } = await supabase.from('absence_audit_log')
+      .select(`*, changed_by_user:app_users!absence_audit_log_changed_by_fkey(id, full_name, email)`)
+      .eq('absence_record_id', req.params.id).order('changed_at', { ascending: false });
     if (error) throw error;
+    setProjectionHeaders(res, authority, 'leave');
     res.json({ success: true, data: (data || []).map(item => ({ ...item, changed_by: item.changed_by_user || null })) });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch audit log', message: error.message });
@@ -5727,12 +6643,26 @@ app.delete('/api/academic-degrees/:id', authenticateToken, checkPermission('depa
 // GET all certificates for a staff member
 app.get('/api/medical-staff/:id/certificates', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const target = await loadStaffScopeRecord(req.params.id);
+    if (!target) return res.status(404).json({ error: 'Medical staff not found' });
+    const authority = await resolveStaffTargetAuthority(req, 'staff.profile.view', target);
+    if (authority.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'staff.profile.view', authority);
+    if (authority.visibility !== 'full') {
+      return res.status(403).json({
+        error: 'Full profile authority required',
+        code: 'AUTHORITY_PROJECTION_REQUIRED',
+        permission: 'staff.profile.view',
+        visibility: authority.visibility,
+        reason: 'Certificate details are not part of the professional summary or operational profile projection.'
+      });
+    }
     const { data, error } = await supabase
       .from('staff_certificates')
       .select('*')
       .eq('staff_id', req.params.id)
       .order('expiry_date', { ascending: true });
     if (error) throw error;
+    setProjectionHeaders(res, authority, 'staff');
     res.json(data || []);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch certificates', message: err.message });
@@ -6297,13 +7227,100 @@ app.put('/api/innovation-projects/:id/execution-clearance', authenticateToken, c
 })
 
 // ═══════════════════ GROUNDED PERSISTENCE ═══════════════════
-app.get('/api/grounded/threads', authenticateToken, async (req, res) => { try { const { data, error } = await supabase.from('grounded_threads').select('*').eq('user_id', req.user.id).order('updated_at', { ascending: false }).limit(50); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.post('/api/grounded/threads', authenticateToken, async (req, res) => { try { const { scope_type, scope_id, title } = req.body; const { data, error } = await supabase.from('grounded_threads').insert({ user_id: req.user.id, scope_type, scope_id, title }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.get('/api/grounded/threads/:id/turns', authenticateToken, async (req, res) => { try { const { data, error } = await supabase.from('grounded_turns').select('*').eq('thread_id', req.params.id).order('created_at', { ascending: true }).limit(200); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.post('/api/grounded/threads/:id/turns', authenticateToken, async (req, res) => { try { const { role, query_text, answer_type, payload, evidence } = req.body; const { data, error } = await supabase.from('grounded_turns').insert({ thread_id: req.params.id, role: role || 'user', query_text, answer_type, payload, evidence }).select().single(); if (error) throw error; await supabase.from('grounded_threads').update({ updated_at: new Date().toISOString() }).eq('id', req.params.id); res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.get('/api/grounded/watchlist', authenticateToken, async (req, res) => { try { const { data, error } = await supabase.from('grounded_watchlist').select('*').eq('user_id', req.user.id).eq('active', true); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.post('/api/grounded/watchlist', authenticateToken, async (req, res) => { try { const { object_type, object_id, rule_key, config } = req.body; const { data, error } = await supabase.from('grounded_watchlist').insert({ user_id: req.user.id, object_type, object_id, rule_key, config }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.delete('/api/grounded/watchlist/:id', authenticateToken, async (req, res) => { try { await supabase.from('grounded_watchlist').update({ active: false }).eq('id', req.params.id).eq('user_id', req.user.id); res.json({ success: true }) } catch (e) { res.status(500).json({ error: e.message }) } })
+// ===== PHASE 5.3E · GROUNDED PERMISSION-AWARE RETRIEVAL =====
+// Grounded is a consumer of the canonical authority resolver, never a bypass.
+// The browser receives only an access plan; authoritative records still come
+// from normal projected APIs, which independently enforce scope + visibility.
+const groundedAuthorityMiddleware = requireAuthority(
+  'grounded.ask',
+  async (req) => ({ scopes: req.user?.department_id ? ['department'] : (req.user?.medical_staff_id ? ['own'] : ['all']) }),
+  { allowLimited: true }
+);
+
+const groundedSourcePlan = async (req, key, permission, options = {}) => {
+  const plan = await resolveCollectionAuthority(req, permission);
+  const a = plan.authority;
+  const permitted = !!a && a.decision !== Authority.DECISIONS.DENY;
+  const projectionReady = options.projectionReady !== false && (!options.fullOnly || a?.visibility === 'full');
+  return {
+    key,
+    permission,
+    allowed: permitted,
+    available: permitted && projectionReady,
+    decision: a?.decision || Authority.DECISIONS.DENY,
+    scope: permitted ? (plan.scope || a?.matched_scope || 'none') : 'none',
+    visibility: permitted ? (a?.visibility || 'none') : 'none',
+    projection: options.projection || null,
+    projection_ready: projectionReady,
+    reason: !permitted
+      ? (a?.reason || 'The current identity is not authorised for this source.')
+      : (!projectionReady ? 'A safe projection for this access level is not available yet.' : (a?.reason || 'Authorised.'))
+  };
+};
+
+app.get('/api/grounded/access', authenticateToken, groundedAuthorityMiddleware, apiLimiter, async (req, res) => {
+  try {
+    const ask = await resolveCollectionAuthority(req, 'grounded.ask');
+    const propose = await resolveCollectionAuthority(req, 'grounded.propose');
+    const commit = await resolveCollectionAuthority(req, 'grounded.commit');
+    const rows = await Promise.all([
+      groundedSourcePlan(req, 'staff', 'staff.directory.view', { projection: 'staff' }),
+      groundedSourcePlan(req, 'oncall', 'oncall.view', { projection: 'oncall' }),
+      groundedSourcePlan(req, 'leave', 'leave.view', { projection: 'leave' }),
+      groundedSourcePlan(req, 'rotations', 'rotation.view', { projection: 'rotation' }),
+      // Unit, research and research-record endpoints are not yet protected by a
+      // dedicated 5.3D projection. Limited roles must not let Grounded fetch them.
+      groundedSourcePlan(req, 'units', 'rotation.view', { fullOnly: true }),
+      groundedSourcePlan(req, 'research', 'research.view', { fullOnly: true }),
+      groundedSourcePlan(req, 'library', 'publications.view', { fullOnly: true })
+    ]);
+    const sources = Object.fromEntries(rows.map(x => [x.key, x]));
+    res.json({
+      success: true,
+      contract: 'grounded.access.v1',
+      actor: {
+        user_id: req.user.id,
+        staff_id: req.user.medical_staff_id || null,
+        department_id: req.user.department_id || null,
+        role: Authority.normalizeRole(req.user.user_role || req.user.role)
+      },
+      ask: {
+        allowed: ask.authority?.decision !== Authority.DECISIONS.DENY,
+        decision: ask.authority?.decision || Authority.DECISIONS.DENY,
+        scope: ask.scope || 'none', visibility: ask.authority?.visibility || 'none'
+      },
+      actions: {
+        propose: { allowed: propose.authority?.decision !== Authority.DECISIONS.DENY, decision: propose.authority?.decision || Authority.DECISIONS.DENY, scope: propose.scope || 'none', visibility: propose.authority?.visibility || 'none' },
+        commit: { allowed: commit.authority?.decision !== Authority.DECISIONS.DENY, decision: commit.authority?.decision || Authority.DECISIONS.DENY, scope: commit.scope || 'none', visibility: commit.authority?.visibility || 'none' }
+      },
+      sources
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to resolve Grounded access', message: e.message });
+  }
+});
+
+const groundedOwnedThread = async (req, res, next) => {
+  try {
+    const { data, error } = await supabase.from('grounded_threads')
+      .select('id,user_id').eq('id', req.params.id).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Grounded thread not found' });
+    if (String(data.user_id) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'Authority denied', code: 'GROUNDED_THREAD_NOT_OWNED' });
+    }
+    req.grounded_thread = data;
+    next();
+  } catch (e) { res.status(500).json({ error: 'Failed to verify Grounded thread ownership' }); }
+};
+
+app.get('/api/grounded/threads', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { const { data, error } = await supabase.from('grounded_threads').select('*').eq('user_id', req.user.id).order('updated_at', { ascending: false }).limit(50); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.post('/api/grounded/threads', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { const { scope_type, scope_id, title } = req.body; const { data, error } = await supabase.from('grounded_threads').insert({ user_id: req.user.id, scope_type, scope_id, title }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.get('/api/grounded/threads/:id/turns', authenticateToken, groundedAuthorityMiddleware, groundedOwnedThread, async (req, res) => { try { const { data, error } = await supabase.from('grounded_turns').select('*').eq('thread_id', req.params.id).order('created_at', { ascending: true }).limit(200); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.post('/api/grounded/threads/:id/turns', authenticateToken, groundedAuthorityMiddleware, groundedOwnedThread, async (req, res) => { try { const { role, query_text, answer_type, payload, evidence } = req.body; const { data, error } = await supabase.from('grounded_turns').insert({ thread_id: req.params.id, role: role || 'user', query_text, answer_type, payload, evidence }).select().single(); if (error) throw error; await supabase.from('grounded_threads').update({ updated_at: new Date().toISOString() }).eq('id', req.params.id).eq('user_id', req.user.id); res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.get('/api/grounded/watchlist', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { const { data, error } = await supabase.from('grounded_watchlist').select('*').eq('user_id', req.user.id).eq('active', true); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.post('/api/grounded/watchlist', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { const { object_type, object_id, rule_key, config } = req.body; const { data, error } = await supabase.from('grounded_watchlist').insert({ user_id: req.user.id, object_type, object_id, rule_key, config }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.delete('/api/grounded/watchlist/:id', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { await supabase.from('grounded_watchlist').update({ active: false }).eq('id', req.params.id).eq('user_id', req.user.id); res.json({ success: true }) } catch (e) { res.status(500).json({ error: e.message }) } })
 
 // ═══════════════════ PASSWORD RESET ═══════════════════
 app.post('/api/auth/password-reset/request', apiLimiter, async (req, res) => { res.json({ ok: true, message: 'If the account exists, reset instructions have been sent.' }) })
