@@ -1,3 +1,4 @@
+/* neumDesk V46.14 · Phase 5.1.2 · Production frontend · 2026-09-24 */
 /* Public login editorial content. Never copy internal announcements here automatically.
    Only enabled entries explicitly marked audience:'public' can appear before sign-in.
    Optional startsAt/expiresAt must be ISO timestamps with Z or an explicit offset.

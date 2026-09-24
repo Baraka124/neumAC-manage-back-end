@@ -1,4 +1,5 @@
-<!DOCTYPE html>       
+<!DOCTYPE html>
+<!-- neumDesk V46.14 · Phase 5.2 · Leave + On-call Decision Intelligence · Production frontend · 2026-09-24 -->       
 <html lang="en">   
 <head>
     <meta charset="UTF-8">
@@ -11,12 +12,11 @@
     <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=DM+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/vue@3.4.21/dist/vue.global.prod.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-    <link rel="stylesheet" href="style.css?v=46.14-grounded-phase41e-oncall-precision">
-    <link rel="stylesheet" href="decision51.css?v=46.14-phase51.2-rotation-surface">
+    <link rel="stylesheet" href="style.css?v=46.14.5.2">
+    <link rel="stylesheet" href="decision51.css?v=46.14.5.2">
     <!-- Preserved Phase 5.1 decision CSS checkpoint: decision51.css?v=46.14-phase51-decision-intelligence -->
-    <link rel="stylesheet" href="activity45-ui.css?v=46.14">
-    <link rel="stylesheet" href="entry46.css?v=46.14-access44-login-polish">
-    <!-- Preserved Access Gate cache checkpoints for regression history: entry46.css?v=46.14-access43-ui · entry46.css?v=46.14-access42 -->
+    <link rel="stylesheet" href="activity45-ui.css?v=46.14.5.2">
+    <link rel="stylesheet" href="entry46.css?v=46.14.5.2">
 
     
 </head>
@@ -375,7 +375,7 @@
                             </div>
 
                             <!-- §9 structured PROPOSAL card (propose → confirm → write) -->
-                            <div v-if="turn.proposal" class="askbar-proposal nd-proposal" :class="{ 'askbar-proposal--done': turn.committed, 'askbar-proposal--cancelled': turn.cancelled }">
+                            <div v-if="turn.proposal" class="askbar-proposal nd-proposal" :class="{ 'askbar-proposal--done': turn.committed, 'askbar-proposal--cancelled': turn.cancelled, 'askbar-proposal--blocked': turn.proposal.blocked && !turn.committed }">
                                 <div class="askbar-proposal-h">
                                     <span class="askbar-proposal-ic"><svg width="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M2 12h20"/></svg></span>
                                     <span>{{ turn.committed ? 'Saved change' : 'Proposed change' }} · <b>record leave</b></span>
@@ -391,10 +391,22 @@
                                     <div class="askbar-impact-preview-head"><span>Impact preview</span><small>Before anything changes</small></div>
                                     <div class="askbar-impact-preview-grid"><div v-for="(im,ii) in turn.proposal.impact.items.slice(0,4)" :key="ii" class="askbar-impact-mini" :class="'askbar-impact-mini--'+im.tone"><span>{{ im.label }}</span><strong>{{ im.value }}</strong></div></div>
                                 </div>
-                                <div v-if="turn.proposal.blocked" class="askbar-proposal-warn">⚠ {{ turn.proposal.blockReason || 'This leave change is blocked by a recorded constraint.' }}</div>
-                                <div v-else-if="turn.proposal.warnings && turn.proposal.warnings.length" class="askbar-proposal-warn">⚠ {{ turn.proposal.warnings.join(' · ') }}. Review coverage before confirming.</div>
+                                <div v-if="turn.proposal.findings?.length && !turn.committed" class="odi-grounded-findings">
+                                    <div v-for="finding in turn.proposal.findings" :key="finding.code" class="odi-grounded-finding">
+                                        <strong>{{ finding.title }} · {{ finding.severity }}</strong>
+                                        <small>{{ finding.summary }}</small>
+                                    </div>
+                                </div>
+                                <div v-if="turn.proposal.requiresOverride && !turn.committed" class="odi-grounded-exception">
+                                    <template v-if="turn.proposal.overrideAllowed">
+                                        <strong>Exception reason required</strong>
+                                        <textarea v-model="turn.proposal.overrideReason" maxlength="2000" placeholder="What arrangement makes it appropriate to continue with this leave exception?"></textarea>
+                                    </template>
+                                    <small v-else>This warning requires a user with leave-exception approval permission.</small>
+                                </div>
+                                <div v-if="turn.proposal.blocked" class="askbar-proposal-block">⛔ {{ turn.proposal.blockReason || 'This leave change is blocked by a recorded constraint.' }}</div>
                                 <div v-if="!turn.committed && !turn.cancelled" class="askbar-proposal-actions">
-                                    <button class="askbar-proposal-confirm" :disabled="turn.writing || turn.proposal.blocked" @click="askBarConfirmLeave(turn.proposal, turn)">{{ turn.proposal.blocked ? 'Blocked' : (turn.writing ? 'Saving…' : 'Confirm & record') }}</button>
+                                    <button class="askbar-proposal-confirm" :disabled="turn.writing || turn.proposal.blocked || (turn.proposal.requiresOverride && (!turn.proposal.overrideAllowed || String(turn.proposal.overrideReason||'').trim().length &lt; 8))" @click="askBarConfirmLeave(turn.proposal, turn)">{{ turn.proposal.blocked ? 'Blocked' : (turn.writing ? 'Saving…' : (turn.proposal.requiresOverride ? 'Confirm with exception' : 'Confirm & record')) }}</button>
                                     <button class="askbar-proposal-cancel" :disabled="turn.writing" @click="askBarCancelLeave(turn)">Cancel</button>
                                 </div>
                                 <div v-if="turn.committed" class="askbar-proposal-ok">{{ turn.commitText }}</div>
@@ -418,6 +430,19 @@
                                     <div class="askbar-impact-preview-head"><span>Impact preview</span><small>Before anything changes</small></div>
                                     <div class="askbar-impact-preview-grid"><div v-for="(im,ii) in turn.oncallProposal.impact.items" :key="ii" class="askbar-impact-mini" :class="'askbar-impact-mini--'+im.tone"><span>{{ im.label }}</span><strong>{{ im.value }}</strong></div></div>
                                 </div>
+                                <div v-if="turn.oncallProposal.findings?.length && !turn.committed" class="odi-grounded-findings">
+                                    <div v-for="finding in turn.oncallProposal.findings" :key="finding.code" class="odi-grounded-finding">
+                                        <strong>{{ finding.title }} · {{ finding.severity }}</strong>
+                                        <small>{{ finding.summary }}</small>
+                                    </div>
+                                </div>
+                                <div v-if="turn.oncallProposal.requiresOverride && !turn.committed" class="odi-grounded-exception">
+                                    <template v-if="turn.oncallProposal.overrideAllowed">
+                                        <strong>Exception reason required</strong>
+                                        <textarea v-model="turn.oncallProposal.overrideReason" maxlength="2000" placeholder="Why is it appropriate to continue with this on-call exception?"></textarea>
+                                    </template>
+                                    <small v-else>This warning requires a user with on-call exception approval permission.</small>
+                                </div>
                                 <div v-if="turn.oncallProposal.blocked" class="askbar-proposal-block">
                                     ⛔ {{ turn.oncallProposal.blockReason || 'This on-call change is blocked by a recorded constraint.' }}
                                     <div v-if="turn.oncallProposal.alternatives && turn.oncallProposal.alternatives.length" class="askbar-alts">
@@ -428,16 +453,9 @@
                                             <span class="askbar-alt-go">assign →</span>
                                         </button>
                                     </div>
-                                    <div v-else class="askbar-alts-none">No eligible physician is free that day — you may need to look outside the usual pool.</div>
-                                </div>
-                                <div v-else-if="turn.oncallProposal.alreadyOnCall" class="askbar-proposal-warn">
-                                    ⚠ {{ turn.oncallProposal.subject.name }} is already on call that day.
-                                </div>
-                                <div v-else-if="turn.oncallProposal.noBackup" class="askbar-proposal-warn">
-                                    ⚠ No backup assigned — the department will be notified.
                                 </div>
                                 <div v-if="!turn.committed && !turn.cancelled" class="askbar-proposal-actions">
-                                    <button class="askbar-proposal-confirm" :disabled="turn.writing || turn.oncallProposal.blocked" @click="askBarConfirmOncall(turn.oncallProposal, turn)">{{ turn.writing ? 'Saving…' : (turn.oncallProposal.blocked ? 'Blocked' : 'Confirm & schedule') }}</button>
+                                    <button class="askbar-proposal-confirm" :disabled="turn.writing || turn.oncallProposal.blocked || (turn.oncallProposal.requiresOverride && (!turn.oncallProposal.overrideAllowed || String(turn.oncallProposal.overrideReason||'').trim().length &lt; 8))" @click="askBarConfirmOncall(turn.oncallProposal, turn)">{{ turn.oncallProposal.blocked ? 'Blocked' : (turn.writing ? 'Saving…' : (turn.oncallProposal.requiresOverride ? 'Confirm with exception' : 'Confirm & schedule')) }}</button>
                                     <button class="askbar-proposal-cancel" :disabled="turn.writing" @click="askBarCancelOncall(turn)">Cancel</button>
                                 </div>
                                 <div v-if="turn.committed" class="askbar-proposal-ok">{{ turn.commitText }}</div>
@@ -8120,14 +8138,6 @@ Use Section heading to structure longer clinical or research articles."></textar
                                 <option v-for="s in medicalStaff.filter(s=>s.employment_status==='active' && isOnCallEligible(s.staff_type))" :key="s.id" :value="s.id">{{ s.full_name }} — {{ formatStaffType(s.staff_type) }}</option>
                             </select>
                             <small v-if="fieldErrors.oncall?.primary_physician_id" class="error-text">{{ fieldErrors.oncall.primary_physician_id }}</small>
-                            <!-- Moment A: physician on leave on this date -->
-                            <div v-if="onCallAbsenceConflict" class="sm-conflict-banner">
-                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                                <div>
-                                    <strong>{{ onCallAbsenceConflict.reason }}</strong> recorded {{ onCallAbsenceConflict.from }} – {{ onCallAbsenceConflict.to }}
-                                    <span  class="nd-l107 nd-v086">Shift can still be saved — coordinate cover as needed</span>
-                                </div>
-                            </div>
                         </div>
                         <!-- Backup: progressive disclosure — collapsed by default, expands on click -->
                         <div class="sm-field" v-if="!onCallModal.showBackup">
@@ -8160,10 +8170,58 @@ Use Section heading to structure longer clinical or research articles."></textar
                             <div class="sm-label">Shift Notes <span class="hint">— optional</span></div>
                             <input type="text" class="sm-input" v-model="onCallModal.form.coverage_notes" placeholder="Handover instructions, special arrangements…">
                         </div>
+
+                        <!-- Phase 5.2 · Explainable on-call review -->
+                        <section v-if="onCallModal.form.primary_physician_id && onCallModal.form.duty_date"
+                                 class="odi-review" aria-live="polite">
+                            <div class="odi-review-head">
+                                <div>
+                                    <span class="odi-review-kicker">Operational decision intelligence</span>
+                                    <div class="odi-review-title">Duty review</div>
+                                    <div class="odi-review-sub">Checks this exact duty against recorded leave, existing assignments, coverage ownership and backup resilience.</div>
+                                </div>
+                                <span v-if="onCallModal.decision" class="odi-state" :class="'odi-state--'+onCallModal.decision.decision">{{ onCallModal.decision.decision }}</span>
+                                <span v-else class="odi-state">pending</span>
+                            </div>
+                            <div class="odi-review-body">
+                                <div v-if="onCallModal.decisionChecking" class="odi-checking"><span class="odi-spinner"></span> Rechecking current departmental records…</div>
+                                <div v-if="onCallModal.decision && !onCallModal.decision.findings.length" class="odi-empty">No material operational issue was found for this duty.</div>
+                                <div v-for="finding in (onCallModal.decision?.findings || [])" :key="finding.code"
+                                     class="odi-finding" :class="'odi-finding--'+finding.severity">
+                                    <span class="odi-finding-mark"></span>
+                                    <div>
+                                        <div class="odi-finding-top"><strong>{{ finding.title }}</strong><span>{{ finding.severity }}</span></div>
+                                        <p>{{ finding.summary }}</p>
+                                        <div v-if="finding.evidence?.count !== undefined || finding.evidence?.records?.length || finding.evidence?.dates?.length" class="odi-evidence">
+                                            <span v-if="finding.evidence?.count !== undefined">{{ finding.evidence.count }} related record{{ finding.evidence.count===1?'':'s' }}</span>
+                                            <span v-else-if="finding.evidence?.records?.length">{{ finding.evidence.records.length }} related record{{ finding.evidence.records.length===1?'':'s' }}</span>
+                                            <span v-if="finding.evidence?.dates?.length">{{ finding.evidence.dates.join(' · ') }}</span>
+                                        </div>
+                                        <div v-if="finding.policy?.reason" class="odi-policy">{{ finding.policy.reason }}</div>
+                                    </div>
+                                </div>
+                                <div v-if="onCallModal.decision?.requiresOverride" class="odi-exception" :class="{'odi-exception--locked': !onCallModal.overrideAllowed}">
+                                    <template v-if="onCallModal.overrideAllowed">
+                                        <strong>Authorised exception required</strong>
+                                        <p>This is not a hard block, but the warning must be acknowledged with a reason. The decision and reason are retained in the audit record.</p>
+                                        <textarea v-model="onCallModal.overrideReason" maxlength="2000" placeholder="Why is it appropriate to continue with this duty exception?"></textarea>
+                                    </template>
+                                    <template v-else>
+                                        <strong>Exception approval required</strong>
+                                        <p>A user with <code>oncall_exceptions</code> write permission must approve this warning.</p>
+                                    </template>
+                                </div>
+                                <div v-if="onCallModal.decisionError" class="odi-error">{{ onCallModal.decisionError }}</div>
+                                <div class="odi-foot">
+                                    <span>Duty date · {{ onCallModal.form.duty_date }}</span>
+                                    <span>{{ onCallModal.decisionChecking ? 'Verification in progress' : 'Revalidated again when saved' }}</span>
+                                </div>
+                            </div>
+                        </section>
                     </div>
                     <div class="sm-form-footer">
                         <button class="sm-btn-back" @click="onCallModal.show = false">Cancel</button>
-                        <button class="sm-btn-save" @click="saveOnCall(saving)" :disabled="saving">
+                        <button class="sm-btn-save" @click="saveOnCall(saving)" :disabled="saving || onCallModal.decisionChecking || (onCallModal.decision && !onCallModal.decision.canCommit) || (onCallModal.decision?.requiresOverride && (!onCallModal.overrideAllowed || String(onCallModal.overrideReason||'').trim().length &lt; 8))">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v13a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
                             {{ saving ? 'Saving…' : onCallModal.mode === 'add' ? 'Schedule Shift' : 'Save changes' }}
                         </button>
@@ -9009,13 +9067,6 @@ Use Section heading to structure longer clinical or research articles."></textar
                             <span class="dp-label">Duration</span>
                             <span class="dp-value">{{ calculateAbsenceDuration(absenceModal.form.start_date, absenceModal.form.end_date) }} days</span>
                         </div>
-                        <div v-if="absenceOverlapWarning" class="absence-overlap-warning">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                            <div>
-                                <strong>Overlapping absence exists</strong>
-                                <span>{{ absenceOverlapWarning.reason }} already recorded {{ absenceOverlapWarning.start }} – {{ absenceOverlapWarning.end }}</span>
-                            </div>
-                        </div>
 
                         <!-- Reason — category cards matching enrollment style -->
                         <div class="sm-field">
@@ -9123,6 +9174,55 @@ Use Section heading to structure longer clinical or research articles."></textar
                                       placeholder="Optional handover or context notes…"></textarea>
                         </div>
 
+                        <!-- Phase 5.2 · Explainable leave review -->
+                        <section v-if="absenceModal.form.staff_member_id && absenceModal.form.start_date && absenceModal.form.end_date"
+                                 class="odi-review" aria-live="polite">
+                            <div class="odi-review-head">
+                                <div>
+                                    <span class="odi-review-kicker">Operational decision intelligence</span>
+                                    <div class="odi-review-title">Leave review</div>
+                                    <div class="odi-review-sub">Checks the proposed period against existing leave, on-call duties, rotation responsibilities and the named covering clinician.</div>
+                                </div>
+                                <span v-if="absenceModal.decision" class="odi-state" :class="'odi-state--'+absenceModal.decision.decision">{{ absenceModal.decision.decision }}</span>
+                                <span v-else class="odi-state">pending</span>
+                            </div>
+                            <div class="odi-review-body">
+                                <div v-if="absenceModal.decisionChecking" class="odi-checking"><span class="odi-spinner"></span> Rechecking current departmental records…</div>
+                                <div v-if="absenceModal.decision && !absenceModal.decision.findings.length" class="odi-empty">No material operational issue was found for this leave period.</div>
+                                <div v-for="finding in (absenceModal.decision?.findings || [])" :key="finding.code"
+                                     class="odi-finding" :class="'odi-finding--'+finding.severity">
+                                    <span class="odi-finding-mark"></span>
+                                    <div>
+                                        <div class="odi-finding-top"><strong>{{ finding.title }}</strong><span>{{ finding.severity }}</span></div>
+                                        <p>{{ finding.summary }}</p>
+                                        <div v-if="finding.evidence?.overlapDays || finding.evidence?.count !== undefined || finding.evidence?.share !== undefined || finding.evidence?.records?.length" class="odi-evidence">
+                                            <span v-if="finding.evidence?.overlapDays">{{ finding.evidence.overlapDays }} overlapping day{{ finding.evidence.overlapDays===1?'':'s' }}</span>
+                                            <span v-if="finding.evidence?.share !== undefined">{{ finding.evidence.share }}% of leave period</span>
+                                            <span v-if="finding.evidence?.count !== undefined">{{ finding.evidence.count }} related record{{ finding.evidence.count===1?'':'s' }}</span>
+                                            <span v-else-if="finding.evidence?.records?.length">{{ finding.evidence.records.length }} related record{{ finding.evidence.records.length===1?'':'s' }}</span>
+                                        </div>
+                                        <div v-if="finding.policy?.reason" class="odi-policy">{{ finding.policy.reason }}</div>
+                                    </div>
+                                </div>
+                                <div v-if="absenceModal.decision?.requiresOverride" class="odi-exception" :class="{'odi-exception--locked': !absenceModal.overrideAllowed}">
+                                    <template v-if="absenceModal.overrideAllowed">
+                                        <strong>Authorised exception required</strong>
+                                        <p>The leave itself may be legitimate, but a material operational warning must be acknowledged with a reason before it is recorded.</p>
+                                        <textarea v-model="absenceModal.overrideReason" maxlength="2000" placeholder="What arrangement makes it appropriate to continue with this leave exception?"></textarea>
+                                    </template>
+                                    <template v-else>
+                                        <strong>Exception approval required</strong>
+                                        <p>A user with <code>leave_exceptions</code> write permission must approve this warning.</p>
+                                    </template>
+                                </div>
+                                <div v-if="absenceModal.decisionError" class="odi-error">{{ absenceModal.decisionError }}</div>
+                                <div class="odi-foot">
+                                    <span>Planned leave · {{ absenceModal.form.start_date }} → {{ absenceModal.form.end_date }}</span>
+                                    <span>{{ absenceModal.decisionChecking ? 'Verification in progress' : 'Revalidated again when saved' }}</span>
+                                </div>
+                            </div>
+                        </section>
+
                         <!-- Recurring absence — only for new absences -->
                         <div v-if="absenceModal.mode === 'add'"  class="nd-l083 nd-v083">
                             <label  class="nd-l032 nd-v082">
@@ -9152,7 +9252,7 @@ Use Section heading to structure longer clinical or research articles."></textar
                     <!-- ── Footer — same buttons as enrollment ── -->
                     <div class="sm-form-footer">
                         <button class="sm-btn-back" @click="absenceModal.show = false">Cancel</button>
-                        <button class="sm-btn-save" @click="saveAbsence(saving)" :disabled="saving">
+                        <button class="sm-btn-save" @click="saveAbsence(saving)" :disabled="saving || absenceModal.decisionChecking || (absenceModal.decision && !absenceModal.decision.canCommit) || (absenceModal.decision?.requiresOverride && (!absenceModal.overrideAllowed || String(absenceModal.overrideReason||'').trim().length &lt; 8))">
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                                 <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v13a2 2 0 01-2 2z"/>
                                 <polyline points="17 21 17 13 7 13 7 21"/>
@@ -12050,20 +12150,15 @@ Use Section heading to structure longer clinical or research articles."></textar
     </teleport>
     </div><!-- end app-layout -->
 </div><!-- end #app -->
-    <script src="activity45.js?v=46.14"></script>
-    <script src="activity50.js?v=46.14-phase50-temporal-integrity"></script>
-    <script src="entry-highlights.js?v=46"></script>
-    <script src="entry46.js?v=46"></script>
-    <script src="grounded-core.js?v=46.11-rotation-action-integrity"></script>
-    <script src="decision51.js?v=46.14-phase51-decision-intelligence"></script>
-    <script src="temporal50.js?v=46.14-phase50-temporal-integrity"></script>
-    <script src="app.js?v=46.14-phase51.2-rotation-surface"></script>
+    <script src="activity45.js?v=46.14.5.2"></script>
+    <script src="entry-highlights.js?v=46.14.5.2"></script>
+    <script src="entry46.js?v=46.14.5.2"></script>
+    <script src="grounded-core.js?v=46.14.5.2"></script>
+    <script src="decision51.js?v=46.14.5.2"></script>
+    <script src="temporal50.js?v=46.14.5.2"></script>
+    <script src="app.js?v=46.14.5.2"></script>
     <!-- Preserved Phase 5.1.1 startup cache checkpoint: app.js?v=46.14-phase51.1-startup-integrity -->
-    <!-- Phase 5.0 cache-history contract: <script src="app.js?v=46.14-phase50-temporal-integrity"></script> -->
     <!-- Preserved Access Gate 4.4 cache checkpoint for regression history: app.js?v=46.14-access44-login-polish -->
-    <!-- Preserved Access Gate app cache checkpoint for regression history: app.js?v=46.14-access42-session-integrity -->
-    <!-- Preserved delivery checkpoints for historical regression contracts: app.js?v=46.14-grounded-phase41e-oncall-precision · style.css?v=46.14-grounded-phase41e-oncall-precision -->
-    <!-- Previous Grounded UI cache checkpoint retained for regression history: app.js?v=46.14-grounded-phase41b-ui-convergence · style.css?v=46.14-grounded-phase41b-ui-convergence -->
 
     <script>
     /* ── Login page — anatomical bronchial tree ── */

@@ -1,3 +1,4 @@
+/* neumDesk V46.14 · Phase 5.1.2 · Production frontend · 2026-09-24 */
 /* V46. Two independent panels. Artwork is contained by the editorial panel. */
 html body #app .entry44.entry46{grid-template-columns:minmax(0,1.55fr) minmax(390px,1fr);align-items:start;background:#fafaf7;isolation:isolate}
 html body #app .entry46 .entry44-access{grid-column:2;grid-row:1;min-height:100svh;position:sticky;top:0;background:#fafaf7;border-left:1px solid #d5ddd5;padding:38px clamp(28px,3.6vw,64px) 26px;z-index:1}

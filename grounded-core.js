@@ -1,3 +1,4 @@
+/* neumDesk V46.14 · Phase 5.1.2 · Production frontend · 2026-09-24 */
 (function(root, factory){
   const api = factory()
   if (typeof module === 'object' && module.exports) module.exports = api

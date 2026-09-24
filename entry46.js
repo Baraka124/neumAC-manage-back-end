@@ -1,3 +1,4 @@
+/* neumDesk V46.14 · Phase 5.1.2 · Production frontend · 2026-09-24 */
 (function(root,factory){const api=factory();if(typeof module==='object'&&module.exports)module.exports=api;else root.Entry46=api;})(typeof globalThis!=='undefined'?globalThis:this,function(){
   'use strict';
   const clean=(s,n)=>typeof s==='string'?s.trim().slice(0,n):'';

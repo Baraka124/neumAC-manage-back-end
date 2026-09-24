@@ -1,5 +1,6 @@
-/* neumDesk V46.14 · Phase 5.1 Operational Decision Intelligence
-   Scoped decision-review surfaces only. Does not alter global Phase 4 UI. */
+/* neumDesk V46.14 · Phase 5.2 · Leave + On-call Decision Intelligence · Production frontend · 2026-09-24 */
+/* neumDesk V46.14 · Shared Decision Intelligence UI
+   Phase 5.2 domains: Rotations + Leave + On-call. Scoped surfaces only; global Phase 4 UI remains intact. */
 
 #app .odi-review{margin-top:14px;border:1px solid #dce6e5;border-radius:14px;background:#fbfdfc;overflow:hidden;box-shadow:none}
 #app .odi-review-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:14px 16px;border-bottom:1px solid #e7eeed;background:#fff}

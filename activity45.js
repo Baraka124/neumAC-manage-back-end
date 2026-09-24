@@ -1,3 +1,4 @@
+/* neumDesk V46.14 · Phase 5.1.2 · Production frontend · 2026-09-24 */
 /* neumDesk V46.14. Deterministic Portfolio Intelligence projection + formal document renderer. */
 (function (root, factory) {
   const api = factory();
@@ -112,17 +113,19 @@
     if(selected.rotations) rows('rotations').filter(r=>!['cancelled','canceled'].includes(String(r.rotation_status||'').toLowerCase())).forEach(r=>{
       const roles=[]; if(same(r.resident_id,person.id)) roles.push('Resident'); if(same(r.supervising_attending_id,person.id)) roles.push('Supervisor');
       if(!roles.length) return;
-      const rawStart=r.start_date||r.rotation_start_date, rawPlannedEnd=r.end_date||r.rotation_end_date;
-      const s=date(rawStart), plannedEnd=date(rawPlannedEnd);
+      const rawPlannedStart=r.start_date||r.rotation_start_date, rawPlannedEnd=r.end_date||r.rotation_end_date;
+      const rawActualStart=r.actual_start_date||rawPlannedStart;
+      const s=date(rawActualStart), plannedStart=date(rawPlannedStart), plannedEnd=date(rawPlannedEnd);
       const explicitTermination=date(r.actual_end_date||r.termination_date||r.terminated_date);
       const unit=unitName(r.training_unit_id), status=nice(r.rotation_status);
       const terminated=String(r.rotation_status||'').toLowerCase()==='terminated_early';
       if(terminated) {
         const changed=date(r.updated_at);
+        const startContext=(plannedStart&&s&&plannedStart!==s)?`Actual start ${pretty(s)}; planned start ${pretty(plannedStart)}. `:'';
         const timing=explicitTermination
-          ? `Terminated early on ${pretty(explicitTermination)}; planned end ${pretty(plannedEnd)}`
-          : `Marked terminated early${changed?` in the system on ${pretty(changed)}`:''}; an explicit actual termination date is not stored`;
-        model.issues.push(`${unit}: ${timing}. The planned rotation span is not shown as completed activity.`);
+          ? `${startContext}Terminated early on ${pretty(explicitTermination)}; planned end ${pretty(plannedEnd)}`
+          : `${startContext}Marked terminated early${changed?` in the system on ${pretty(changed)}`:''}; an explicit actual termination date is not stored`;
+        if(!explicitTermination) model.issues.push(`${unit}: ${timing}. The planned rotation span is not shown as completed activity.`);
         const actualSpanKnown=!!(s&&explicitTermination);
         const inSelectedPeriod=actualSpanKnown&&overlaps(s,explicitTermination,start,end);
         if(inSelectedPeriod&&same(r.resident_id,person.id)) model.residentAssignments.push({title:unit,role:'Resident',supervisor:staffName(r.supervising_attending_id),start:s,end:explicitTermination,status,ref:String(r.id),timing,terminatedEarly:true,evidenceKind:'person'});

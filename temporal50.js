@@ -1,3 +1,4 @@
+/* neumDesk V46.14 · Phase 5.1.2 · Production frontend · 2026-09-24 */
 /* neumDesk Phase 5.0 — Temporal Integrity interpreter.
  * Deterministic, dependency-free temporal semantics shared by Grounded actions.
  */
