@@ -7316,8 +7316,36 @@ const groundedOwnedThread = async (req, res, next) => {
 
 app.get('/api/grounded/threads', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { const { data, error } = await supabase.from('grounded_threads').select('*').eq('user_id', req.user.id).order('updated_at', { ascending: false }).limit(50); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
 app.post('/api/grounded/threads', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { const { scope_type, scope_id, title } = req.body; const { data, error } = await supabase.from('grounded_threads').insert({ user_id: req.user.id, scope_type, scope_id, title }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.get('/api/grounded/threads/:id/turns', authenticateToken, groundedAuthorityMiddleware, groundedOwnedThread, async (req, res) => { try { const { data, error } = await supabase.from('grounded_turns').select('*').eq('thread_id', req.params.id).order('created_at', { ascending: true }).limit(200); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.post('/api/grounded/threads/:id/turns', authenticateToken, groundedAuthorityMiddleware, groundedOwnedThread, async (req, res) => { try { const { role, query_text, answer_type, payload, evidence } = req.body; const { data, error } = await supabase.from('grounded_turns').insert({ thread_id: req.params.id, role: role || 'user', query_text, answer_type, payload, evidence }).select().single(); if (error) throw error; await supabase.from('grounded_threads').update({ updated_at: new Date().toISOString() }).eq('id', req.params.id).eq('user_id', req.user.id); res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+// Thread history stores text metadata only. Never accept browser-supplied source
+// rows or evidence snapshots: their authority may change after the turn is saved.
+const groundedTurnFields = 'id,thread_id,role,query_text,answer_type,created_at';
+app.get('/api/grounded/threads/:id/turns', authenticateToken, groundedAuthorityMiddleware, groundedOwnedThread, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('grounded_turns').select(groundedTurnFields)
+      .eq('thread_id', req.params.id).order('created_at', { ascending: true }).limit(200);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: 'Failed to fetch Grounded turns' }); }
+});
+app.post('/api/grounded/threads/:id/turns', authenticateToken, groundedAuthorityMiddleware, groundedOwnedThread, async (req, res) => {
+  try {
+    const { role = 'user', query_text, answer_type } = req.body || {};
+    if (!['user', 'assistant'].includes(role) || typeof query_text !== 'string' || !query_text.trim() || query_text.length > 4000) {
+      return res.status(400).json({ error: 'Invalid Grounded turn' });
+    }
+    if (answer_type != null && (typeof answer_type !== 'string' || answer_type.length > 80)) {
+      return res.status(400).json({ error: 'Invalid Grounded answer type' });
+    }
+    const { data, error } = await supabase.from('grounded_turns')
+      .insert({ thread_id: req.params.id, role, query_text: query_text.trim(), answer_type: answer_type || null,
+        payload: null, evidence: null })
+      .select(groundedTurnFields).single();
+    if (error) throw error;
+    await supabase.from('grounded_threads').update({ updated_at: new Date().toISOString() })
+      .eq('id', req.params.id).eq('user_id', req.user.id);
+    res.status(201).json(data);
+  } catch (e) { res.status(500).json({ error: 'Failed to save Grounded turn' }); }
+});
 app.get('/api/grounded/watchlist', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { const { data, error } = await supabase.from('grounded_watchlist').select('*').eq('user_id', req.user.id).eq('active', true); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
 app.post('/api/grounded/watchlist', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { const { object_type, object_id, rule_key, config } = req.body; const { data, error } = await supabase.from('grounded_watchlist').insert({ user_id: req.user.id, object_type, object_id, rule_key, config }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
 app.delete('/api/grounded/watchlist/:id', authenticateToken, groundedAuthorityMiddleware, async (req, res) => { try { await supabase.from('grounded_watchlist').update({ active: false }).eq('id', req.params.id).eq('user_id', req.user.id); res.json({ success: true }) } catch (e) { res.status(500).json({ error: e.message }) } })
