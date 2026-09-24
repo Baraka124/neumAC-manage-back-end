@@ -1,3 +1,4 @@
+// neumDesk V46.14 · Phase 5.2 · Leave + On-call Decision Intelligence · Production backend · 2026-09-24
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
 // VERSION 6.0 - BACKEND PLAN V44 IMPLEMENTED
 // --- ORIGINAL FIXES --- 
@@ -439,8 +440,20 @@ const schemas = {
     backup_physician_id: Joi.string().uuid().optional().allow(null),
     coverage_notes: Joi.string().optional().allow(''),
     schedule_id: Joi.string().optional(),
-    created_by: Joi.string().uuid().optional().allow(null)
+    created_by: Joi.string().uuid().optional().allow(null),
+    decision_override: Joi.object({ accepted: Joi.boolean().valid(true).required(), reason: Joi.string().trim().min(8).max(2000).required(), review_contract: Joi.string().optional(), finding_codes: Joi.array().items(Joi.string()).optional() }).optional()
   }),
+  onCallUpdate: Joi.object({
+    duty_date: Joi.date().optional(),
+    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'on_call_home', 'on_call_mixed', 'on_call_present').optional(),
+    coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
+    start_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).optional(),
+    end_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).optional(),
+    primary_physician_id: Joi.string().uuid().optional(),
+    backup_physician_id: Joi.string().uuid().optional().allow(null, ''),
+    coverage_notes: Joi.string().optional().allow(''),
+    decision_override: Joi.object({ accepted: Joi.boolean().valid(true).required(), reason: Joi.string().trim().min(8).max(2000).required(), review_contract: Joi.string().optional(), finding_codes: Joi.array().items(Joi.string()).optional() }).optional()
+  }).min(1),
 
   // FIX 2 SUPPORT: absenceRecord schema — total_days and current_status are derived server-side,
   // not required from client
@@ -455,7 +468,8 @@ const schemas = {
     coverage_arranged: Joi.boolean().default(false),
     covering_staff_id: Joi.string().uuid().optional().allow(null),
     coverage_notes: Joi.string().optional().allow(''),
-    hod_notes: Joi.string().optional().allow('')
+    hod_notes: Joi.string().optional().allow(''),
+    decision_override: Joi.object({ accepted: Joi.boolean().valid(true).required(), reason: Joi.string().trim().min(8).max(2000).required(), review_contract: Joi.string().optional(), finding_codes: Joi.array().items(Joi.string()).optional() }).optional()
   }),
   absenceRecordUpdate: Joi.object({
     staff_member_id: Joi.string().uuid().optional(),
@@ -469,7 +483,8 @@ const schemas = {
     covering_staff_id: Joi.string().uuid().optional().allow(null),
     coverage_notes: Joi.string().optional().allow(''),
     hod_notes: Joi.string().optional().allow(''),
-    current_status: Joi.string().optional()
+    current_status: Joi.string().optional(),
+    decision_override: Joi.object({ accepted: Joi.boolean().valid(true).required(), reason: Joi.string().trim().min(8).max(2000).required(), review_contract: Joi.string().optional(), finding_codes: Joi.array().items(Joi.string()).optional() }).optional()
   }).min(1),
 
   register: Joi.object({
@@ -2495,6 +2510,195 @@ app.delete('/api/rotations/:id', authenticateToken, checkPermission('resident_ro
   }
 });
 
+
+// ============ PHASE 5.2 · LEAVE + ON-CALL DECISION INTELLIGENCE ============
+// Same deterministic Decision51 contract used by the browser and Grounded.
+// Backend review is authoritative and is repeated immediately before every write.
+const canOverrideOperationalDecision = async (req, moduleName) => {
+  if (!req?.user?.id) return false;
+  const { data:user, error:userError } = await supabase.from('app_users').select('admin_level,user_role').eq('id', req.user.id).maybeSingle();
+  if (userError) throw userError;
+  if ((user?.admin_level ?? 0) >= 1 || user?.user_role === 'system_admin') return true;
+  const { data:perm, error:permError } = await supabase.from('user_permissions').select('can_write').eq('user_id', req.user.id).eq('module', moduleName).maybeSingle();
+  if (permError) throw permError;
+  return perm?.can_write === true;
+};
+
+const recordOperationalDecisionEvent = async ({decision, req, domain, action, subjectId=null, recordId=null, status='reviewed', override=null}) => {
+  try {
+    const { data, error } = await supabase.from('operational_decision_events').insert({
+      domain,
+      action,
+      subject_type:'medical_staff',
+      subject_id:subjectId,
+      proposed_state:decision?.proposal||{},
+      findings:decision?.findings||[],
+      decision:decision?.decision||'pass',
+      review_contract:decision?.contract||null,
+      override_required:!!decision?.requiresOverride,
+      override_used:!!override,
+      override_reason:override?.reason||null,
+      override_by:override?req?.user?.id:null,
+      override_at:override?new Date().toISOString():null,
+      committed_record_id:recordId,
+      event_status:status,
+      created_by:req?.user?.id||null,
+      created_at:new Date().toISOString(),
+      committed_at:recordId?new Date().toISOString():null
+    }).select('id').single();
+    if (error) throw error;
+    return data?.id||null;
+  } catch(e) {
+    // Decision logging must never silently turn a valid operational write into a failure.
+    // The failed audit attempt is still visible in server logs for remediation.
+    console.warn('[Decision51] operational event audit failed:', e.message);
+    return null;
+  }
+};
+
+const enforceOperationalDecision = async ({decision, override, req, domain, action, subjectId, exceptionModule, blockedCode, overrideCode}) => {
+  if (!decision?.canCommit) {
+    await recordOperationalDecisionEvent({decision,req,domain,action,subjectId,status:'blocked'});
+    return {ok:false,status:409,body:{
+      error:'Operational decision blocked', code:blockedCode,
+      message:'A non-overridable operational constraint must be resolved before this change can be saved.',
+      decision
+    }};
+  }
+  if (decision.requiresOverride) {
+    const allowed=await canOverrideOperationalDecision(req, exceptionModule);
+    if (!override?.accepted) {
+      await recordOperationalDecisionEvent({decision,req,domain,action,subjectId,status:'exception_required'});
+      return {ok:false,status:409,body:{
+        error:'Exception approval required', code:overrideCode,
+        message:'This change can continue only with an authorised exception and a recorded reason.',
+        override_allowed:allowed, decision
+      }};
+    }
+    if (!allowed) return {ok:false,status:403,body:{
+      error:'Exception approval required', code:`${overrideCode}_NOT_AUTHORIZED`,
+      message:'You can edit this record but do not have permission to approve this operational exception.', decision
+    }};
+    if (!override.reason || String(override.reason).trim().length < 8) return {ok:false,status:400,body:{
+      error:'Override reason required', code:`${overrideCode}_REASON_REQUIRED`,
+      message:'Record a short reason for continuing with this exception.', decision
+    }};
+  }
+  return {ok:true,override:decision.requiresOverride?override:null};
+};
+
+const loadLeaveDecisionState = async ({staffId, coveringStaffId=null, start, end, excludeId=null}) => {
+  const staffIds=[staffId,coveringStaffId].filter(Boolean);
+  const [staffR, absencesR, rotationsR, oncallR] = await Promise.all([
+    staffIds.length
+      ? supabase.from('medical_staff').select('id,full_name,staff_type,employment_status,department_id').in('id',staffIds)
+      : Promise.resolve({data:[]}),
+    staffIds.length
+      ? supabase.from('staff_absence_records').select('id,staff_member_id,start_date,end_date,actual_start_date,actual_return_date,current_status,absence_reason,absence_type,coverage_arranged,covering_staff_id').in('staff_member_id',staffIds).neq('current_status','cancelled').lte('start_date',end).gte('end_date',start)
+      : Promise.resolve({data:[]}),
+    supabase.from('resident_rotations').select('id,resident_id,training_unit_id,supervising_attending_id,start_date,end_date,actual_start_date,actual_end_date,rotation_status,rotation_category').in('rotation_status',['scheduled','active','extended']).lte('start_date',end).gte('end_date',start),
+    supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,duty_date,shift_type,coverage_area_id').gte('duty_date',start).lte('duty_date',end).is('deleted_at',null)
+  ]);
+  for (const r of [staffR,absencesR,rotationsR,oncallR]) if (r?.error) throw r.error;
+  const staff=staffR.data||[];
+  return {
+    staff:staff.find(x=>String(x.id)===String(staffId))||null,
+    coveringStaff:coveringStaffId?staff.find(x=>String(x.id)===String(coveringStaffId))||null:null,
+    absences:(absencesR.data||[]).filter(a=>!excludeId||String(a.id)!==String(excludeId)),
+    rotations:rotationsR.data||[],
+    oncall:oncallR.data||[]
+  };
+};
+
+const buildLeaveDecision = async (payload, {excludeId=null,action='record'}={}) => {
+  const start=formatDate(payload.start_date), end=formatDate(payload.end_date);
+  const state=await loadLeaveDecisionState({staffId:payload.staff_member_id,coveringStaffId:payload.covering_staff_id||null,start,end,excludeId});
+  return Decision51.reviewLeave({
+    proposal:{
+      staffId:payload.staff_member_id,
+      coveringStaffId:payload.covering_staff_id||null,
+      start,end,excludeId,
+      absenceType:payload.absence_type||'planned',
+      reason:payload.absence_reason||'other',
+      coverageArranged:!!payload.coverage_arranged
+    },
+    ...state, action,
+    sourceState:{staff:'authoritative',leave:'authoritative',rotations:'authoritative',oncall:'authoritative'}
+  });
+};
+
+const loadOnCallDecisionState = async ({staffId,backupId=null,date,coverageAreaId=null,excludeId=null}) => {
+  const staffIds=[staffId,backupId].filter(Boolean);
+  const [staffR, areaR, absencesR, oncallR] = await Promise.all([
+    staffIds.length
+      ? supabase.from('medical_staff').select('id,full_name,staff_type,employment_status').in('id',staffIds)
+      : Promise.resolve({data:[]}),
+    coverageAreaId
+      ? supabase.from('coverage_areas').select('id,name,code,requires_coverage,is_active').eq('id',coverageAreaId).maybeSingle()
+      : Promise.resolve({data:null}),
+    staffIds.length
+      ? supabase.from('staff_absence_records').select('id,staff_member_id,start_date,end_date,actual_start_date,actual_return_date,current_status,absence_reason,absence_type').in('staff_member_id',staffIds).neq('current_status','cancelled').lte('start_date',date).gte('end_date',date)
+      : Promise.resolve({data:[]}),
+    supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,duty_date,shift_type,coverage_area_id,start_time,end_time').eq('duty_date',date).is('deleted_at',null)
+  ]);
+  for (const r of [staffR,areaR,absencesR,oncallR]) if (r?.error) throw r.error;
+  const staff=staffR.data||[];
+  return {
+    staff:staff.find(x=>String(x.id)===String(staffId))||null,
+    backup:backupId?staff.find(x=>String(x.id)===String(backupId))||null:null,
+    coverageArea:areaR.data||null,
+    absences:absencesR.data||[],
+    oncall:(oncallR.data||[]).filter(o=>!excludeId||String(o.id)!==String(excludeId))
+  };
+};
+
+const buildOnCallDecision = async (payload, {excludeId=null,action='assign'}={}) => {
+  const date=formatDate(payload.duty_date);
+  const state=await loadOnCallDecisionState({staffId:payload.primary_physician_id,backupId:payload.backup_physician_id||null,date,coverageAreaId:payload.coverage_area_id||null,excludeId});
+  return Decision51.reviewOnCall({
+    proposal:{
+      staffId:payload.primary_physician_id,
+      backupId:payload.backup_physician_id||null,
+      date,
+      coverageAreaId:payload.coverage_area_id||null,
+      shiftType:payload.shift_type||'primary_call',
+      startTime:payload.start_time||null,
+      endTime:payload.end_time||null,
+      excludeId
+    },
+    ...state, action,
+    sourceState:{staff:'authoritative',leave:'authoritative',oncall:'authoritative',coverageAreas:'authoritative'}
+  });
+};
+
+app.post('/api/absence-records/review', authenticateToken, checkPermission('staff_absence','read'), apiLimiter, async (req,res)=>{
+  try {
+    const b=req.body||{};
+    const start=formatDate(b.start_date), end=formatDate(b.end_date);
+    if(!b.staff_member_id||!start||!end) return res.status(400).json({error:'Incomplete review request',message:'Staff member, start and end are required.'});
+    const decision=await buildLeaveDecision({...b,start_date:start,end_date:end},{excludeId:b.exclude_id||null,action:b.exclude_id?'update':'record'});
+    const override_allowed=await canOverrideOperationalDecision(req,'leave_exceptions');
+    res.json({success:true,decision,override_allowed});
+  } catch(e) {
+    console.error('[Decision51] leave review failed',e);
+    res.status(500).json({error:'Leave decision review failed',message:e.message});
+  }
+});
+
+app.post('/api/oncall/review', authenticateToken, checkPermission('oncall_schedule','read'), apiLimiter, async (req,res)=>{
+  try {
+    const b=req.body||{};
+    const date=formatDate(b.duty_date);
+    if(!b.primary_physician_id||!date) return res.status(400).json({error:'Incomplete review request',message:'Primary clinician and duty date are required.'});
+    const decision=await buildOnCallDecision({...b,duty_date:date},{excludeId:b.exclude_id||null,action:b.exclude_id?'update':'assign'});
+    const override_allowed=await canOverrideOperationalDecision(req,'oncall_exceptions');
+    res.json({success:true,decision,override_allowed});
+  } catch(e) {
+    console.error('[Decision51] on-call review failed',e);
+    res.status(500).json({error:'On-call decision review failed',message:e.message});
+  }
+});
+
 // ===== 9. ON-CALL SCHEDULE =====
 // FIX 6: Duplicate on-call route block removed. Only one set of handlers here.
 app.get('/api/oncall', authenticateToken, apiLimiter, async (req, res) => {
@@ -2556,6 +2760,14 @@ app.get('/api/oncall/upcoming', authenticateToken, apiLimiter, async (req, res) 
 app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'create'), validate(schemas.onCall), async (req, res) => {
   try {
     const d = req.validatedData || req.body;
+    const decision = await buildOnCallDecision(d, { action:'assign' });
+    const enforcement = await enforceOperationalDecision({
+      decision, override:d.decision_override, req,
+      domain:'oncall_schedule', action:'assign', subjectId:d.primary_physician_id,
+      exceptionModule:'oncall_exceptions', blockedCode:'ONCALL_DECISION_BLOCKED', overrideCode:'ONCALL_OVERRIDE_REQUIRED'
+    });
+    if (!enforcement.ok) return res.status(enforcement.status).json(enforcement.body);
+
     const scheduleData = {
       duty_date:            formatDate(d.duty_date),
       shift_type:           d.shift_type || 'primary_call',
@@ -2572,6 +2784,7 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
     };
     const { data, error } = await supabase.from('oncall_schedule').insert([scheduleData]).select().single();
     if (error) throw error;
+    await recordOperationalDecisionEvent({decision,req,domain:'oncall_schedule',action:'assign',subjectId:d.primary_physician_id,recordId:data.id,status:'committed',override:enforcement.override});
 
     // ── NOTIFICATION: On-call scheduled without backup ───────────────────
     if (!scheduleData.backup_physician_id) {
@@ -2621,24 +2834,38 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
 app.put('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedule', 'update'), validate(schemas.onCallUpdate), async (req, res) => {
   try {
     const d = req.validatedData || req.body;
-    const scheduleData = {
-      duty_date:            formatDate(d.duty_date),
-      shift_type:           d.shift_type || 'primary_call',
-      start_time:           d.start_time,
-      end_time:             d.end_time,
-      primary_physician_id: d.primary_physician_id,
-      backup_physician_id:  d.backup_physician_id  || null,
-      coverage_notes:       d.coverage_notes       || null,
-      coverage_area_id:     d.coverage_area_id     || null,
-      updated_at:           new Date().toISOString()
+    const { data:current, error:fetchError } = await supabase.from('oncall_schedule').select('*').eq('id', req.params.id).single();
+    if (fetchError) {
+      if (fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Schedule not found' });
+      throw fetchError;
+    }
+    const merged = {
+      duty_date: d.duty_date !== undefined ? formatDate(d.duty_date) : formatDate(current.duty_date),
+      shift_type: d.shift_type !== undefined ? d.shift_type : current.shift_type,
+      start_time: d.start_time !== undefined ? d.start_time : current.start_time,
+      end_time: d.end_time !== undefined ? d.end_time : current.end_time,
+      primary_physician_id: d.primary_physician_id !== undefined ? d.primary_physician_id : current.primary_physician_id,
+      backup_physician_id: d.backup_physician_id !== undefined ? (d.backup_physician_id || null) : (current.backup_physician_id || null),
+      coverage_notes: d.coverage_notes !== undefined ? (d.coverage_notes || null) : (current.coverage_notes || null),
+      coverage_area_id: d.coverage_area_id !== undefined ? (d.coverage_area_id || null) : (current.coverage_area_id || null)
     };
+    const decision = await buildOnCallDecision(merged, { excludeId:req.params.id, action:'update' });
+    const enforcement = await enforceOperationalDecision({
+      decision, override:d.decision_override, req,
+      domain:'oncall_schedule', action:'update', subjectId:merged.primary_physician_id,
+      exceptionModule:'oncall_exceptions', blockedCode:'ONCALL_DECISION_BLOCKED', overrideCode:'ONCALL_OVERRIDE_REQUIRED'
+    });
+    if (!enforcement.ok) return res.status(enforcement.status).json(enforcement.body);
+
+    const scheduleData = { ...merged, updated_at:new Date().toISOString() };
     const { data, error } = await supabase.from('oncall_schedule').update(scheduleData).eq('id', req.params.id).select().single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Schedule not found' });
-      if (error.code === '23505')    return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date.' });
-      if (error.code === '42703')    return res.status(500).json({ error: 'Schema mismatch', message: 'Run the coverage_areas migration in Supabase first. Column missing: ' + error.message });
+      if (error.code === '23505') return res.status(409).json({ error: 'Duplicate schedule', message: 'A primary call already exists for this area and date.', decision });
+      if (error.code === '42703') return res.status(500).json({ error: 'Schema mismatch', message: 'Run the coverage_areas migration in Supabase first. Column missing: ' + error.message });
       throw error;
     }
+    await recordOperationalDecisionEvent({decision,req,domain:'oncall_schedule',action:'update',subjectId:merged.primary_physician_id,recordId:data.id,status:'committed',override:enforcement.override});
     res.json(data);
   } catch (error) {
     res.status(500).json({ error: 'Failed to update on-call schedule', message: error.message });
@@ -2795,6 +3022,14 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
     const actualDays = actualReturnDate ? calculateDays(actualStartDate || startDateStr, actualReturnDate) : null;
     const currentStatus = actualReturnDate ? 'returned_to_duty' : deriveAbsenceStatus(startDateStr, endDateStr);
 
+    const decision = await buildLeaveDecision({ ...dataSource, start_date:startDateStr, end_date:endDateStr }, { action:'record' });
+    const enforcement = await enforceOperationalDecision({
+      decision, override:dataSource.decision_override, req,
+      domain:'staff_absence', action:'record', subjectId:dataSource.staff_member_id,
+      exceptionModule:'leave_exceptions', blockedCode:'LEAVE_DECISION_BLOCKED', overrideCode:'LEAVE_OVERRIDE_REQUIRED'
+    });
+    if (!enforcement.ok) return res.status(enforcement.status).json(enforcement.body);
+
     // FIX 3: recorded_by is a FK to app_users. A token id that isn't a real
     // app_users row causes a FK violation and the whole insert fails. Resolve it
     // safely: use req.user.id only if it exists in app_users; else match by email;
@@ -2845,6 +3080,8 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
       if (error.code === '23505') return res.status(409).json({ error: 'Duplicate entry', message: 'An absence record already exists for this staff member during this period' });
       throw error;
     }
+
+    await recordOperationalDecisionEvent({decision,req,domain:'staff_absence',action:'record',subjectId:dataSource.staff_member_id,recordId:data.id,status:'committed',override:enforcement.override});
 
     // Generate recurring instances in background
     if (absenceData.is_recurring && absenceData.recurrence_pattern && absenceData.recurrence_end_date) {
@@ -2962,6 +3199,23 @@ app.put('/api/absence-records/:id', authenticateToken, checkPermission('staff_ab
     else if (actualReturnDate) currentStatus = 'returned_to_duty';
     else currentStatus = deriveAbsenceStatus(startDateStr, endDateStr);
 
+    const mergedDecisionPayload = {
+      ...currentRecord, ...dataSource,
+      staff_member_id:dataSource.staff_member_id !== undefined ? dataSource.staff_member_id : currentRecord.staff_member_id,
+      absence_type:dataSource.absence_type !== undefined ? dataSource.absence_type : currentRecord.absence_type,
+      absence_reason:dataSource.absence_reason !== undefined ? dataSource.absence_reason : currentRecord.absence_reason,
+      start_date:startDateStr, end_date:endDateStr,
+      coverage_arranged:dataSource.coverage_arranged !== undefined ? dataSource.coverage_arranged : !!currentRecord.coverage_arranged,
+      covering_staff_id:dataSource.covering_staff_id !== undefined ? (dataSource.covering_staff_id || null) : (currentRecord.covering_staff_id || null)
+    };
+    const decision = await buildLeaveDecision(mergedDecisionPayload, {excludeId:req.params.id, action:'update'});
+    const enforcement = await enforceOperationalDecision({
+      decision, override:dataSource.decision_override, req,
+      domain:'staff_absence', action:'update', subjectId:mergedDecisionPayload.staff_member_id,
+      exceptionModule:'leave_exceptions', blockedCode:'LEAVE_DECISION_BLOCKED', overrideCode:'LEAVE_OVERRIDE_REQUIRED'
+    });
+    if (!enforcement.ok) return res.status(enforcement.status).json(enforcement.body);
+
     const updateData = {
       staff_member_id: dataSource.staff_member_id !== undefined ? dataSource.staff_member_id : currentRecord.staff_member_id,
       absence_type: dataSource.absence_type !== undefined ? dataSource.absence_type : currentRecord.absence_type,
@@ -2994,6 +3248,7 @@ app.put('/api/absence-records/:id', authenticateToken, checkPermission('staff_ab
     if (changedFields.length) {
       try { await supabase.from('absence_audit_log').insert(changedFields); } catch (e) { console.warn('Audit log failed:', e.message); }
     }
+    await recordOperationalDecisionEvent({decision,req,domain:'staff_absence',action:'update',subjectId:mergedDecisionPayload.staff_member_id,recordId:data.id,status:'committed',override:enforcement.override});
 
     res.json({ success:true, data, message:'Absence record updated successfully' });
   } catch (error) {
