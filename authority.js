@@ -39,6 +39,10 @@ const PERMISSION_CATALOG = Object.freeze({
   'identity.users.security': { domain: 'identity', label: 'Manage account security actions' },
   'identity.overrides.manage': { domain: 'identity', label: 'Manage explicit authority overrides' },
 
+  'staff.create': { domain: 'staff', label: 'Create staff records' },
+  'staff.archive': { domain: 'staff', label: 'Archive staff records' },
+  'leave.cancel': { domain: 'leave', label: 'Cancel leave records' },
+  'leave.purge': { domain: 'leave', label: 'Permanently remove leave records' },
   // People / professional identity
   'staff.directory.view': { domain: 'staff', label: 'View departmental professional directory' },
   'staff.profile.view': { domain: 'staff', label: 'View professional profile' },
@@ -93,6 +97,9 @@ const ROLE_POLICIES = Object.freeze({
   }),
 
   department_head: Object.freeze({
+    'staff.create': Object.freeze([rule('department', 'full')]),
+    'staff.archive': Object.freeze([rule('department', 'full')]),
+    'leave.cancel': Object.freeze([rule('department', 'full')]),
     'identity.users.view': Object.freeze([rule('all', 'full', 'Department heads may review account identities but do not administer them by default.')]),
 
     'staff.directory.view': Object.freeze([rule('department', 'full')]),
@@ -131,6 +138,9 @@ const ROLE_POLICIES = Object.freeze({
   }),
 
   coordinator: Object.freeze({
+    'staff.create': Object.freeze([rule('department', 'full')]),
+    'staff.archive': Object.freeze([rule('department', 'full')]),
+    'leave.cancel': Object.freeze([rule('department', 'full')]),
     'staff.directory.view': Object.freeze([rule('department', 'summary')]),
     'staff.profile.view': Object.freeze([rule('own', 'full'), rule('department', 'operational')]),
     'staff.profile.edit': Object.freeze([rule('department', 'full')]),
@@ -163,6 +173,7 @@ const ROLE_POLICIES = Object.freeze({
   }),
 
   clinician: Object.freeze({
+    'leave.cancel': Object.freeze([rule('own', 'full')]),
     'staff.directory.view': Object.freeze([rule('department', 'summary')]),
     'staff.profile.view': Object.freeze([rule('own', 'full'), rule('department', 'summary')]),
     'staff.profile.edit': Object.freeze([rule('own', 'full')]),
@@ -181,6 +192,7 @@ const ROLE_POLICIES = Object.freeze({
   }),
 
   resident: Object.freeze({
+    'leave.cancel': Object.freeze([rule('own', 'full')]),
     'staff.directory.view': Object.freeze([rule('department', 'summary')]),
     'staff.profile.view': Object.freeze([rule('own', 'full'), rule('department', 'summary')]),
     'staff.profile.edit': Object.freeze([rule('own', 'full')]),

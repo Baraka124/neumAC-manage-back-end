@@ -1043,10 +1043,19 @@ const constrainQueryByStaffScope = async (query, req, plan, fieldName) => {
   return { query, empty: true };
 };
 
+const Access = require('./access.js').createAccess({db:supabase, Authority, resolve:resolveRequestAuthority, loadStaff:loadStaffScopeRecord, loadPermissions:loadUserPermissions});
+
 // Legacy middleware retained only for routes not yet migrated to the canonical
 // resource/action/scope model. admin_level remains a temporary compatibility
 // bridge here; it is not consulted by requireAuthority().
 const checkPermission = (resource, action) => {
+  if (['medical_staff','staff_absence','resident_rotations','oncall_schedule'].includes(resource) && ['create','update','delete','write'].includes(action)) return async(req,res,next)=>{
+    if(req.path==='/api/upload/staff-photo') {
+      try {const p=await resolveCollectionAuthority(req,'staff.profile.edit');if(p.authority?.decision!==Authority.DECISIONS.ALLOW)return sendAuthorityDenied(res,'staff.profile.edit',p.authority);return next();}
+      catch(e){return res.status(500).json({error:'Could not check upload authority'});}
+    }
+    return Access.middleware(resource,action==='write'?'update':action)(req,res,next);
+  };
   return async (req, res, next) => {
     if (req.method === 'OPTIONS') return next()
     if (!req.user?.id) return res.status(401).json({ error: 'Authentication required' })
@@ -1609,6 +1618,15 @@ async function authoritySnapshot(userId) {
   };
 }
 
+app.get('/api/authority/capabilities', authenticateToken, apiLimiter, async(req,res)=>{
+  try { res.setHeader('Cache-Control','no-store'); res.json(await Access.capabilities(req)); }
+  catch(e){res.status(500).json({error:'Could not resolve access'});}
+});
+app.get('/api/identity/users/:id/events', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, async(req,res)=>{
+  try {const {data,error}=await supabase.from('identity_events').select('id,actor_user_id,event_type,reason,metadata,created_at').eq('subject_user_id',req.params.id).order('created_at',{ascending:false}).limit(100); if(error) throw error; res.json({data:data||[]});}
+  catch(e){res.status(500).json({error:'Could not load identity history'});}
+});
+app.get('/api/identity/config', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, (req,res)=>res.json({invitations_enabled:IDENTITY_INVITES_ENABLED}));
 app.get('/api/authority/catalog', authenticateToken, apiLimiter, async (req, res) => {
   res.json({
     success: true,
@@ -1624,7 +1642,7 @@ app.get('/api/authority/me', authenticateToken, apiLimiter, async (req, res) => 
   try {
     const snapshot = await authoritySnapshot(req.user.id);
     if (!snapshot) return res.status(404).json({ error: 'Identity not found' });
-    res.json({ success: true, ...snapshot });
+    res.json({ success: true, ...snapshot, capabilities: await Access.capabilities({...req,user:snapshot.user,authority_overrides:snapshot.overrides}) });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load authority', message: e.message });
   }
@@ -1635,7 +1653,7 @@ app.get('/api/authority/users/:id', authenticateToken,
   try {
     const snapshot = await authoritySnapshot(req.params.id);
     if (!snapshot) return res.status(404).json({ error: 'Identity not found' });
-    res.json({ success: true, ...snapshot });
+    res.json({ success: true, ...snapshot, capabilities: await Access.capabilities({...req,user:snapshot.user,authority_overrides:snapshot.overrides}) });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load user authority', message: e.message });
   }
@@ -1660,6 +1678,11 @@ app.put('/api/authority/users/:id/overrides', authenticateToken,
     }
     if (input.expires_at && new Date(input.expires_at) <= new Date()) {
       return res.status(400).json({ error: 'Invalid expiry', message: 'expires_at must be in the future.' });
+    }
+    if(input.effect==='allow') {
+      const grantor=await resolveRequestAuthority(req,input.permission_key,{scopes:[input.scope]});
+      const rank={none:0,summary:1,operational:2,full:3};
+      if(grantor.decision===Authority.DECISIONS.DENY || rank[grantor.visibility]<rank[input.visibility||'full']) return res.status(403).json({error:'You cannot grant authority beyond your own scope and visibility.'});
     }
     const now = new Date().toISOString();
     const { data, error } = await supabase.from('authority_overrides').upsert({
@@ -1776,6 +1799,7 @@ app.post('/api/identity/invitations', authenticateToken, requireAuthority('ident
     const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
     const now = new Date().toISOString();
     // Temporary legacy bridge until Phase 5.3C replaces admin_level with the Authority Resolver.
+    if (['system_admin','department_head','coordinator'].includes(input.user_role) && Authority.normalizeRole(req.user.user_role)!=='system_admin') return res.status(403).json({error:'Only a system administrator may invite an administrative role.'});
     const adminLevel = ['system_admin', 'department_head'].includes(input.user_role) ? 1 : 0;
     const { data: created, error } = await supabase.from('app_users').insert({
       email: accountEmail,
@@ -1875,8 +1899,9 @@ app.post('/api/auth/accept-invitation', authLimiter, validate(schemas.acceptInvi
       lifecycle_reason: null,
       auth_version: Number(target.auth_version || 1) + 1,
       updated_at: now
-    }).eq('id', target.id).select('id, email, full_name, user_role, account_status, medical_staff_id, activated_at').single();
+    }).eq('id', target.id).eq('account_status','invited').eq('invitation_token_hash',tokenDigest(token)).select('id, email, full_name, user_role, account_status, medical_staff_id, activated_at').maybeSingle();
     if (updateError) throw updateError;
+    if (!activated) return res.status(409).json({error:'Invitation already used or superseded'});
     await recordIdentityEvent(target.id, target.id, 'account_activated', null, { method: 'invitation' });
     res.json({ success: true, message: 'Account activated. You can now sign in.', user: activated });
   } catch (e) {
@@ -1913,21 +1938,33 @@ app.put('/api/identity/users/:id', authenticateToken, requireAuthority('identity
     const patch = { ...req.validatedData, updated_at: new Date().toISOString() };
     const identityBindingChanged =
       (Object.prototype.hasOwnProperty.call(patch, 'user_role') && patch.user_role !== target.user_role) ||
-      (Object.prototype.hasOwnProperty.call(patch, 'medical_staff_id') && patch.medical_staff_id !== target.medical_staff_id);
+      (Object.prototype.hasOwnProperty.call(patch, 'medical_staff_id') && patch.medical_staff_id !== target.medical_staff_id) ||
+      (Object.prototype.hasOwnProperty.call(patch, 'department_id') && patch.department_id !== target.department_id);
     if (identityBindingChanged) patch.auth_version = Number(target.auth_version || 1) + 1;
+    if(identityBindingChanged && target.id===req.user.id) return res.status(403).json({error:'Another administrator must change your own identity bindings.'});
+    if(patch.department_id) {
+      const {data:department,error:departmentError}=await supabase.from('departments').select('id').eq('id',patch.department_id).maybeSingle();
+      if(departmentError) throw departmentError;
+      if(!department) return res.status(400).json({error:'Department does not exist'});
+    }
+    if(patch.medical_staff_id && !(await loadStaffScopeRecord(patch.medical_staff_id))) return res.status(400).json({error:'Active staff profile does not exist'});
+    if(patch.user_role && patch.user_role!==target.user_role && Authority.normalizeRole(req.user.user_role)!=='system_admin') return res.status(403).json({error:'Only a system administrator may change account roles.'});
+
     if (Object.prototype.hasOwnProperty.call(patch, 'medical_staff_id') && patch.medical_staff_id) {
       const conflict = await ensureStaffIdentityAvailable(patch.medical_staff_id, target.id);
       if (conflict) return res.status(409).json({ error: 'Staff profile already linked', existing_user: conflict });
     }
     if (Object.prototype.hasOwnProperty.call(patch, 'user_role')) {
       if (target.id === req.user.id && patch.user_role !== target.user_role) return res.status(403).json({ error: 'You cannot change your own role' });
-      // Temporary legacy bridge until Phase 5.3C.
+      if (Authority.normalizeRole(target.user_role)==='system_admin' && patch.user_role!=='system_admin' && !(await ensureAnotherActiveAdmin(target))) return res.status(409).json({error:'Last active administrator'});
+      // Compatibility metadata only; authority uses the canonical role.
       patch.admin_level = ['system_admin', 'department_head'].includes(patch.user_role) ? 1 : 0;
     }
     const { data, error } = await supabase.from('app_users').update(patch)
       .eq('id', target.id)
       .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, job_title, updated_at').single();
     if (error) throw error;
+    if (patch.department_id !== undefined && patch.department_id !== target.department_id) await recordIdentityEvent(req.user.id,target.id,'department_changed',null,{from:target.department_id,to:patch.department_id});
     if (patch.user_role && patch.user_role !== target.user_role) await recordIdentityEvent(req.user.id, target.id, 'role_changed', null, { from: target.user_role, to: patch.user_role });
     if (Object.prototype.hasOwnProperty.call(patch, 'medical_staff_id') && patch.medical_staff_id !== target.medical_staff_id) await recordIdentityEvent(req.user.id, target.id, 'staff_link_changed', null, { from: target.medical_staff_id, to: patch.medical_staff_id });
     res.json({ success: true, user: data });
@@ -2221,7 +2258,21 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
   }
 });
 
-app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_staff', 'update'), validate(schemas.medicalStaff), async (req, res) => {
+app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_staff', 'update'), async (req,res,next) => {
+  try {
+  const staff=await loadStaffScopeRecord(req.params.id);
+  const decision=await resolveStaffTargetAuthority(req,'staff.profile.edit',staff);
+  if(decision.matched_scope!=='own') return next();
+  const schema=Joi.object({professional_email:Joi.string().email().allow('',null),mobile_phone:Joi.string().max(40).allow('',null),public_bio:Joi.string().max(2000).allow('',null)}).min(1);
+  const validated=schema.validate(req.body);
+  if(validated.error) return res.status(400).json({error:'Self-service edits support professional email, mobile phone and biography only.'});
+  try {
+    const {data,error}=await supabase.from('medical_staff').update({...validated.value,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('id,professional_email,mobile_phone,public_bio').single();
+    if(error) throw error;
+    return res.json(data);
+  } catch(e){ return res.status(500).json({error:'Profile update failed'}); }
+  } catch(e){ return res.status(500).json({error:'Profile access check failed'}); }
+}, validate(schemas.medicalStaff), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
     // FIX: DB column is TEXT — keep training_year as string, no parseInt conversion
@@ -2929,13 +2980,7 @@ app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {
 // ============ PHASE 5.1 · OPERATIONAL DECISION INTELLIGENCE ============
 // The decision engine is shared with the browser/Grounded surface. The backend
 // always rebuilds the review from authoritative records immediately before a write.
-const canOverrideRotationDecision = async (req) => {
-  if (!req?.user?.id) return false;
-  const { data:user } = await supabase.from('app_users').select('admin_level,user_role').eq('id', req.user.id).maybeSingle();
-  if ((user?.admin_level ?? 0) >= 1 || user?.user_role === 'system_admin') return true;
-  const { data:perm } = await supabase.from('user_permissions').select('can_write').eq('user_id', req.user.id).eq('module','rotation_exceptions').maybeSingle();
-  return perm?.can_write === true;
-};
+const canOverrideRotationDecision = req => Access.exception(req,'rotation.approve_exception');
 
 const loadRotationDecisionState = async ({residentId,unitId,supervisorId,start,end,excludeId=null}) => {
   const ids=[residentId,supervisorId].filter(Boolean);
@@ -3314,15 +3359,7 @@ app.delete('/api/rotations/:id', authenticateToken, checkPermission('resident_ro
 // ============ PHASE 5.2 · LEAVE + ON-CALL DECISION INTELLIGENCE ============
 // Same deterministic Decision51 contract used by the browser and Grounded.
 // Backend review is authoritative and is repeated immediately before every write.
-const canOverrideOperationalDecision = async (req, moduleName) => {
-  if (!req?.user?.id) return false;
-  const { data:user, error:userError } = await supabase.from('app_users').select('admin_level,user_role').eq('id', req.user.id).maybeSingle();
-  if (userError) throw userError;
-  if ((user?.admin_level ?? 0) >= 1 || user?.user_role === 'system_admin') return true;
-  const { data:perm, error:permError } = await supabase.from('user_permissions').select('can_write').eq('user_id', req.user.id).eq('module', moduleName).maybeSingle();
-  if (permError) throw permError;
-  return perm?.can_write === true;
-};
+const canOverrideOperationalDecision = (req, name) => Access.exception(req,name==='leave_exceptions'?'leave.approve_exception':'oncall.approve_exception');
 
 const recordOperationalDecisionEvent = async ({decision, req, domain, action, subjectId=null, recordId=null, status='reviewed', override=null}) => {
   try {
@@ -3471,7 +3508,7 @@ const buildOnCallDecision = async (payload, {excludeId=null,action='assign'}={})
   });
 };
 
-app.post('/api/absence-records/review', authenticateToken, checkPermission('staff_absence','read'), apiLimiter, async (req,res)=>{
+app.post('/api/absence-records/review', authenticateToken, Access.middleware('staff_absence','create'), apiLimiter, async (req,res)=>{
   try {
     const b=req.body||{};
     const start=formatDate(b.start_date), end=formatDate(b.end_date);
@@ -3485,7 +3522,7 @@ app.post('/api/absence-records/review', authenticateToken, checkPermission('staf
   }
 });
 
-app.post('/api/oncall/review', authenticateToken, checkPermission('oncall_schedule','read'), apiLimiter, async (req,res)=>{
+app.post('/api/oncall/review', authenticateToken, Access.middleware('oncall_schedule','create'), apiLimiter, async (req,res)=>{
   try {
     const b=req.body||{};
     const date=formatDate(b.duty_date);
