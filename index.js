@@ -1,3 +1,4 @@
+const IdentityWorkspace = require('./identity');
 // neumDesk V46.14 · Phase 5.3E · Grounded permission-aware retrieval · Production backend · 2026-09-24
 // Stable production filename: index.js. Release identifiers live in comments, not filenames.
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
@@ -573,7 +574,7 @@ const schemas = {
 
   acceptInvitation: Joi.object({
     token: Joi.string().min(20).required(),
-    new_password: Joi.string().min(10).required()
+    new_password: Joi.string().min(10).max(72).required()
   }),
 
   userProfile: Joi.object({
@@ -586,7 +587,7 @@ const schemas = {
 
   changePassword: Joi.object({
     current_password: Joi.string().required(),
-    new_password: Joi.string().min(10).required()
+    new_password: Joi.string().min(10).max(72).required()
   }),
 
   forgotPassword: Joi.object({
@@ -595,7 +596,7 @@ const schemas = {
 
   resetPassword: Joi.object({
     token: Joi.string().required(),
-    new_password: Joi.string().min(10).required()
+    new_password: Joi.string().min(10).max(72).required()
   }),
 
   department: Joi.object({
@@ -795,7 +796,7 @@ const authenticateToken = async (req, res, next) => {
   try {
     const { data: identity, error } = await supabase
       .from('app_users')
-      .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, auth_version')
+      .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, auth_version, development_credentials, password_reset_required')
       .eq('id', decoded.id)
       .maybeSingle();
     if (error || !identity) return res.status(401).json({ error: 'Account unavailable', message: 'This account no longer exists' });
@@ -806,6 +807,8 @@ const authenticateToken = async (req, res, next) => {
         message: `This account is ${identity.account_status}. Contact an administrator if access should be restored.`
       });
     }
+    const blocked = IdentityWorkspace.credentialBlock(identity, IdentityWorkspace.developmentEnabled());
+    if (blocked) return res.status(401).json({error:'Password setup required',message:blocked});
     const currentVersion = Number(identity.auth_version || 1);
     const tokenVersion = Number(decoded.auth_version || 1);
     if (currentVersion !== tokenVersion) {
@@ -1123,7 +1126,7 @@ async function recordIdentityEvent(actorUserId, subjectUserId, eventType, reason
 
 async function getIdentityUser(userId) {
   const { data, error } = await supabase.from('app_users')
-    .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, auth_version, password_hash, invited_at, activated_at, suspended_at, locked_at, archived_at')
+    .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, auth_version, password_hash, development_credentials, password_reset_required, invited_at, activated_at, suspended_at, locked_at, archived_at')
     .eq('id', userId).maybeSingle();
   if (error) throw error;
   return data || null;
@@ -1300,7 +1303,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
     const { data: user, error } = await supabase
       .from('app_users')
-      .select('id, email, full_name, user_role, job_title, admin_level, department_id, password_hash, account_status, medical_staff_id, auth_version, last_login_at')
+      .select('id, email, full_name, user_role, job_title, admin_level, department_id, password_hash, account_status, medical_staff_id, auth_version, last_login_at, development_credentials, password_reset_required')
       .eq('email', email.toLowerCase()).single();
 
     if (error || !user) {
@@ -1319,6 +1322,9 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     if (!validPassword) {
       return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
     }
+
+    const blocked = IdentityWorkspace.credentialBlock(user, IdentityWorkspace.developmentEnabled());
+    if (blocked) return res.status(403).json({error:'Password setup required',message:blocked});
 
     // Load this user's explicit permissions from DB
     const permMap = await loadUserPermissions(user.id)
@@ -1413,14 +1419,15 @@ app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPasswo
     const { data: user } = await supabase.from('app_users').select('id, email, full_name, account_status').eq('email', email.toLowerCase()).single();
     // Always return 200 — never reveal whether the email exists (prevents enumeration)
     if (user && user.account_status === 'active') {
-      const resetToken = jwt.sign({ userId: user.id, email: user.email, purpose: 'password_reset' }, JWT_SECRET, { expiresIn: '1h' });
+      const resetToken = jwt.sign({ userId: user.id, email: user.email, purpose: 'password_reset', jti: crypto.randomUUID() }, JWT_SECRET, { expiresIn: '1h' });
       const tokenExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
       // Store token hash in DB so it can be invalidated after use
-      await supabase.from('app_users').update({
+      const {error:resetError}=await supabase.from('app_users').update({
         reset_token: tokenDigest(resetToken),
         reset_token_expires_at: tokenExpiry,
         updated_at: new Date().toISOString()
       }).eq('id', user.id);
+      if(resetError)throw resetError;
       const resetLink = `${APP_URL}?reset_token=${resetToken}`;
       try {
         await sendAccountEmail(
@@ -1438,7 +1445,7 @@ app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPasswo
         console.error('Password reset email delivery failed:', mailError.message);
       }
     }
-    res.json({ message: 'If an account with that email exists, a reset link has been sent.' });
+    res.json({ message: 'If an active account with that email exists, a reset link has been requested.' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to process password reset', message: error.message });
   }
@@ -1458,25 +1465,30 @@ app.post('/api/auth/reset-password', authLimiter, validate(schemas.resetPassword
     }
     // Verify token matches what's stored (prevents token reuse after a new reset was requested)
     const { data: user } = await supabase.from('app_users')
-      .select('id, reset_token, reset_token_expires_at, auth_version')
+      .select('id, reset_token, reset_token_expires_at, auth_version, account_status, password_hash')
       .eq('email', decoded.email).single();
-    if (!user || ![token, tokenDigest(token)].includes(user.reset_token)) {
+    if (!user || user.account_status !== 'active' || user.id !== decoded.userId || user.reset_token !== tokenDigest(token)) {
       return res.status(400).json({ error: 'Token already used', message: 'This reset link has already been used or superseded. Please request a new one.' });
     }
-    if (new Date(user.reset_token_expires_at) < new Date()) {
+    if (!user.reset_token_expires_at || !(new Date(user.reset_token_expires_at).getTime() > Date.now())) {
       return res.status(400).json({ error: 'Token expired', message: 'This reset link has expired. Please request a new one.' });
     }
+    if (Buffer.byteLength(new_password)>72 || (user.password_hash && await bcrypt.compare(new_password,user.password_hash))) return res.status(400).json({error:'Choose a different password, at most 72 bytes.'});
     const passwordHash = await bcrypt.hash(new_password, 12);
-    const { error } = await supabase.from('app_users')
+    const { data: changed, error } = await supabase.from('app_users')
       .update({
         password_hash: passwordHash,
+        development_credentials: false,
+        password_reset_required: false,
         reset_token: null,
         reset_token_expires_at: null,
         auth_version: Number(user.auth_version || 1) + 1,
         updated_at: new Date().toISOString()
       })
-      .eq('email', decoded.email);
+      .eq('id',user.id).eq('account_status','active').eq('auth_version',user.auth_version).eq('reset_token',tokenDigest(token)).select('id').maybeSingle();
     if (error) throw error;
+    if (!changed) return res.status(409).json({error:'Reset already used or account changed. Request a new link.'});
+    await recordIdentityEvent(user.id,user.id,'password_reset_completed',null,{});
     res.json({ message: 'Password reset successfully. You can now log in with your new password.' });
   } catch (error) {
     res.status(400).json({ error: 'Failed to reset password', message: error.message });
@@ -1507,12 +1519,12 @@ app.get('/api/permissions/users', authenticateToken, requireAuthority('identity.
     // Resolve linked staff records in one batch query, not N+1
     const staffIds = users.map(u => u.medical_staff_id).filter(Boolean);
     let staffById = {};
-    if (staffIds.length) {
+    for (let start=0;start<staffIds.length;start+=200) {
       const { data: staffRows } = await supabase
         .from('medical_staff')
         .select('id, full_name, specialization, staff_type')
-        .in('id', staffIds);
-      staffById = Object.fromEntries((staffRows || []).map(s => [s.id, s]));
+        .in('id', staffIds.slice(start,start+200));
+      Object.assign(staffById,Object.fromEntries((staffRows || []).map(s => [s.id, s])));
     }
 
     res.json({
@@ -1628,7 +1640,8 @@ app.get('/api/identity/users/:id/events', authenticateToken, requireAuthority('i
   try {const {data,error}=await supabase.from('identity_events').select('id,actor_user_id,event_type,reason,metadata,created_at').eq('subject_user_id',req.params.id).order('created_at',{ascending:false}).limit(100); if(error) throw error; res.json({data:data||[]});}
   catch(e){res.status(500).json({error:'Could not load identity history'});}
 });
-app.get('/api/identity/config', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, (req,res)=>res.json({invitations_enabled:IDENTITY_INVITES_ENABLED}));
+IdentityWorkspace.registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthority,apiLimiter,bcrypt,jwt,JWT_SECRET,APP_URL,sendAccountEmail,tokenDigest,recordIdentityEvent,Authority});
+app.get('/api/identity/config', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, (req,res)=>res.json({invitations_enabled:IDENTITY_INVITES_ENABLED,development_passwords_enabled:IdentityWorkspace.developmentEnabled()&&Authority.normalizeRole(req.user.user_role)==='system_admin'}));
 app.get('/api/authority/catalog', authenticateToken, apiLimiter, async (req, res) => {
   res.json({
     success: true,
@@ -1750,10 +1763,14 @@ app.delete('/api/authority/users/:userId/overrides/:overrideId', authenticateTok
 // writes continue through checkPermission until their scoped action migration.
 app.get('/api/identity/users', authenticateToken, requireAuthority('identity.users.view', { scopes: ['all'] }), apiLimiter, async (req, res) => {
   try {
-    const { data: users, error } = await supabase.from('app_users')
-      .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, job_title, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at')
-      .order('full_name');
-    if (error) throw error;
+    const users=[];
+    for(let start=0;;start+=500){
+      const {data,error}=await supabase.from('app_users')
+        .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, job_title, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at, development_credentials, password_reset_required')
+        .order('id').range(start,start+499);
+      if(error)throw error;users.push(...(data||[]));if(!data||data.length<500)break;
+    }
+    users.sort((a,b)=>String(a.full_name||'').localeCompare(String(b.full_name||'')));
     const staffIds = [...new Set((users || []).map(u => u.medical_staff_id).filter(Boolean))];
     let staffById = {};
     if (staffIds.length) {
@@ -1777,11 +1794,11 @@ app.post('/api/identity/invitations', authenticateToken, requireAuthority('ident
     if (!IDENTITY_INVITES_ENABLED) return res.status(503).json({ error: 'Invitations not enabled', message: 'Account invitation delivery remains disabled until the invitation setup screen is deployed.' });
     const input = req.validatedData || req.body;
     const { data: staff, error: staffError } = await supabase.from('medical_staff')
-      .select('id, full_name, professional_email, department_id, employment_status')
+      .select('id, full_name, professional_email, department_id, employment_status, deleted_at')
       .eq('id', input.medical_staff_id).maybeSingle();
     if (staffError) throw staffError;
-    if (!staff) return res.status(404).json({ error: 'Staff profile not found' });
-    if (staff.employment_status && staff.employment_status !== 'active') {
+    if (!staff || staff.deleted_at) return res.status(404).json({ error: 'Staff profile not found' });
+    if (staff.employment_status !== 'active') {
       return res.status(409).json({ error: 'Staff profile is not active', message: 'Account access should only be granted to an active staff profile.' });
     }
     const existingForStaff = await ensureStaffIdentityAvailable(staff.id);
@@ -1797,7 +1814,7 @@ app.post('/api/identity/invitations', authenticateToken, requireAuthority('ident
     const { data: emailOwner } = await supabase.from('app_users').select('id, medical_staff_id, account_status').eq('email', accountEmail).maybeSingle();
     if (emailOwner) return res.status(409).json({ error: 'Email already registered', existing_user_id: emailOwner.id, account_status: emailOwner.account_status });
 
-    const rawToken = jwt.sign({ purpose: 'account_invitation', email: accountEmail, staff_id: staff.id }, JWT_SECRET, { expiresIn: '48h' });
+    const rawToken = jwt.sign({ purpose: 'account_invitation', jti: crypto.randomUUID(), email: accountEmail, staff_id: staff.id }, JWT_SECRET, { expiresIn: '48h' });
     const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
     const now = new Date().toISOString();
     // Temporary legacy bridge until Phase 5.3C replaces admin_level with the Authority Resolver.
@@ -1847,7 +1864,7 @@ app.post('/api/identity/users/:id/resend-invitation', authenticateToken, require
     const target = await getIdentityUser(req.params.id);
     if (!target) return res.status(404).json({ error: 'User not found' });
     if (target.account_status !== 'invited') return res.status(409).json({ error: 'Account is not awaiting activation' });
-    const rawToken = jwt.sign({ purpose: 'account_invitation', userId: target.id, email: target.email, staff_id: target.medical_staff_id }, JWT_SECRET, { expiresIn: '48h' });
+    const rawToken = jwt.sign({ purpose: 'account_invitation', jti: crypto.randomUUID(), userId: target.id, email: target.email, staff_id: target.medical_staff_id }, JWT_SECRET, { expiresIn: '48h' });
     const expiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
     const now = new Date().toISOString();
     const { error } = await supabase.from('app_users').update({
@@ -1890,6 +1907,7 @@ app.post('/api/auth/accept-invitation', authLimiter, validate(schemas.acceptInvi
     if (!target || target.account_status !== 'invited') return res.status(400).json({ error: 'Invitation is no longer active' });
     if (!target.invitation_token_hash || target.invitation_token_hash !== tokenDigest(token)) return res.status(400).json({ error: 'Invitation has been superseded' });
     if (!target.invitation_expires_at || new Date(target.invitation_expires_at) < new Date()) return res.status(400).json({ error: 'Invitation expired' });
+    if(Buffer.byteLength(new_password)>72) return res.status(400).json({error:'Use a password of at most 72 bytes.'});
     const passwordHash = await bcrypt.hash(new_password, 12);
     const now = new Date().toISOString();
     const { data: activated, error: updateError } = await supabase.from('app_users').update({
@@ -1938,6 +1956,7 @@ app.put('/api/identity/users/:id', authenticateToken, requireAuthority('identity
     const target = await getIdentityUser(req.params.id);
     if (!target) return res.status(404).json({ error: 'User not found' });
     const patch = { ...req.validatedData, updated_at: new Date().toISOString() };
+    if(target.development_credentials && patch.user_role && !['clinician','resident'].includes(patch.user_role)) return res.status(409).json({error:'Require an individual password before assigning an administrative role.'});
     const identityBindingChanged =
       (Object.prototype.hasOwnProperty.call(patch, 'user_role') && patch.user_role !== target.user_role) ||
       (Object.prototype.hasOwnProperty.call(patch, 'medical_staff_id') && patch.medical_staff_id !== target.medical_staff_id) ||
@@ -1981,7 +2000,7 @@ app.get('/api/users', authenticateToken, requireAuthority('identity.users.view',
     const { page = 1, limit = 20, role, department_id, status } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('app_users')
-      .select('id, email, full_name, user_role, department_id, medical_staff_id, phone_number, account_status, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at', { count: 'exact' });
+      .select('id, email, full_name, user_role, department_id, medical_staff_id, phone_number, account_status, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at, development_credentials, password_reset_required', { count: 'exact' });
     if (role) query = query.eq('user_role', role);
     if (department_id) query = query.eq('department_id', department_id);
     if (status) query = query.eq('account_status', status);
@@ -2028,10 +2047,13 @@ app.put('/api/users/change-password', authenticateToken, validate(schemas.change
     if (fetchError) throw fetchError;
     const validPassword = await bcrypt.compare(current_password, user.password_hash || '');
     if (!validPassword) return res.status(401).json({ error: 'Current password is incorrect' });
+    if(Buffer.byteLength(new_password)>72 || await bcrypt.compare(new_password,user.password_hash)) return res.status(400).json({error:'Choose a different password, at most 72 bytes.'});
     const passwordHash = await bcrypt.hash(new_password, 12);
-    const { error } = await supabase.from('app_users').update({ password_hash: passwordHash, auth_version: Number(user.auth_version || 1) + 1, updated_at: new Date().toISOString() }).eq('id', req.user.id);
+    const { data: changed, error } = await supabase.from('app_users').update({ password_hash: passwordHash, development_credentials:false, password_reset_required:false, reset_token:null, reset_token_expires_at:null, auth_version: Number(user.auth_version || 1) + 1, updated_at: new Date().toISOString() }).eq('id', req.user.id).eq('auth_version',user.auth_version).eq('account_status','active').select('id').maybeSingle();
     if (error) throw error;
-    res.json({ message: 'Password changed successfully' });
+    if(!changed) return res.status(409).json({error:'Account changed. Sign in and try again.'});
+    await recordIdentityEvent(req.user.id,req.user.id,'password_changed',null,{});
+    res.json({ message: 'Password changed successfully. Please sign in again.' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to change password', message: error.message });
   }
