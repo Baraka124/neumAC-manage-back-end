@@ -80,6 +80,10 @@ const PERMISSION_CATALOG = Object.freeze({
   'sync.rotations.preview': { domain: 'sync', label: 'Preview rotations external-source sync' },
   'sync.rotations.commit': { domain: 'sync', label: 'Commit rotations external-source sync' },
 
+  'units.view': { domain: 'units', label: 'View clinical units' },
+  'units.edit': { domain: 'units', label: 'Manage clinical units and assignments' },
+  'research.catalog.view': { domain: 'research', label: 'View shared partner catalog' },
+  'research.catalog.edit': { domain: 'research', label: 'Manage shared partner catalog' },
   // Research / system
   'research.view': { domain: 'research', label: 'View research portfolio' },
   'research.edit': { domain: 'research', label: 'Edit research portfolio' },
@@ -130,6 +134,9 @@ const ROLE_POLICIES = Object.freeze({
     'governance.view': Object.freeze([rule('department', 'full')]),
     'governance.review': Object.freeze([rule('department', 'full')]),
 
+    'units.view': Object.freeze([rule('department', 'full')]),
+    'units.edit': Object.freeze([rule('department', 'full')]),
+    'research.catalog.view': Object.freeze([rule('all', 'full')]),
     'research.view': Object.freeze([rule('department', 'full')]),
     'research.edit': Object.freeze([rule('department', 'full')]),
     'publications.view': Object.freeze([rule('department', 'full')]),
@@ -165,6 +172,9 @@ const ROLE_POLICIES = Object.freeze({
     'grounded.commit': Object.freeze([rule('department', 'full')]),
     'governance.view': Object.freeze([rule('department', 'full')]),
 
+    'units.view': Object.freeze([rule('department', 'full')]),
+    'units.edit': Object.freeze([rule('department', 'full')]),
+    'research.catalog.view': Object.freeze([rule('all', 'full')]),
     'research.view': Object.freeze([rule('department', 'full')]),
     'research.edit': Object.freeze([rule('department', 'full')]),
     'publications.view': Object.freeze([rule('department', 'full')]),
@@ -187,6 +197,8 @@ const ROLE_POLICIES = Object.freeze({
     'grounded.ask': Object.freeze([rule('department', 'operational')]),
     'grounded.propose': Object.freeze([rule('own', 'full')]),
     'research.view': Object.freeze([rule('department', 'summary')]),
+    'units.view': Object.freeze([rule('department', 'operational')]),
+    'research.catalog.view': Object.freeze([rule('all', 'summary')]),
     'publications.view': Object.freeze([rule('department', 'full')]),
     'publications.edit': Object.freeze([rule('own', 'full')])
   }),
@@ -203,6 +215,7 @@ const ROLE_POLICIES = Object.freeze({
     'oncall.view': Object.freeze([rule('department', 'operational')]),
 
     'grounded.ask': Object.freeze([rule('department', 'operational')]),
+    'units.view': Object.freeze([rule('department', 'operational')]),
     'publications.view': Object.freeze([rule('department', 'full')])
   })
 });

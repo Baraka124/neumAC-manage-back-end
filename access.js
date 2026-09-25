@@ -1,9 +1,11 @@
 'use strict';
 // Canonical access integration. Stable runtime filename.
 const MODULES = Object.freeze({
+  ...require('./portfolio.js').MODULES,
   medical_staff: {read:'staff.directory.view',create:'staff.create',update:'staff.profile.edit',delete:'staff.archive'},
   staff_absence: {read:'leave.view',create:'leave.create',update:'leave.edit',delete:'leave.cancel'},
   resident_rotations: {read:'rotation.view',create:'rotation.create',update:'rotation.edit',delete:'rotation.terminate'},
+  emergency_callouts: {read:'oncall.view',create:'oncall.assign',update:'oncall.edit',delete:'oncall.cancel'},
   oncall_schedule: {read:'oncall.view',create:'oncall.assign',update:'oncall.edit',delete:'oncall.cancel'},
   user_management: {read:'identity.users.view',create:'identity.users.invite',update:'identity.users.manage',delete:'identity.users.lifecycle'},
   rotation_exceptions:{read:'rotation.approve_exception',write:'rotation.approve_exception'},
@@ -34,6 +36,7 @@ function createAccess({db, Authority, resolve, loadStaff, loadPermissions}) {
       const p=permissions.get(module);
       legacy[module]={read:broad||p?.can_read===true,write:broad||p?.can_write===true};
     }
+    legacy.analytics={read:decisions['research.view']?.all?.decision==='ALLOW'&&!Object.values(decisions['research.view']||{}).some(d=>d.source==='user_override_deny'),write:false};
     return {legacy,contract:'neumdesk.capabilities.v1',actor:{id:req.user.id,staff_id:req.user.medical_staff_id||null,department_id:req.user.department_id||null},decisions,modules:MODULES};
   }
   async function targets(req,resource,action) {
