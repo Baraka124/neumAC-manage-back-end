@@ -161,7 +161,7 @@
       }));
     }
 
-    const duties=oncall.filter(o=>(String(o.primary_physician_id)===String(residentId)||String(o.backup_physician_id)===String(residentId))&&iso(o.duty_date)>=start&&iso(o.duty_date)<=end);
+    const duties=oncall.filter(o=>(String(o.primary_physician_id)===String(residentId)||String(o.backup_physician_id)===String(residentId)||String(o.resident_physician_id)===String(residentId))&&iso(o.duty_date)>=start&&iso(o.duty_date)<=end);
     if(duties.length) findings.push(finding('RESIDENT_ONCALL_CONTEXT','context','On-call duties occur during this rotation',`${resident?.full_name||'The resident'} has ${duties.length} recorded on-call dut${duties.length===1?'y':'ies'} during the proposed period.`,{evidence:{count:duties.length,dates:duties.map(x=>iso(x.duty_date)).filter(Boolean)},policy:{overridable:false,invariant:null,reason:'On-call duty is normally compatible with a clinical rotation and is shown as context, not a conflict.'}}));
 
     const supervised=rotations.filter(r=>String(r.id)!==String(excludeId||'')&&String(r.supervising_attending_id)===String(supervisorId)&&activeStatus(r.rotation_status)&&overlap(start,end,effectiveRotStart(r),effectiveRotEnd(r)));
@@ -204,7 +204,7 @@
       }));
     }
 
-    const staffDuties=oncall.filter(o=>(String(o.primary_physician_id)===String(staffId)||String(o.backup_physician_id)===String(staffId))&&iso(o.duty_date)>=start&&iso(o.duty_date)<=end);
+    const staffDuties=oncall.filter(o=>(String(o.primary_physician_id)===String(staffId)||String(o.backup_physician_id)===String(staffId)||String(o.resident_physician_id)===String(staffId))&&iso(o.duty_date)>=start&&iso(o.duty_date)<=end);
     if(staffDuties.length){
       const prim=staffDuties.filter(o=>String(o.primary_physician_id)===String(staffId));
       const backup=staffDuties.length-prim.length;
@@ -240,7 +240,7 @@
           resolutions:[{kind:'choose_cover',label:'Choose another covering clinician'},{kind:'continue_exception',label:'Keep cover with exception'}]
         }));
       }
-      const coverDuties=oncall.filter(o=>(String(o.primary_physician_id)===String(coveringStaffId)||String(o.backup_physician_id)===String(coveringStaffId))&&iso(o.duty_date)>=start&&iso(o.duty_date)<=end);
+      const coverDuties=oncall.filter(o=>(String(o.primary_physician_id)===String(coveringStaffId)||String(o.backup_physician_id)===String(coveringStaffId)||String(o.resident_physician_id)===String(coveringStaffId))&&iso(o.duty_date)>=start&&iso(o.duty_date)<=end);
       if(coverDuties.length) findings.push(finding('LEAVE_COVERING_STAFF_ONCALL','context','Covering clinician also has on-call duties',`${coveringStaff.full_name||'The covering clinician'} has ${coverDuties.length} recorded on-call dut${coverDuties.length===1?'y':'ies'} during the coverage period.`,{evidence:{count:coverDuties.length,dates:coverDuties.map(o=>iso(o.duty_date)).filter(Boolean)},policy:{overridable:false,invariant:null,reason:'On-call duty does not automatically make a clinician unavailable for daytime/unit coverage; it is shown as context.'}}));
     }
 
@@ -288,7 +288,7 @@
     }
 
     const sameDate=oncall.filter(o=>String(o.id)!==String(excludeId||'')&&iso(o.duty_date)===dutyDate);
-    const samePerson=sameDate.filter(o=>String(o.primary_physician_id)===String(staffId));
+    const samePerson=sameDate.filter(o=>[o.primary_physician_id,o.backup_physician_id,o.resident_physician_id].filter(Boolean).some(id=>String(id)===String(staffId)));
     const exactDuplicate=samePerson.filter(o=>String(o.shift_type||'primary_call')===String(shiftType)&&String(o.coverage_area_id||'')===String(coverageAreaId||''));
     if(exactDuplicate.length) findings.push(finding('ONCALL_DUPLICATE_ASSIGNMENT','block','This clinician already has the same duty assignment',`${staff?.full_name||'The clinician'} already has an equivalent ${shiftType.replaceAll('_',' ')} record on ${dutyDate}.`,{evidence:{records:exactDuplicate.map(o=>({id:o.id,coverageAreaId:o.coverage_area_id||null,shiftType:o.shift_type||null}))},policy:{overridable:false,invariant:'NO_DUPLICATE_ONCALL_RECORD',reason:'Duplicate operational records create ambiguous duty ownership.'}}));
     else if(samePerson.length) findings.push(finding('ONCALL_MULTI_AREA_DUTY','warning','Clinician already has another duty that day',`${staff?.full_name||'The clinician'} already has ${samePerson.length} other on-call assignment${samePerson.length===1?'':'s'} on ${dutyDate}.`,{evidence:{records:samePerson.map(o=>({id:o.id,coverageAreaId:o.coverage_area_id||null,shiftType:o.shift_type||null}))},policy:{overridable:true,invariant:null,reason:'One clinician may occasionally cover multiple roles/areas, but the additional duty must be intentional and documented.'},resolutions:[{kind:'review_oncall',label:'Review existing duty'},{kind:'choose_primary',label:'Choose another clinician'},{kind:'continue_exception',label:'Keep multiple duties'}]}));

@@ -16,7 +16,7 @@ const TARGETS = {
   medical_staff: {table:'medical_staff', fields:['id'], select:'id,department_id'},
   staff_absence: {table:'staff_absence_records',fields:['staff_member_id'], select:'id,staff_member_id'},
   resident_rotations: {table:'resident_rotations',fields:['resident_id'], select:'id,resident_id,supervising_attending_id,training_unit_id'},
-  oncall_schedule: {table:'oncall_schedule',fields:['primary_physician_id','backup_physician_id'],select:'id,primary_physician_id,backup_physician_id'}
+  oncall_schedule: {table:'oncall_schedule',fields:['primary_physician_id','backup_physician_id','resident_physician_id'],select:'id,primary_physician_id,backup_physician_id,resident_physician_id'}
 };
 function createAccess({db, Authority, resolve, loadStaff, loadPermissions}) {
   const full = d => d?.decision === Authority.DECISIONS.ALLOW;

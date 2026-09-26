@@ -1640,7 +1640,7 @@ app.get('/api/identity/users/:id/events', authenticateToken, requireAuthority('i
   try {const {data,error}=await supabase.from('identity_events').select('id,actor_user_id,event_type,reason,metadata,created_at').eq('subject_user_id',req.params.id).order('created_at',{ascending:false}).limit(100); if(error) throw error; res.json({data:data||[]});}
   catch(e){res.status(500).json({error:'Could not load identity history'});}
 });
-IdentityWorkspace.registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthority,apiLimiter,bcrypt,jwt,JWT_SECRET,APP_URL,sendAccountEmail,tokenDigest,recordIdentityEvent,Authority});
+IdentityWorkspace.registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthority,apiLimiter,bcrypt,jwt,JWT_SECRET,APP_URL,sendAccountEmail,tokenDigest,recordIdentityEvent,Authority,resolveRequestAuthority});
 app.get('/api/identity/config', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, (req,res)=>res.json({invitations_enabled:IDENTITY_INVITES_ENABLED,development_passwords_enabled:IdentityWorkspace.developmentEnabled()&&Authority.normalizeRole(req.user.user_role)==='system_admin'}));
 app.get('/api/authority/catalog', authenticateToken, apiLimiter, async (req, res) => {
   res.json({
@@ -3015,7 +3015,7 @@ const loadRotationDecisionState = async ({residentId,unitId,supervisorId,start,e
     unitId ? supabase.from('training_units').select('id,unit_name,unit_status,maximum_residents,department_id').eq('id',unitId).maybeSingle() : Promise.resolve({data:null}),
     supabase.from('resident_rotations').select('id,resident_id,training_unit_id,supervising_attending_id,start_date,end_date,actual_start_date,actual_end_date,rotation_status,rotation_category,training_unit:training_units(unit_name)').in('rotation_status',['scheduled','active','extended']).lte('start_date',end).gte('end_date',start),
     ids.length ? supabase.from('staff_absence_records').select('id,staff_member_id,start_date,end_date,actual_start_date,actual_return_date,current_status,absence_reason,absence_type').in('staff_member_id',ids).neq('current_status','cancelled').lte('start_date',end).gte('end_date',start) : Promise.resolve({data:[]}),
-    residentId ? supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,duty_date,shift_type').or(`primary_physician_id.eq.${residentId},backup_physician_id.eq.${residentId}`).gte('duty_date',start).lte('duty_date',end).is('deleted_at',null) : Promise.resolve({data:[]})
+    residentId ? supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,resident_physician_id,duty_date,shift_type').or(`primary_physician_id.eq.${residentId},backup_physician_id.eq.${residentId},resident_physician_id.eq.${residentId}`).gte('duty_date',start).lte('duty_date',end).is('deleted_at',null) : Promise.resolve({data:[]})
   ]);
   for (const r of [staffR,unitR,rotationsR,absencesR,oncallR]) if (r?.error) throw r.error;
   const staff=staffR.data||[];
@@ -3460,7 +3460,7 @@ const loadLeaveDecisionState = async ({staffId, coveringStaffId=null, start, end
       ? supabase.from('staff_absence_records').select('id,staff_member_id,start_date,end_date,actual_start_date,actual_return_date,current_status,absence_reason,absence_type,coverage_arranged,covering_staff_id').in('staff_member_id',staffIds).neq('current_status','cancelled').lte('start_date',end).gte('end_date',start)
       : Promise.resolve({data:[]}),
     supabase.from('resident_rotations').select('id,resident_id,training_unit_id,supervising_attending_id,start_date,end_date,actual_start_date,actual_end_date,rotation_status,rotation_category').in('rotation_status',['scheduled','active','extended']).lte('start_date',end).gte('end_date',start),
-    supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,duty_date,shift_type,coverage_area_id').gte('duty_date',start).lte('duty_date',end).is('deleted_at',null)
+    supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,resident_physician_id,duty_date,shift_type,coverage_area_id').gte('duty_date',start).lte('duty_date',end).is('deleted_at',null)
   ]);
   for (const r of [staffR,absencesR,rotationsR,oncallR]) if (r?.error) throw r.error;
   const staff=staffR.data||[];
@@ -3502,7 +3502,7 @@ const loadOnCallDecisionState = async ({staffId,backupId=null,date,coverageAreaI
     staffIds.length
       ? supabase.from('staff_absence_records').select('id,staff_member_id,start_date,end_date,actual_start_date,actual_return_date,current_status,absence_reason,absence_type').in('staff_member_id',staffIds).neq('current_status','cancelled').lte('start_date',date).gte('end_date',date)
       : Promise.resolve({data:[]}),
-    supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,duty_date,shift_type,coverage_area_id,start_time,end_time').eq('duty_date',date).is('deleted_at',null)
+    supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,resident_physician_id,duty_date,shift_type,coverage_area_id,start_time,end_time').eq('duty_date',date).is('deleted_at',null)
   ]);
   for (const r of [staffR,areaR,absencesR,oncallR]) if (r?.error) throw r.error;
   const staff=staffR.data||[];
@@ -3584,14 +3584,14 @@ app.get('/api/oncall', authenticateToken, apiLimiter, async (req, res) => {
     let query = supabase.from('oncall_schedule').select(`
         *, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
         backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
-        coverage_area:coverage_areas(id,name,code,color)
+        resident_physician:medical_staff!oncall_schedule_resident_physician_id_fkey(id,full_name,staff_type,department_id), coverage_area:coverage_areas(id,name,code,color)
       `).is('deleted_at', null).order('duty_date');
     if (start_date) query = query.gte('duty_date', start_date);
     if (end_date) query = query.lte('duty_date', end_date);
-    if (physician_id) query = query.or(`primary_physician_id.eq.${physician_id},backup_physician_id.eq.${physician_id}`);
+    if (physician_id) query = query.or(`primary_physician_id.eq.${physician_id},backup_physician_id.eq.${physician_id},resident_physician_id.eq.${physician_id}`);
     const { data, error } = await query;
     if (error) throw error;
-    const scoped = await filterRowsForCollectionScope(req, plan, data || [], row => [row.primary_physician_id, row.backup_physician_id]);
+    const scoped = await filterRowsForCollectionScope(req, plan, data || [], row => [row.primary_physician_id, row.backup_physician_id, row.resident_physician_id]);
     setProjectionHeaders(res, plan.authority, 'oncall');
     res.json(scoped.map(item => Projection.projectOnCall(item, plan.authority.visibility)));
   } catch (error) {
@@ -3607,10 +3607,10 @@ app.get('/api/oncall/today', authenticateToken, apiLimiter, async (req, res) => 
     const { data, error } = await supabase.from('oncall_schedule').select(`
         *, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
         backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
-        coverage_area:coverage_areas(id,name,code,color)
+        resident_physician:medical_staff!oncall_schedule_resident_physician_id_fkey(id,full_name,staff_type,department_id), coverage_area:coverage_areas(id,name,code,color)
       `).eq('duty_date', today).is('deleted_at', null);
     if (error) throw error;
-    const scoped = await filterRowsForCollectionScope(req, plan, data || [], row => [row.primary_physician_id, row.backup_physician_id]);
+    const scoped = await filterRowsForCollectionScope(req, plan, data || [], row => [row.primary_physician_id, row.backup_physician_id, row.resident_physician_id]);
     setProjectionHeaders(res, plan.authority, 'oncall');
     res.json(scoped.map(item => Projection.projectOnCall(item, plan.authority.visibility)));
   } catch (error) {
@@ -3625,10 +3625,10 @@ app.get('/api/oncall/upcoming', authenticateToken, apiLimiter, async (req, res) 
     const today = formatDate(new Date());
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     const { data, error } = await supabase.from('oncall_schedule')
-      .select('*, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id), backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id), coverage_area:coverage_areas(id,name,code,color)')
+      .select('*, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id), backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id), resident_physician:medical_staff!oncall_schedule_resident_physician_id_fkey(id,full_name,staff_type,department_id), coverage_area:coverage_areas(id,name,code,color)')
       .gte('duty_date', today).lte('duty_date', nextWeek).is('deleted_at', null).order('duty_date');
     if (error) throw error;
-    const scoped = await filterRowsForCollectionScope(req, plan, data || [], row => [row.primary_physician_id, row.backup_physician_id]);
+    const scoped = await filterRowsForCollectionScope(req, plan, data || [], row => [row.primary_physician_id, row.backup_physician_id, row.resident_physician_id]);
     setProjectionHeaders(res, plan.authority, 'oncall');
     res.json(scoped.map(item => Projection.projectOnCall(item, plan.authority.visibility)));
   } catch (error) {
@@ -4112,7 +4112,7 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
           .select('id')
           .gte('duty_date', startDateStr)
           .lte('duty_date', endDateStr)
-          .or(`primary_physician_id.eq.${absenceData.staff_member_id},backup_physician_id.eq.${absenceData.staff_member_id}`);
+          .or(`primary_physician_id.eq.${absenceData.staff_member_id},backup_physician_id.eq.${absenceData.staff_member_id},resident_physician_id.eq.${absenceData.staff_member_id}`);
         if (conflicts?.length) {
           const ids = conflicts.map(c => c.id);
           await supabase.from('oncall_schedule').update({ has_conflict: true }).in('id', ids);
@@ -6272,7 +6272,7 @@ const EXPORT_SPECS = {
  staff:{permission:'staff.directory.view',fields:['id']},
  rotations:{permission:'rotation.view',fields:['resident_id']},
  absences:{permission:'leave.view',fields:['staff_member_id']},
- oncall:{permission:'oncall.view',fields:['primary_physician_id','backup_physician_id']}
+ oncall:{permission:'oncall.view',fields:['primary_physician_id','backup_physician_id','resident_physician_id']}
 };
 const exportQuery = async(req,type,query)=>{
  const spec=EXPORT_SPECS[type];let plan=await resolveCollectionAuthority(req,spec.permission);
@@ -6303,7 +6303,7 @@ app.get('/api/ical/oncall', authenticateToken, async (req, res) => {
   try {
     let query = supabase
       .from('oncall_schedule')
-      .select('id, primary_physician_id, backup_physician_id, duty_date, shift_type, start_time, end_time, coverage_notes, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name)')
+      .select('id, primary_physician_id, backup_physician_id, resident_physician_id, duty_date, shift_type, start_time, end_time, coverage_notes, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name)')
       .is('deleted_at', null)
       .gte('duty_date', new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0])
       .order('duty_date', { ascending: true })
@@ -6458,7 +6458,7 @@ app.get('/api/export/oncall', authenticateToken, async (req, res) => {
   try {
     const { from, to } = req.query
     let query = supabase.from('oncall_schedule')
-      .select('primary_physician_id, backup_physician_id, duty_date, shift_type, start_time, end_time, coverage_notes, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name)')
+      .select('primary_physician_id, backup_physician_id, resident_physician_id, duty_date, shift_type, start_time, end_time, coverage_notes, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(full_name)')
       .is('deleted_at', null).order('duty_date', { ascending: true })
     if (from) query = query.gte('duty_date', from)
     if (to) query = query.lte('duty_date', to)
@@ -7026,100 +7026,46 @@ app.delete('/api/coverage-areas/:id', authenticateToken, checkPermission('system
 })
 
 // ===== ONCALL BATCH INSERT =====
-app.post('/api/oncall/batch', authenticateToken, checkPermission('oncall_schedule', 'create'), async (req, res) => {
-  try {
-    const { shifts } = req.body
-    if (!Array.isArray(shifts) || shifts.length === 0)
-      return res.status(400).json({ error: 'shifts array is required' })
-    if (shifts.length > 200)
-      return res.status(400).json({ error: 'Maximum 200 shifts per batch' })
-
-    // Validate required fields up front
-    const invalid = shifts.filter(s => !s.primary_physician_id || !s.duty_date)
-    if (invalid.length > 0)
-      return res.status(400).json({ error: `${invalid.length} shifts missing required fields` })
-
-    // Get all existing shifts for the date range to detect duplicates
-    const dates = [...new Set(shifts.map(s => formatDate(new Date(s.duty_date))))]
-    const { data: existing } = await supabase.from('oncall_schedule')
-      .select('id, duty_date, primary_physician_id')
-      .in('duty_date', dates)
-
-    const existingMap = {}
-    ;(existing || []).forEach(e => { existingMap[`${e.duty_date}|${e.primary_physician_id}`] = e.id })
-
-    const force = req.body.force_override === true
-    let inserted = 0, updated = 0, skipped = 0
-    const conflicts = []
-    
-    // Also check for OTHER physicians on the same dates (different person, same date)
-    const { data: allOnDates } = await supabase.from('oncall_schedule')
-      .select('id, duty_date, primary_physician_id')
-      .in('duty_date', dates)
-    const datePhysMap = {}
-    ;(allOnDates || []).forEach(e => {
-      if (!datePhysMap[e.duty_date]) datePhysMap[e.duty_date] = []
-      datePhysMap[e.duty_date].push({ id: e.id, physician_id: e.primary_physician_id })
-    })
-    
-    for (const s of shifts) {
-      const dd = formatDate(new Date(s.duty_date))
-      const key = `${dd}|${s.primary_physician_id}`
-      const row = {
-        duty_date:            dd,
-        shift_type:           ['primary_call','backup_call','float_physician','on_call_home','on_call_mixed','on_call_present'].includes(s.shift_type) ? s.shift_type : 'primary_call',
-        coverage_area_id:     s.coverage_area_id || null,
-        start_time:           s.start_time || '15:00',
-        end_time:             s.end_time   || '08:00',
-        primary_physician_id: s.primary_physician_id,
-        backup_physician_id:  s.backup_physician_id  || null,
-        coverage_notes:       s.coverage_notes       || (s.source_file ? `Synced from ${s.source_file}` : null),
-        updated_at:           new Date().toISOString(),
+app.post('/api/oncall/batch', authenticateToken, requireAuthority('sync.oncall.commit',{scopes:['all']}), apiLimiter, async(req,res)=>{
+  const shifts=req.body?.shifts;
+  if(!Array.isArray(shifts)||!shifts.length||shifts.length>200)return res.status(400).json({error:'Provide 1 to 200 reviewed shifts.'});
+  const results=[];let inserted=0,updated=0,skipped=0;
+  for(const s of shifts){
+    try{
+      const date=s.duty_date;
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(date||'')||isNaN(Date.parse(date))||new Date(date+'T12:00:00Z').toISOString().slice(0,10)!==date||!['on_call_home','on_call_mixed','on_call_present'].includes(s.shift_type))throw Error('Invalid date or shift type');
+      if(!s.primary_physician_id||!Object.prototype.hasOwnProperty.call(s,'resident_physician_id')||s.primary_physician_id===s.resident_physician_id)throw Error('Invalid staff/resident selection');
+      const {data:existing,error:readError}=await supabase.from('oncall_schedule').select('*').eq('duty_date',date).is('deleted_at',null);if(readError)throw readError;
+      let current=null;
+      if(existing?.length){if(existing.length!==1||!s.expected)throw Error('Existing shift requires review');current=existing[0];for(const key of ['id','primary_physician_id','resident_physician_id','shift_type','updated_at'])if((current[key]??null)!==(s.expected[key]??null))throw Error('Schedule changed after preview. Reload the file.');}
+      else if(s.expected)throw Error('Reviewed shift no longer exists');
+      const action=current?'update':'create';
+      const child={...req,path:'/api/oncall',params:current?{id:current.id}:{},body:{primary_physician_id:s.primary_physician_id,resident_physician_id:s.resident_physician_id}};
+      await Access.authorize(child,'oncall_schedule',action);
+      const {data:staff,error:staffError}=await supabase.from('medical_staff').select('id,department_id,employment_status,deleted_at,staff_type').in('id',[s.primary_physician_id,s.resident_physician_id].filter(Boolean));if(staffError)throw staffError;
+      if(staff.length!==[s.primary_physician_id,s.resident_physician_id].filter(Boolean).length||staff.some(p=>p.employment_status!=='active'||p.deleted_at))throw Error('Assignment includes unavailable staff');
+      if(s.resident_physician_id){const resident=staff.find(p=>p.id===s.resident_physician_id);const {data:type,error:typeError}=await supabase.from('staff_types').select('is_resident_type').eq('type_key',resident.staff_type).maybeSingle();if(typeError)throw typeError;if(!type?.is_resident_type)throw Error('MIR must be linked to a resident staff profile');}
+      // Check leave and duty conflicts for both the attending and the MIR.
+      const reviews=[];
+      for(const id of [s.primary_physician_id,s.resident_physician_id].filter(Boolean)){
+        const decision=await buildOnCallDecision({...current,...s,primary_physician_id:id,backup_physician_id:id===s.primary_physician_id?current?.backup_physician_id||null:null},{excludeId:current?.id||null,action:current?'update':'assign'});
+        const warnings=(decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block');
+        const override=req.body.acknowledge_history===true&&warnings.every(f=>f.code==='ONCALL_RETROSPECTIVE_ASSIGNMENT')?{accepted:true,reason:'Administrator explicitly acknowledged historical Excel schedule import.'}:undefined;
+        const enforcement=await enforceOperationalDecision({decision,override,req:child,domain:'oncall_schedule',action:'sync',subjectId:id,exceptionModule:'oncall_exceptions',blockedCode:'ONCALL_DECISION_BLOCKED',overrideCode:'ONCALL_OVERRIDE_REQUIRED'});
+        if(!enforcement.ok)throw Error((decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.title).join('; ')||'Operational conflict requires review in On-call');
+        reviews.push({decision,subjectId:id,override:enforcement.override});
       }
-      
-      if (existingMap[key]) {
-        // Same person, same date — UPDATE
-        await supabase.from('oncall_schedule').update(row).eq('id', existingMap[key])
-        updated++
-      } else {
-        // Check: is there a DIFFERENT physician already on this date?
-        const othersOnDate = (datePhysMap[dd] || []).filter(e => e.physician_id !== s.primary_physician_id)
-        if (othersOnDate.length > 0 && !force) {
-          // There's already someone else on this date — flag as conflict but still insert
-          // (a date can have multiple physicians with different shift types)
-        }
-        // INSERT new shift
-        row.schedule_id = generateId('SCH')
-        row.created_by  = req.user.id
-        row.created_at  = new Date().toISOString()
-        const { error } = await supabase.from('oncall_schedule').insert(row)
-        if (error) {
-          // If insert fails (e.g. schedule_id collision), retry with new ID
-          row.schedule_id = generateId('SCH')
-          const { error: err2 } = await supabase.from('oncall_schedule').insert(row)
-          if (err2) {
-            conflicts.push({ date: dd, physician_id: s.primary_physician_id, error: err2.message })
-            skipped++
-            continue
-          }
-        }
-        inserted++
-      }
-    }
-
-    res.status(201).json({
-      success: true,
-      inserted,
-      updated,
-      skipped,
-      total: inserted + updated,
-      conflicts: conflicts.length > 0 ? conflicts : undefined,
-      message: `Synced ${inserted + updated} shifts (${inserted} new, ${updated} updated${skipped ? ', ' + skipped + ' skipped' : ''}).`
-    })
-  } catch (err) {
-    res.status(500).json({ error: 'Batch sync failed', message: err.message })
+      const primary=staff.find(p=>p.id===s.primary_physician_id);
+      const row={primary_physician_id:s.primary_physician_id,resident_physician_id:s.resident_physician_id||null,shift_type:s.shift_type,updated_at:new Date().toISOString(),sync_source:{file:String(req.body.source_file||'').slice(0,240),sheet:String(s.source_sheet||'').slice(0,80),row:Number(s.source_row)||null,actor:req.user.id},sync_key:'guardias:'+String(primary.department_id||'unassigned')+':'+date};
+      let recordId=current?.id;
+      if(current){let query=supabase.from('oncall_schedule').update(row).eq('id',current.id).is('deleted_at',null);query=current.updated_at?query.eq('updated_at',current.updated_at):query.is('updated_at',null);const {data,error}=await query.select('id').maybeSingle();if(error)throw error;if(!data)throw Error('Shift changed while saving. Refresh and review.');updated++;}
+      else {const {data,error}=await supabase.from('oncall_schedule').insert({...row,duty_date:date,schedule_id:generateId('SCH'),start_time:'15:00',end_time:'08:00',created_by:req.user.id,created_at:new Date().toISOString()}).select('id').single();if(error)throw error;recordId=data.id;inserted++;}
+      for(const review of reviews)await recordOperationalDecisionEvent({...review,req,domain:'oncall_schedule',action:'sync',recordId,status:'committed'});
+      results.push({date,status:current?'updated':'inserted'});
+    }catch(e){skipped++;results.push({date:s?.duty_date||null,status:'not_saved',message:e.code==='23505'?'Another sync already saved this date. Refresh.':e.status===403?'Permission denied for this assignment':e.message})}
   }
-})
+  res.json({success:skipped===0,inserted,updated,skipped,total:inserted+updated,results});
+});
 
 // ===== 404 HANDLER =====
 
