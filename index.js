@@ -1,3 +1,4 @@
+const TestSessions = require('./test-sessions');
 const IdentityWorkspace = require('./identity');
 // neumDesk V46.14 · Phase 5.3E · Grounded permission-aware retrieval · Production backend · 2026-09-24
 // Stable production filename: index.js. Release identifiers live in comments, not filenames.
@@ -814,6 +815,8 @@ const authenticateToken = async (req, res, next) => {
     if (currentVersion !== tokenVersion) {
       return res.status(401).json({ error: 'Session revoked', message: 'Your session is no longer valid. Please sign in again.' });
     }
+    try { req.testSession=await TestSessions.validate({decoded,identity,supabase,Authority}); } catch(e) { return res.status(401).json({error:'Test session ended',message:e.message}); }
+    if(req.testSession&&!['GET','HEAD'].includes(req.method)&&(/^\/api\/(identity|authority)\//.test(req.path)||req.path.startsWith('/api/auth/')&&req.path!=='/api/auth/logout'))return res.status(403).json({error:'Return to system administrator to change accounts or security settings.'});
     req.user = {
       id: identity.id,
       email: identity.email,
@@ -843,7 +846,7 @@ app.use('/uploads', authenticateToken, express.static(path.join(__dirname, 'uplo
 // meaning it blocked admins from everything else too.
 let _maintenanceCache = { value: false, at: 0 }
 app.use('/api', async (req, res, next) => {
-  if (req.path.startsWith('/api/auth')) return next()
+  if (req.path.startsWith('/auth/') || req.path.startsWith('/api/auth/')) return next()
   const now = Date.now()
   if (now - _maintenanceCache.at > 30000) {
     try {
@@ -1392,7 +1395,7 @@ app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
         .maybeSingle();
       linkedStaff = staffRow || null;
     }
-    res.json({ ...data, permissions, linked_staff: linkedStaff })
+    res.json({ ...data, permissions, linked_staff: linkedStaff, test_session:req.testSession||null })
   } catch (e) { res.status(401).json({ error: 'Session validation failed' }) }
 });
 
@@ -1641,7 +1644,8 @@ app.get('/api/identity/users/:id/events', authenticateToken, requireAuthority('i
   catch(e){res.status(500).json({error:'Could not load identity history'});}
 });
 IdentityWorkspace.registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthority,apiLimiter,bcrypt,jwt,JWT_SECRET,APP_URL,sendAccountEmail,tokenDigest,recordIdentityEvent,Authority,resolveRequestAuthority});
-app.get('/api/identity/config', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, (req,res)=>res.json({invitations_enabled:IDENTITY_INVITES_ENABLED,development_passwords_enabled:IdentityWorkspace.developmentEnabled()&&Authority.normalizeRole(req.user.user_role)==='system_admin'}));
+TestSessions.register({app,authenticateToken,apiLimiter,supabase,Authority,jwt,JWT_SECRET,credentialBlock:IdentityWorkspace.credentialBlock,developmentEnabled:IdentityWorkspace.developmentEnabled});
+app.get('/api/identity/config', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, (req,res)=>res.json({invitations_enabled:IDENTITY_INVITES_ENABLED,development_test_sessions_enabled:TestSessions.enabled()&&Authority.normalizeRole(req.user.user_role)==='system_admin',development_passwords_enabled:IdentityWorkspace.developmentEnabled()&&Authority.normalizeRole(req.user.user_role)==='system_admin'}));
 app.get('/api/authority/catalog', authenticateToken, apiLimiter, async (req, res) => {
   res.json({
     success: true,
@@ -3419,9 +3423,9 @@ const recordOperationalDecisionEvent = async ({decision, req, domain, action, su
   }
 };
 
-const enforceOperationalDecision = async ({decision, override, req, domain, action, subjectId, exceptionModule, blockedCode, overrideCode}) => {
+const enforceOperationalDecision = async ({decision, override, req, domain, action, subjectId, exceptionModule, blockedCode, overrideCode, recordEvents=true}) => {
   if (!decision?.canCommit) {
-    await recordOperationalDecisionEvent({decision,req,domain,action,subjectId,status:'blocked'});
+    if(recordEvents) await recordOperationalDecisionEvent({decision,req,domain,action,subjectId,status:'blocked'});
     return {ok:false,status:409,body:{
       error:'Operational decision blocked', code:blockedCode,
       message:'A non-overridable operational constraint must be resolved before this change can be saved.',
@@ -3431,7 +3435,7 @@ const enforceOperationalDecision = async ({decision, override, req, domain, acti
   if (decision.requiresOverride) {
     const allowed=await canOverrideOperationalDecision(req, exceptionModule);
     if (!override?.accepted) {
-      await recordOperationalDecisionEvent({decision,req,domain,action,subjectId,status:'exception_required'});
+      if(recordEvents) await recordOperationalDecisionEvent({decision,req,domain,action,subjectId,status:'exception_required'});
       return {ok:false,status:409,body:{
         error:'Exception approval required', code:overrideCode,
         message:'This change can continue only with an authorised exception and a recorded reason.',
@@ -7028,11 +7032,15 @@ app.delete('/api/coverage-areas/:id', authenticateToken, checkPermission('system
 // ===== ONCALL BATCH INSERT =====
 app.post('/api/oncall/batch', authenticateToken, requireAuthority('sync.oncall.commit',{scopes:['all']}), apiLimiter, async(req,res)=>{
   const shifts=req.body?.shifts;
+  if(req.body?.dry_run!==undefined&&typeof req.body.dry_run!=='boolean')return res.status(400).json({error:'dry_run must be boolean'});
+  const dryRun=req.body?.dry_run===true;
   if(!Array.isArray(shifts)||!shifts.length||shifts.length>200)return res.status(400).json({error:'Provide 1 to 200 reviewed shifts.'});
-  const results=[];let inserted=0,updated=0,skipped=0;
+  const results=[];let inserted=0,updated=0,skipped=0,ready=0;
+  const dates={};for(const shift of shifts)dates[shift?.duty_date]=(dates[shift?.duty_date]||0)+1;
   for(const s of shifts){
     try{
       const date=s.duty_date;
+      if(dates[date]>1)throw Error('Repeated date in request. Review the source file.');
       if(!/^\d{4}-\d{2}-\d{2}$/.test(date||'')||isNaN(Date.parse(date))||new Date(date+'T12:00:00Z').toISOString().slice(0,10)!==date||!['on_call_home','on_call_mixed','on_call_present'].includes(s.shift_type))throw Error('Invalid date or shift type');
       if(!s.primary_physician_id||!Object.prototype.hasOwnProperty.call(s,'resident_physician_id')||s.primary_physician_id===s.resident_physician_id)throw Error('Invalid staff/resident selection');
       const {data:existing,error:readError}=await supabase.from('oncall_schedule').select('*').eq('duty_date',date).is('deleted_at',null);if(readError)throw readError;
@@ -7044,17 +7052,18 @@ app.post('/api/oncall/batch', authenticateToken, requireAuthority('sync.oncall.c
       await Access.authorize(child,'oncall_schedule',action);
       const {data:staff,error:staffError}=await supabase.from('medical_staff').select('id,department_id,employment_status,deleted_at,staff_type').in('id',[s.primary_physician_id,s.resident_physician_id].filter(Boolean));if(staffError)throw staffError;
       if(staff.length!==[s.primary_physician_id,s.resident_physician_id].filter(Boolean).length||staff.some(p=>p.employment_status!=='active'||p.deleted_at))throw Error('Assignment includes unavailable staff');
-      if(s.resident_physician_id){const resident=staff.find(p=>p.id===s.resident_physician_id);const {data:type,error:typeError}=await supabase.from('staff_types').select('is_resident_type').eq('type_key',resident.staff_type).maybeSingle();if(typeError)throw typeError;if(!type?.is_resident_type)throw Error('MIR must be linked to a resident staff profile');}
+      if(s.resident_physician_id){const resident=staff.find(p=>p.id===s.resident_physician_id);const {data:type,error:typeError}=await supabase.from('staff_types').select('is_resident_type').eq('type_key',resident.staff_type).maybeSingle();if(typeError)throw typeError;if(!type?.is_resident_type)throw Error('Resident assignment must link to a resident staff profile');}
       // Check leave and duty conflicts for both the attending and the MIR.
       const reviews=[];
       for(const id of [s.primary_physician_id,s.resident_physician_id].filter(Boolean)){
-        const decision=await buildOnCallDecision({...current,...s,primary_physician_id:id,backup_physician_id:id===s.primary_physician_id?current?.backup_physician_id||null:null},{excludeId:current?.id||null,action:current?'update':'assign'});
+        const decision=await buildOnCallDecision({duty_date:date,shift_type:s.shift_type,start_time:current?.start_time||'15:00',end_time:current?.end_time||'08:00',coverage_area_id:current?.coverage_area_id||null,primary_physician_id:id,backup_physician_id:id===s.primary_physician_id?current?.backup_physician_id||null:null},{excludeId:current?.id||null,action:current?'update':'assign'});
         const warnings=(decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block');
         const override=req.body.acknowledge_history===true&&warnings.every(f=>f.code==='ONCALL_RETROSPECTIVE_ASSIGNMENT')?{accepted:true,reason:'Administrator explicitly acknowledged historical Excel schedule import.'}:undefined;
-        const enforcement=await enforceOperationalDecision({decision,override,req:child,domain:'oncall_schedule',action:'sync',subjectId:id,exceptionModule:'oncall_exceptions',blockedCode:'ONCALL_DECISION_BLOCKED',overrideCode:'ONCALL_OVERRIDE_REQUIRED'});
+        const enforcement=await enforceOperationalDecision({decision,override,req:child,domain:'oncall_schedule',action:'sync',subjectId:id,exceptionModule:'oncall_exceptions',blockedCode:'ONCALL_DECISION_BLOCKED',overrideCode:'ONCALL_OVERRIDE_REQUIRED',recordEvents:!dryRun});
         if(!enforcement.ok)throw Error((decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.title).join('; ')||'Operational conflict requires review in On-call');
         reviews.push({decision,subjectId:id,override:enforcement.override});
       }
+      if(dryRun){ready++;results.push({date,status:'ready',action:current?'update':'insert'});continue}
       const primary=staff.find(p=>p.id===s.primary_physician_id);
       const row={primary_physician_id:s.primary_physician_id,resident_physician_id:s.resident_physician_id||null,shift_type:s.shift_type,updated_at:new Date().toISOString(),sync_source:{file:String(req.body.source_file||'').slice(0,240),sheet:String(s.source_sheet||'').slice(0,80),row:Number(s.source_row)||null,actor:req.user.id},sync_key:'guardias:'+String(primary.department_id||'unassigned')+':'+date};
       let recordId=current?.id;
@@ -7062,9 +7071,9 @@ app.post('/api/oncall/batch', authenticateToken, requireAuthority('sync.oncall.c
       else {const {data,error}=await supabase.from('oncall_schedule').insert({...row,duty_date:date,schedule_id:generateId('SCH'),start_time:'15:00',end_time:'08:00',created_by:req.user.id,created_at:new Date().toISOString()}).select('id').single();if(error)throw error;recordId=data.id;inserted++;}
       for(const review of reviews)await recordOperationalDecisionEvent({...review,req,domain:'oncall_schedule',action:'sync',recordId,status:'committed'});
       results.push({date,status:current?'updated':'inserted'});
-    }catch(e){skipped++;results.push({date:s?.duty_date||null,status:'not_saved',message:e.code==='23505'?'Another sync already saved this date. Refresh.':e.status===403?'Permission denied for this assignment':e.message})}
+    }catch(e){skipped++;results.push({date:s?.duty_date||null,status:dryRun?'needs_attention':'not_saved',message:e.code==='23505'?'Another sync already saved this date. Refresh.':e.status===403?'Permission denied for this assignment':e.message})}
   }
-  res.json({success:skipped===0,inserted,updated,skipped,total:inserted+updated,results});
+  res.json({success:skipped===0,dry_run:dryRun,ready,inserted,updated,skipped,total:inserted+updated,results});
 });
 
 // ===== 404 HANDLER =====

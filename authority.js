@@ -293,6 +293,11 @@ function resolveAuthority({ actor, permission, context = {}, overrides = [], now
     return { ...base, decision: DECISIONS.DENY, source: 'catalog', reason: `Unknown permission key: ${permission}.` };
   }
 
+  // A system administrator must retain the tools needed to restore account access.
+  if(canonicalRole==='system_admin'&&(permission.startsWith('identity.')||permission==='system.settings.view')){
+    return {...base,decision:DECISIONS.ALLOW,visibility:'full',source:'system_admin_recovery',matched_scope:'all',reason:'Protected system-administrator access for account recovery.'};
+  }
+
   const activeOverrides = (overrides || [])
     .map(normalizeOverride)
     .filter(Boolean)
