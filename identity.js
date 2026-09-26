@@ -1,6 +1,11 @@
 'use strict';
 // Development credentials never act as a master password and fail closed in production.
 const developmentEnabled = (env=process.env) => env.NODE_ENV === 'development' && env.IDENTITY_DEV_PASSWORDS_ENABLED === 'true';
+function developmentPasswordStatus(isSystemAdmin,env=process.env) {
+ if(!isSystemAdmin)return {status:'system_admin_required'};
+ const development=env.NODE_ENV==='development',flag=env.IDENTITY_DEV_PASSWORDS_ENABLED==='true';
+ return {status:development&&flag?'enabled':!development?'development_required':'flag_required',checks:{development_mode:development,password_flag:flag}};
+}
 const credentialBlock = (user,enabled) => user.password_reset_required ? 'Choose an individual password using your reset email before signing in.' : user.development_credentials && !enabled ? 'Development credentials are disabled. Ask an administrator for an individual password reset.' : null;
 const emailKey = value => String(value||'').trim().toLowerCase();
 function registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthority,apiLimiter,bcrypt,jwt,JWT_SECRET,APP_URL,sendAccountEmail,tokenDigest,recordIdentityEvent,Authority,resolveRequestAuthority}) {
@@ -87,4 +92,4 @@ function registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthor
   }catch(e){fail(res,e)}
  });
 }
-module.exports={developmentEnabled,credentialBlock,emailKey,registerIdentityWorkspace};
+module.exports={developmentPasswordStatus,developmentEnabled,credentialBlock,emailKey,registerIdentityWorkspace};

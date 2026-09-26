@@ -1645,7 +1645,11 @@ app.get('/api/identity/users/:id/events', authenticateToken, requireAuthority('i
 });
 IdentityWorkspace.registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthority,apiLimiter,bcrypt,jwt,JWT_SECRET,APP_URL,sendAccountEmail,tokenDigest,recordIdentityEvent,Authority,resolveRequestAuthority});
 TestSessions.register({app,authenticateToken,apiLimiter,supabase,Authority,jwt,JWT_SECRET,credentialBlock:IdentityWorkspace.credentialBlock,developmentEnabled:IdentityWorkspace.developmentEnabled});
-app.get('/api/identity/config', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, (req,res)=>res.json({invitations_enabled:IDENTITY_INVITES_ENABLED,development_test_sessions_enabled:TestSessions.enabled()&&Authority.normalizeRole(req.user.user_role)==='system_admin',development_passwords_enabled:IdentityWorkspace.developmentEnabled()&&Authority.normalizeRole(req.user.user_role)==='system_admin'}));
+app.get('/api/identity/config', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, (req,res)=>{
+ const isSystemAdmin=Authority.normalizeRole(req.user.user_role)==='system_admin';
+ res.setHeader('Cache-Control','no-store');
+ res.json({invitations_enabled:IDENTITY_INVITES_ENABLED,development_test_sessions_enabled:TestSessions.enabled()&&isSystemAdmin,development_passwords_enabled:IdentityWorkspace.developmentEnabled()&&isSystemAdmin,development_passwords:IdentityWorkspace.developmentPasswordStatus(isSystemAdmin)});
+});
 app.get('/api/authority/catalog', authenticateToken, apiLimiter, async (req, res) => {
   res.json({
     success: true,
