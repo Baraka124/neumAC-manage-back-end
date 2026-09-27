@@ -1,4 +1,3 @@
-/* neumDesk V46.14 · Phase 5.3E · Grounded permission-aware retrieval · 2026-09-27 */
 // neumDesk V46.14 · Phase 5.3D · Operational Visibility & Field Projection · Production backend · 2026-09-24
 // Stable production filename: index.js. Release identifiers live in comments, not filenames.
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
@@ -1275,66 +1274,6 @@ app.get('/api/debug/live-status', authenticateToken, async (req, res) => {
   }
 });
 
-
-// ============ PHASE 5.3E · GROUNDED AUTHORITY ENVELOPE ============
-// Grounded never invents a parallel permission model. This compact envelope is
-// derived from the same Authority resolver used by protected API routes. It is
-// a client-side UX hint only: every backend read/write remains independently
-// enforced and projected on the server.
-const GROUNDED_AUTHORITY_KEYS = Object.freeze([
-  'grounded.ask','grounded.propose','grounded.commit',
-  'staff.directory.view','staff.profile.view','staff.profile.edit',
-  'rotation.view','rotation.create','rotation.edit','rotation.terminate','rotation.approve_exception',
-  'leave.view','leave.create','leave.edit','leave.return_to_duty','leave.approve_exception',
-  'oncall.view','oncall.assign','oncall.edit','oncall.cancel','oncall.approve_exception',
-  'research.view','research.edit','publications.view','publications.edit'
-]);
-
-async function buildGroundedAuthorityEnvelope(actor) {
-  if (!actor?.id) return { schema:'grounded.authority.v1', actor:null, permissions:{} };
-  const overrides = await loadAuthorityOverrides(actor.id);
-  const candidateScopes = [];
-  if (actor.department_id) candidateScopes.push('department');
-  if (actor.medical_staff_id) candidateScopes.push('own');
-  candidateScopes.push('all');
-  const permissions = {};
-  for (const key of GROUNDED_AUTHORITY_KEYS) {
-    let chosen = null;
-    for (const scope of [...new Set(candidateScopes)]) {
-      const result = Authority.resolveAuthority({ actor, permission:key, context:{scopes:[scope]}, overrides });
-      if (result.source === 'user_override_deny') { chosen = result; break; }
-      if (!chosen) chosen = result;
-      if (result.decision !== Authority.DECISIONS.DENY) { chosen = result; break; }
-    }
-    permissions[key] = {
-      decision: chosen?.decision || Authority.DECISIONS.DENY,
-      visibility: chosen?.visibility || 'none',
-      scope: chosen?.matched_scope || null,
-      source: chosen?.source || 'role_default',
-      reason: chosen?.reason || null
-    };
-  }
-  return {
-    schema:'grounded.authority.v1',
-    generated_at:new Date().toISOString(),
-    actor:{
-      user_id:actor.id,
-      staff_id:actor.medical_staff_id || null,
-      department_id:actor.department_id || null,
-      role:Authority.normalizeRole(actor.user_role || actor.role) || null
-    },
-    permissions
-  };
-}
-
-const groundedScopes = req => {
-  const scopes=[];
-  if(req?.user?.department_id) scopes.push('department');
-  if(req?.user?.medical_staff_id) scopes.push('own');
-  scopes.push('all');
-  return {scopes:[...new Set(scopes)]};
-};
-
 // ===== 2. AUTHENTICATION =====
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
@@ -1403,8 +1342,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     await supabase.from('app_users').update({ last_login_at: loginAt, updated_at: loginAt }).eq('id', user.id);
     await recordIdentityEvent(user.id, user.id, 'login_success', null, { auth_version: authVersion });
     const { password_hash, ...userWithoutPassword } = user;
-    const groundedAuthority = await buildGroundedAuthorityEnvelope({ ...userWithoutPassword, auth_version: authVersion });
-    res.json({ token, user: { ...userWithoutPassword, auth_version: authVersion, last_login_at: loginAt, permissions, linked_staff: linkedStaff, grounded_authority: groundedAuthority }, expires_in: '24h' });
+    res.json({ token, user: { ...userWithoutPassword, auth_version: authVersion, last_login_at: loginAt, permissions, linked_staff: linkedStaff }, expires_in: '24h' });
 
   } catch (error) {
     console.error('Login error:', error);
@@ -1437,8 +1375,7 @@ app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
         .maybeSingle();
       linkedStaff = staffRow || null;
     }
-    const groundedAuthority = await buildGroundedAuthorityEnvelope(data);
-    res.json({ ...data, permissions, linked_staff: linkedStaff, grounded_authority: groundedAuthority })
+    res.json({ ...data, permissions, linked_staff: linkedStaff })
   } catch (e) { res.status(401).json({ error: 'Session validation failed' }) }
 });
 
@@ -1690,19 +1627,6 @@ app.get('/api/authority/me', authenticateToken, apiLimiter, async (req, res) => 
     res.json({ success: true, ...snapshot });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load authority', message: e.message });
-  }
-});
-
-app.get('/api/grounded/authority', authenticateToken, apiLimiter, async (req, res) => {
-  try {
-    const envelope = await buildGroundedAuthorityEnvelope(req.user);
-    const ask = envelope.permissions['grounded.ask'];
-    if (!ask || ask.decision === Authority.DECISIONS.DENY) {
-      return res.status(403).json({ error:'Authority denied', code:'GROUNDED_ASK_DENIED', permission:'grounded.ask', authority:ask || null });
-    }
-    res.json({ success:true, authority:envelope });
-  } catch (e) {
-    res.status(500).json({ error:'Failed to load Grounded authority', message:e.message });
   }
 });
 
@@ -7303,13 +7227,13 @@ app.put('/api/innovation-projects/:id/execution-clearance', authenticateToken, c
 })
 
 // ═══════════════════ GROUNDED PERSISTENCE ═══════════════════
-app.get('/api/grounded/threads', authenticateToken, requireAuthority('grounded.ask', groundedScopes, { allowLimited:true }), async (req, res) => { try { const { data, error } = await supabase.from('grounded_threads').select('*').eq('user_id', req.user.id).order('updated_at', { ascending: false }).limit(50); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.post('/api/grounded/threads', authenticateToken, requireAuthority('grounded.ask', groundedScopes, { allowLimited:true }), async (req, res) => { try { const { scope_type, scope_id, title } = req.body; const { data, error } = await supabase.from('grounded_threads').insert({ user_id: req.user.id, scope_type, scope_id, title }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.get('/api/grounded/threads/:id/turns', authenticateToken, requireAuthority('grounded.ask', groundedScopes, { allowLimited:true }), async (req, res) => { try { const { data, error } = await supabase.from('grounded_turns').select('*').eq('thread_id', req.params.id).order('created_at', { ascending: true }).limit(200); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.post('/api/grounded/threads/:id/turns', authenticateToken, requireAuthority('grounded.ask', groundedScopes, { allowLimited:true }), async (req, res) => { try { const { role, query_text, answer_type, payload, evidence } = req.body; const { data, error } = await supabase.from('grounded_turns').insert({ thread_id: req.params.id, role: role || 'user', query_text, answer_type, payload, evidence }).select().single(); if (error) throw error; await supabase.from('grounded_threads').update({ updated_at: new Date().toISOString() }).eq('id', req.params.id); res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.get('/api/grounded/watchlist', authenticateToken, requireAuthority('grounded.ask', groundedScopes, { allowLimited:true }), async (req, res) => { try { const { data, error } = await supabase.from('grounded_watchlist').select('*').eq('user_id', req.user.id).eq('active', true); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.post('/api/grounded/watchlist', authenticateToken, requireAuthority('grounded.ask', groundedScopes, { allowLimited:true }), async (req, res) => { try { const { object_type, object_id, rule_key, config } = req.body; const { data, error } = await supabase.from('grounded_watchlist').insert({ user_id: req.user.id, object_type, object_id, rule_key, config }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
-app.delete('/api/grounded/watchlist/:id', authenticateToken, requireAuthority('grounded.ask', groundedScopes, { allowLimited:true }), async (req, res) => { try { await supabase.from('grounded_watchlist').update({ active: false }).eq('id', req.params.id).eq('user_id', req.user.id); res.json({ success: true }) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.get('/api/grounded/threads', authenticateToken, async (req, res) => { try { const { data, error } = await supabase.from('grounded_threads').select('*').eq('user_id', req.user.id).order('updated_at', { ascending: false }).limit(50); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.post('/api/grounded/threads', authenticateToken, async (req, res) => { try { const { scope_type, scope_id, title } = req.body; const { data, error } = await supabase.from('grounded_threads').insert({ user_id: req.user.id, scope_type, scope_id, title }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.get('/api/grounded/threads/:id/turns', authenticateToken, async (req, res) => { try { const { data, error } = await supabase.from('grounded_turns').select('*').eq('thread_id', req.params.id).order('created_at', { ascending: true }).limit(200); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.post('/api/grounded/threads/:id/turns', authenticateToken, async (req, res) => { try { const { role, query_text, answer_type, payload, evidence } = req.body; const { data, error } = await supabase.from('grounded_turns').insert({ thread_id: req.params.id, role: role || 'user', query_text, answer_type, payload, evidence }).select().single(); if (error) throw error; await supabase.from('grounded_threads').update({ updated_at: new Date().toISOString() }).eq('id', req.params.id); res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.get('/api/grounded/watchlist', authenticateToken, async (req, res) => { try { const { data, error } = await supabase.from('grounded_watchlist').select('*').eq('user_id', req.user.id).eq('active', true); if (error) throw error; res.json(data || []) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.post('/api/grounded/watchlist', authenticateToken, async (req, res) => { try { const { object_type, object_id, rule_key, config } = req.body; const { data, error } = await supabase.from('grounded_watchlist').insert({ user_id: req.user.id, object_type, object_id, rule_key, config }).select().single(); if (error) throw error; res.status(201).json(data) } catch (e) { res.status(500).json({ error: e.message }) } })
+app.delete('/api/grounded/watchlist/:id', authenticateToken, async (req, res) => { try { await supabase.from('grounded_watchlist').update({ active: false }).eq('id', req.params.id).eq('user_id', req.user.id); res.json({ success: true }) } catch (e) { res.status(500).json({ error: e.message }) } })
 
 // ═══════════════════ PASSWORD RESET ═══════════════════
 app.post('/api/auth/password-reset/request', apiLimiter, async (req, res) => { res.json({ ok: true, message: 'If the account exists, reset instructions have been sent.' }) })
