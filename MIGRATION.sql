@@ -1,6 +1,6 @@
--- neumDesk V46.14 · Current cumulative migration through Phase 5.3D
+-- neumDesk V46.14 · Current cumulative migration through Phase 5.3E
 -- Stable deployment filename: MIGRATION.sql
--- Phase 5.3D adds no new schema; this stable file retains the cumulative 5.3B/5.3C identity + authority migration.
+-- Phase 5.3E adds no new schema; this stable file retains the cumulative 5.3B/5.3C identity + authority migration.
 -- This migration is additive/idempotent where practical and never deletes user identities.
 
 BEGIN;

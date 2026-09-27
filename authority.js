@@ -39,10 +39,6 @@ const PERMISSION_CATALOG = Object.freeze({
   'identity.users.security': { domain: 'identity', label: 'Manage account security actions' },
   'identity.overrides.manage': { domain: 'identity', label: 'Manage explicit authority overrides' },
 
-  'staff.create': { domain: 'staff', label: 'Create staff records' },
-  'staff.archive': { domain: 'staff', label: 'Archive staff records' },
-  'leave.cancel': { domain: 'leave', label: 'Cancel leave records' },
-  'leave.purge': { domain: 'leave', label: 'Permanently remove leave records' },
   // People / professional identity
   'staff.directory.view': { domain: 'staff', label: 'View departmental professional directory' },
   'staff.profile.view': { domain: 'staff', label: 'View professional profile' },
@@ -80,10 +76,6 @@ const PERMISSION_CATALOG = Object.freeze({
   'sync.rotations.preview': { domain: 'sync', label: 'Preview rotations external-source sync' },
   'sync.rotations.commit': { domain: 'sync', label: 'Commit rotations external-source sync' },
 
-  'units.view': { domain: 'units', label: 'View clinical units' },
-  'units.edit': { domain: 'units', label: 'Manage clinical units and assignments' },
-  'research.catalog.view': { domain: 'research', label: 'View shared partner catalog' },
-  'research.catalog.edit': { domain: 'research', label: 'Manage shared partner catalog' },
   // Research / system
   'research.view': { domain: 'research', label: 'View research portfolio' },
   'research.edit': { domain: 'research', label: 'Edit research portfolio' },
@@ -101,9 +93,6 @@ const ROLE_POLICIES = Object.freeze({
   }),
 
   department_head: Object.freeze({
-    'staff.create': Object.freeze([rule('department', 'full')]),
-    'staff.archive': Object.freeze([rule('department', 'full')]),
-    'leave.cancel': Object.freeze([rule('department', 'full')]),
     'identity.users.view': Object.freeze([rule('all', 'full', 'Department heads may review account identities but do not administer them by default.')]),
 
     'staff.directory.view': Object.freeze([rule('department', 'full')]),
@@ -134,9 +123,6 @@ const ROLE_POLICIES = Object.freeze({
     'governance.view': Object.freeze([rule('department', 'full')]),
     'governance.review': Object.freeze([rule('department', 'full')]),
 
-    'units.view': Object.freeze([rule('department', 'full')]),
-    'units.edit': Object.freeze([rule('department', 'full')]),
-    'research.catalog.view': Object.freeze([rule('all', 'full')]),
     'research.view': Object.freeze([rule('department', 'full')]),
     'research.edit': Object.freeze([rule('department', 'full')]),
     'publications.view': Object.freeze([rule('department', 'full')]),
@@ -145,9 +131,6 @@ const ROLE_POLICIES = Object.freeze({
   }),
 
   coordinator: Object.freeze({
-    'staff.create': Object.freeze([rule('department', 'full')]),
-    'staff.archive': Object.freeze([rule('department', 'full')]),
-    'leave.cancel': Object.freeze([rule('department', 'full')]),
     'staff.directory.view': Object.freeze([rule('department', 'summary')]),
     'staff.profile.view': Object.freeze([rule('own', 'full'), rule('department', 'operational')]),
     'staff.profile.edit': Object.freeze([rule('department', 'full')]),
@@ -172,9 +155,6 @@ const ROLE_POLICIES = Object.freeze({
     'grounded.commit': Object.freeze([rule('department', 'full')]),
     'governance.view': Object.freeze([rule('department', 'full')]),
 
-    'units.view': Object.freeze([rule('department', 'full')]),
-    'units.edit': Object.freeze([rule('department', 'full')]),
-    'research.catalog.view': Object.freeze([rule('all', 'full')]),
     'research.view': Object.freeze([rule('department', 'full')]),
     'research.edit': Object.freeze([rule('department', 'full')]),
     'publications.view': Object.freeze([rule('department', 'full')]),
@@ -183,7 +163,6 @@ const ROLE_POLICIES = Object.freeze({
   }),
 
   clinician: Object.freeze({
-    'leave.cancel': Object.freeze([rule('own', 'full')]),
     'staff.directory.view': Object.freeze([rule('department', 'summary')]),
     'staff.profile.view': Object.freeze([rule('own', 'full'), rule('department', 'summary')]),
     'staff.profile.edit': Object.freeze([rule('own', 'full')]),
@@ -197,14 +176,11 @@ const ROLE_POLICIES = Object.freeze({
     'grounded.ask': Object.freeze([rule('department', 'operational')]),
     'grounded.propose': Object.freeze([rule('own', 'full')]),
     'research.view': Object.freeze([rule('department', 'summary')]),
-    'units.view': Object.freeze([rule('department', 'operational')]),
-    'research.catalog.view': Object.freeze([rule('all', 'summary')]),
     'publications.view': Object.freeze([rule('department', 'full')]),
     'publications.edit': Object.freeze([rule('own', 'full')])
   }),
 
   resident: Object.freeze({
-    'leave.cancel': Object.freeze([rule('own', 'full')]),
     'staff.directory.view': Object.freeze([rule('department', 'summary')]),
     'staff.profile.view': Object.freeze([rule('own', 'full'), rule('department', 'summary')]),
     'staff.profile.edit': Object.freeze([rule('own', 'full')]),
@@ -215,7 +191,6 @@ const ROLE_POLICIES = Object.freeze({
     'oncall.view': Object.freeze([rule('department', 'operational')]),
 
     'grounded.ask': Object.freeze([rule('department', 'operational')]),
-    'units.view': Object.freeze([rule('department', 'operational')]),
     'publications.view': Object.freeze([rule('department', 'full')])
   })
 });
@@ -291,11 +266,6 @@ function resolveAuthority({ actor, permission, context = {}, overrides = [], now
   }
   if (!PERMISSION_CATALOG[permission]) {
     return { ...base, decision: DECISIONS.DENY, source: 'catalog', reason: `Unknown permission key: ${permission}.` };
-  }
-
-  // A system administrator must retain the tools needed to restore account access.
-  if(canonicalRole==='system_admin'&&(permission.startsWith('identity.')||permission==='system.settings.view')){
-    return {...base,decision:DECISIONS.ALLOW,visibility:'full',source:'system_admin_recovery',matched_scope:'all',reason:'Protected system-administrator access for account recovery.'};
   }
 
   const activeOverrides = (overrides || [])
