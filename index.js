@@ -1,3 +1,4 @@
+const ProductionCredentials = require('./production-credentials');
 const TestSessions = require('./test-sessions');
 const IdentityWorkspace = require('./identity');
 // neumDesk V46.14 · Phase 5.3E · Grounded permission-aware retrieval · Production backend · 2026-09-24
@@ -148,7 +149,7 @@ const {
 // GitHub Pages host and localhost are kept for migration/dev. If the
 // ALLOWED_ORIGINS env var is set on the host it overrides this entirely.
 const ALLOWED_ORIGINS_STRING = ENV_ALLOWED_ORIGINS ||
-  'https://neumact.org,https://www.neumact.org,https://baraka124.github.io,http://localhost:3000,http://localhost:8080';
+  'https://desk.neumact.org,https://neumact.org,https://www.neumact.org,https://baraka124.github.io,http://localhost:3000,http://localhost:8080';
 const allowedOrigins = ALLOWED_ORIGINS_STRING.split(',').map(origin => origin.trim());
 
 console.log('🌐 CORS Configuration:', { allowedOrigins, nodeEnv: NODE_ENV });
@@ -216,7 +217,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'HEAD'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'X-API-Key', 'X-Request-ID'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'X-API-Key', 'X-Request-ID', 'X-Neumdesk-Release'],
   exposedHeaders: ['Content-Range', 'X-Content-Range'],
   maxAge: 86400,
   preflightContinue: false,
@@ -302,6 +303,12 @@ app.use(helmet({
 }));
 
 app.use(express.json({ limit: '10mb' }));
+app.get('/api/release',(req,res)=>{res.setHeader('Cache-Control','no-store');res.json(require('./release.json'))});
+app.use('/api',(req,res,next)=>{
+ const supplied=req.get('X-Neumdesk-Release');
+ if(!['GET','HEAD','OPTIONS'].includes(req.method) && (req.get('Authorization')||['/auth/login','/auth/complete-password-setup'].includes(req.path)) && supplied!==require('./release.json').id)return res.status(409).json({error:'Release mismatch',message:'Refresh the frontend or deploy the matching backend before saving changes.'});
+ next();
+});
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // /uploads static route moved below authenticateToken declaration (see B-SEC5 fix)
 
@@ -575,7 +582,7 @@ const schemas = {
 
   acceptInvitation: Joi.object({
     token: Joi.string().min(20).required(),
-    new_password: Joi.string().min(10).max(72).required()
+    new_password: Joi.string().min(15).max(72).required()
   }),
 
   userProfile: Joi.object({
@@ -588,7 +595,7 @@ const schemas = {
 
   changePassword: Joi.object({
     current_password: Joi.string().required(),
-    new_password: Joi.string().min(10).max(72).required()
+    new_password: Joi.string().min(15).max(72).required()
   }),
 
   forgotPassword: Joi.object({
@@ -597,7 +604,7 @@ const schemas = {
 
   resetPassword: Joi.object({
     token: Joi.string().required(),
-    new_password: Joi.string().min(10).max(72).required()
+    new_password: Joi.string().min(15).max(72).required()
   }),
 
   department: Joi.object({
@@ -795,6 +802,7 @@ const authenticateToken = async (req, res, next) => {
     return res.status(403).json({ error: 'Invalid token', message: 'Access token is invalid or expired' });
   }
   try {
+    if(decoded.purpose && decoded.purpose !== 'development_test') return res.status(401).json({error:'A full sign-in session is required'});
     const { data: identity, error } = await supabase
       .from('app_users')
       .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, auth_version, development_credentials, password_reset_required')
@@ -1300,14 +1308,14 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     // B2 FIX: Removed hardcoded admin bypass (was: admin@neumocare.org / password123)
     // B2 FIX: Removed unauthenticated fallback — unknown users must exist in DB
 
-    if (!email || !password) {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || Buffer.byteLength(password)>72) {
       return res.status(400).json({ error: 'Validation failed', message: 'Email and password are required' });
     }
 
     const { data: user, error } = await supabase
       .from('app_users')
-      .select('id, email, full_name, user_role, job_title, admin_level, department_id, password_hash, account_status, medical_staff_id, auth_version, last_login_at, development_credentials, password_reset_required')
-      .eq('email', email.toLowerCase()).single();
+      .select('id, email, full_name, user_role, job_title, admin_level, department_id, password_hash, account_status, medical_staff_id, auth_version, last_login_at, development_credentials, password_reset_required, temporary_password_expires_at')
+      .eq('email', email.trim().toLowerCase()).single();
 
     if (error || !user) {
       return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
@@ -1326,6 +1334,9 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Authentication failed', message: 'Invalid email or password' });
     }
 
+    const challenge = ProductionCredentials.setupChallenge(user,jwt,JWT_SECRET);
+    if(challenge?.expired) return res.status(403).json({error:'Temporary password expired',message:'Ask your administrator to issue a new temporary password.'});
+    if(challenge){res.setHeader('Cache-Control','no-store');return res.json(challenge)}
     const blocked = IdentityWorkspace.credentialBlock(user, IdentityWorkspace.developmentEnabled());
     if (blocked) return res.status(403).json({error:'Password setup required',message:blocked});
 
@@ -1361,7 +1372,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const loginAt = new Date().toISOString();
     await supabase.from('app_users').update({ last_login_at: loginAt, updated_at: loginAt }).eq('id', user.id);
     await recordIdentityEvent(user.id, user.id, 'login_success', null, { auth_version: authVersion });
-    const { password_hash, ...userWithoutPassword } = user;
+    const { password_hash, temporary_password_expires_at, ...userWithoutPassword } = user;
     res.json({ token, user: { ...userWithoutPassword, auth_version: authVersion, last_login_at: loginAt, permissions, linked_staff: linkedStaff }, expires_in: '24h' });
 
   } catch (error) {
@@ -1644,11 +1655,12 @@ app.get('/api/identity/users/:id/events', authenticateToken, requireAuthority('i
   catch(e){res.status(500).json({error:'Could not load identity history'});}
 });
 IdentityWorkspace.registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthority,apiLimiter,bcrypt,jwt,JWT_SECRET,APP_URL,sendAccountEmail,tokenDigest,recordIdentityEvent,Authority,resolveRequestAuthority});
+ProductionCredentials.register({app,db:supabase,authenticateToken,requireAuthority,bcrypt,jwt,secret:JWT_SECRET,recordIdentityEvent,Authority});
 TestSessions.register({app,authenticateToken,apiLimiter,supabase,Authority,jwt,JWT_SECRET,credentialBlock:IdentityWorkspace.credentialBlock,developmentEnabled:IdentityWorkspace.developmentEnabled});
 app.get('/api/identity/config', authenticateToken, requireAuthority('identity.users.view',{scopes:['all']}), apiLimiter, (req,res)=>{
  const isSystemAdmin=Authority.normalizeRole(req.user.user_role)==='system_admin';
  res.setHeader('Cache-Control','no-store');
- res.json({invitations_enabled:IDENTITY_INVITES_ENABLED,development_test_sessions_enabled:TestSessions.enabled()&&isSystemAdmin,development_passwords_enabled:IdentityWorkspace.developmentEnabled()&&isSystemAdmin,development_passwords:IdentityWorkspace.developmentPasswordStatus(isSystemAdmin)});
+ res.json({production_credentials_enabled:isSystemAdmin,release:require('./release.json').id,invitations_enabled:IDENTITY_INVITES_ENABLED,development_test_sessions_enabled:TestSessions.enabled()&&isSystemAdmin,development_passwords_enabled:IdentityWorkspace.developmentEnabled()&&isSystemAdmin,development_passwords:IdentityWorkspace.developmentPasswordStatus(isSystemAdmin)});
 });
 app.get('/api/authority/catalog', authenticateToken, apiLimiter, async (req, res) => {
   res.json({
@@ -1774,7 +1786,7 @@ app.get('/api/identity/users', authenticateToken, requireAuthority('identity.use
     const users=[];
     for(let start=0;;start+=500){
       const {data,error}=await supabase.from('app_users')
-        .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, job_title, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at, development_credentials, password_reset_required')
+        .select('id, email, full_name, user_role, admin_level, account_status, medical_staff_id, department_id, job_title, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at, development_credentials, password_reset_required, temporary_password_expires_at')
         .order('id').range(start,start+499);
       if(error)throw error;users.push(...(data||[]));if(!data||data.length<500)break;
     }
@@ -2008,7 +2020,7 @@ app.get('/api/users', authenticateToken, requireAuthority('identity.users.view',
     const { page = 1, limit = 20, role, department_id, status } = req.query;
     const offset = (page - 1) * limit;
     let query = supabase.from('app_users')
-      .select('id, email, full_name, user_role, department_id, medical_staff_id, phone_number, account_status, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at, development_credentials, password_reset_required', { count: 'exact' });
+      .select('id, email, full_name, user_role, department_id, medical_staff_id, phone_number, account_status, invited_at, activated_at, suspended_at, locked_at, archived_at, last_login_at, created_at, updated_at, development_credentials, password_reset_required, temporary_password_expires_at', { count: 'exact' });
     if (role) query = query.eq('user_role', role);
     if (department_id) query = query.eq('department_id', department_id);
     if (status) query = query.eq('account_status', status);
@@ -2040,7 +2052,7 @@ app.put('/api/users/profile', authenticateToken, validate(schemas.userProfile), 
   try {
     const { data, error } = await supabase.from('app_users')
       .update({ ...(req.validatedData || req.body), updated_at: new Date().toISOString() })
-      .eq('id', req.user.id).select().single();
+      .eq('id', req.user.id).select('id,email,full_name,phone_number,notifications_enabled,absence_notifications,announcement_notifications').single();
     if (error) throw error;
     res.json(data);
   } catch (error) {
@@ -3102,6 +3114,7 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
     if (!startDate || !endDate || endDate < startDate) {
       return res.status(400).json({ error: 'Invalid date format', message: 'start_date and end_date must define a valid rotation window' });
     }
+    if(dataSource.rotation_status==='terminated_early'&&!actualEndDate)return res.status(400).json({error:'Actual end date required',message:'Record when the rotation actually ended.'});
     if (actualEndDate && actualEndDate < (actualStartDate || startDate)) {
       return res.status(400).json({ error: 'Invalid actual date window', message: 'actual_end_date cannot be before the effective rotation start' });
     }

@@ -82,7 +82,7 @@ function registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthor
    const patch={auth_version:Number(user.auth_version||1)+1,updated_at:new Date().toISOString()};let rawToken;
    if(action==='require_password_reset'){
     rawToken=jwt.sign({purpose:'password_reset',userId:user.id,email:user.email,jti:require('crypto').randomUUID()},JWT_SECRET,{expiresIn:'1h'});
-    Object.assign(patch,{password_reset_required:true,reset_token:tokenDigest(rawToken),reset_token_expires_at:new Date(Date.now()+3600000).toISOString()});
+    Object.assign(patch,{password_reset_required:true,temporary_password_expires_at:null,reset_token:tokenDigest(rawToken),reset_token_expires_at:new Date(Date.now()+3600000).toISOString()});
    }
    const {data:updated,error:updateError}=await supabase.from('app_users').update(patch).eq('id',user.id).eq('account_status','active').eq('auth_version',user.auth_version).select('id').maybeSingle();if(updateError)throw updateError;if(!updated)return res.status(409).json({error:'Account changed. Refresh before retrying.'});
    let delivery=null;
