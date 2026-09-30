@@ -176,10 +176,11 @@ function projectOnCall(row, visibility = 'summary') {
 
   const base = pick(row, [
     'id', 'schedule_id', 'duty_date', 'primary_physician_id',
-    'backup_physician_id', 'coverage_area_id'
+    'backup_physician_id', 'resident_physician_id', 'coverage_area_id'
   ]);
   base.primary_physician = projectPersonRef(row.primary_physician, 'summary');
   base.backup_physician = projectPersonRef(row.backup_physician, 'summary');
+  base.resident_physician = projectPersonRef(row.resident_physician, 'summary');
   if (row.coverage_area) base.coverage_area = cleanObject(pick(row.coverage_area, ['id', 'name', 'code', 'color']));
 
   if (level === 'operational') {
