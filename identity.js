@@ -80,11 +80,12 @@ function registerIdentityWorkspace({app,supabase,authenticateToken,requireAuthor
    if(!user||user.account_status!=='active')return res.status(409).json({error:'Choose an active account.'});
    if(Authority.normalizeRole(user.user_role)==='system_admin'&&Authority.normalizeRole(req.user.user_role)!=='system_admin')return res.status(403).json({error:'Only a system administrator can manage another administrator.'});
    const patch={auth_version:Number(user.auth_version||1)+1,updated_at:new Date().toISOString()};let rawToken;
+   if(action==='require_password_reset'&&Authority.normalizeRole(user.user_role)==='system_admin')return res.status(403).json({error:'System-administrator passwords cannot be changed or reset in this application.'});
    if(action==='require_password_reset'){
     rawToken=jwt.sign({purpose:'password_reset',userId:user.id,email:user.email,jti:require('crypto').randomUUID()},JWT_SECRET,{expiresIn:'1h'});
     Object.assign(patch,{password_reset_required:true,temporary_password_expires_at:null,reset_token:tokenDigest(rawToken),reset_token_expires_at:new Date(Date.now()+3600000).toISOString()});
    }
-   const {data:updated,error:updateError}=await supabase.from('app_users').update(patch).eq('id',user.id).eq('account_status','active').eq('auth_version',user.auth_version).select('id').maybeSingle();if(updateError)throw updateError;if(!updated)return res.status(409).json({error:'Account changed. Refresh before retrying.'});
+   const {data:updated,error:updateError}=await supabase.from('app_users').update(patch).eq('id',user.id).eq('account_status','active').eq('auth_version',user.auth_version).eq('user_role',user.user_role).select('id').maybeSingle();if(updateError)throw updateError;if(!updated)return res.status(409).json({error:'Account changed. Refresh before retrying.'});
    let delivery=null;
    if(rawToken){try{delivery=await sendAccountEmail(user.email,'Choose your individual Neumact password',`<p>Your administrator requires a new individual password. Existing sessions have ended.</p><p><a href="${APP_URL}?reset_token=${encodeURIComponent(rawToken)}">Choose password</a></p><p>This link expires in one hour.</p>`)}catch{delivery={delivered:false,mode:'delivery_failed'}}}
    await recordIdentityEvent(req.user.id,user.id,action,reason.trim(),{delivery:delivery?.mode||null});

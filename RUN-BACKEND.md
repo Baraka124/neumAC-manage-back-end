@@ -1,4 +1,4 @@
-# Backend — 5.3-production.1
+# Backend — 5.3-production.2
 
 Deploy this as a matched pair with the supplied frontend.
 
@@ -14,3 +14,5 @@ Before deployment: `python verify_release.py --frontend ../frontend --backend .`
 For local use: backend on port 3000, frontend at http://localhost:8080; include that origin in ALLOWED_ORIGINS. Use a test Supabase project if you want to avoid writing to your real data.
 
 Rollback: redeploy BOTH previous recovery packages together. The added nullable database column can remain. Accounts already issued temporary credentials still require individual password setup; use the previous email-reset flow or complete setup before rolling back. Do not remove the migration column during rollback.
+
+Update .2: existing system-administrator passwords cannot be changed or reset within the application. Entering your current administrator password only confirms your identity. Generated user credentials now appear visibly and scroll into view. If the .1 migration was already applied, no further SQL is needed.

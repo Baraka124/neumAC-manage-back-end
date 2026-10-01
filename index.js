@@ -1430,9 +1430,9 @@ app.post('/api/auth/register', authenticateToken, requireAuthority('identity.use
 app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPassword), async (req, res) => {
   try {
     const { email } = req.validatedData || req.body;
-    const { data: user } = await supabase.from('app_users').select('id, email, full_name, account_status').eq('email', email.toLowerCase()).single();
+    const { data: user } = await supabase.from('app_users').select('id, email, full_name, account_status, user_role').eq('email', email.toLowerCase()).single();
     // Always return 200 — never reveal whether the email exists (prevents enumeration)
-    if (user && user.account_status === 'active') {
+    if (user && user.account_status === 'active' && Authority.normalizeRole(user.user_role)!=='system_admin') {
       const resetToken = jwt.sign({ userId: user.id, email: user.email, purpose: 'password_reset', jti: crypto.randomUUID() }, JWT_SECRET, { expiresIn: '1h' });
       const tokenExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
       // Store token hash in DB so it can be invalidated after use
@@ -1440,7 +1440,7 @@ app.post('/api/auth/forgot-password', authLimiter, validate(schemas.forgotPasswo
         reset_token: tokenDigest(resetToken),
         reset_token_expires_at: tokenExpiry,
         updated_at: new Date().toISOString()
-      }).eq('id', user.id);
+      }).eq('id', user.id).eq('user_role',user.user_role);
       if(resetError)throw resetError;
       const resetLink = `${APP_URL}?reset_token=${resetToken}`;
       try {
@@ -1479,8 +1479,9 @@ app.post('/api/auth/reset-password', authLimiter, validate(schemas.resetPassword
     }
     // Verify token matches what's stored (prevents token reuse after a new reset was requested)
     const { data: user } = await supabase.from('app_users')
-      .select('id, reset_token, reset_token_expires_at, auth_version, account_status, password_hash')
+      .select('id, reset_token, reset_token_expires_at, auth_version, account_status, password_hash, user_role')
       .eq('email', decoded.email).single();
+    if(user && Authority.normalizeRole(user.user_role)==='system_admin')return res.status(403).json({error:'Administrator password protected',message:'System-administrator passwords cannot be reset in this application.'});
     if (!user || user.account_status !== 'active' || user.id !== decoded.userId || user.reset_token !== tokenDigest(token)) {
       return res.status(400).json({ error: 'Token already used', message: 'This reset link has already been used or superseded. Please request a new one.' });
     }
@@ -1499,7 +1500,7 @@ app.post('/api/auth/reset-password', authLimiter, validate(schemas.resetPassword
         auth_version: Number(user.auth_version || 1) + 1,
         updated_at: new Date().toISOString()
       })
-      .eq('id',user.id).eq('account_status','active').eq('auth_version',user.auth_version).eq('reset_token',tokenDigest(token)).select('id').maybeSingle();
+      .eq('id',user.id).eq('account_status','active').eq('auth_version',user.auth_version).eq('reset_token',tokenDigest(token)).eq('user_role',user.user_role).select('id').maybeSingle();
     if (error) throw error;
     if (!changed) return res.status(409).json({error:'Reset already used or account changed. Request a new link.'});
     await recordIdentityEvent(user.id,user.id,'password_reset_completed',null,{});
@@ -1919,7 +1920,7 @@ app.post('/api/auth/accept-invitation', authLimiter, validate(schemas.acceptInvi
     catch { return res.status(400).json({ error: 'Invalid or expired invitation' }); }
     if (decoded.purpose !== 'account_invitation') return res.status(400).json({ error: 'Invalid invitation token' });
     let query = supabase.from('app_users')
-      .select('id, email, full_name, account_status, invitation_token_hash, invitation_expires_at, auth_version')
+      .select('id, email, full_name, user_role, password_hash, account_status, invitation_token_hash, invitation_expires_at, auth_version')
       .eq('email', String(decoded.email || '').toLowerCase());
     if (decoded.userId) query = query.eq('id', decoded.userId);
     const { data: target, error } = await query.maybeSingle();
@@ -1927,6 +1928,7 @@ app.post('/api/auth/accept-invitation', authLimiter, validate(schemas.acceptInvi
     if (!target || target.account_status !== 'invited') return res.status(400).json({ error: 'Invitation is no longer active' });
     if (!target.invitation_token_hash || target.invitation_token_hash !== tokenDigest(token)) return res.status(400).json({ error: 'Invitation has been superseded' });
     if (!target.invitation_expires_at || new Date(target.invitation_expires_at) < new Date()) return res.status(400).json({ error: 'Invitation expired' });
+    if(Authority.normalizeRole(target.user_role)==='system_admin'&&target.password_hash)return res.status(403).json({error:'Administrator password protected'});
     if(Buffer.byteLength(new_password)>72) return res.status(400).json({error:'Use a password of at most 72 bytes.'});
     const passwordHash = await bcrypt.hash(new_password, 12);
     const now = new Date().toISOString();
@@ -1939,7 +1941,7 @@ app.post('/api/auth/accept-invitation', authLimiter, validate(schemas.acceptInvi
       lifecycle_reason: null,
       auth_version: Number(target.auth_version || 1) + 1,
       updated_at: now
-    }).eq('id', target.id).eq('account_status','invited').eq('invitation_token_hash',tokenDigest(token)).select('id, email, full_name, user_role, account_status, medical_staff_id, activated_at').maybeSingle();
+    }).eq('id', target.id).eq('account_status','invited').eq('invitation_token_hash',tokenDigest(token)).eq('user_role',target.user_role).eq('auth_version',target.auth_version).select('id, email, full_name, user_role, account_status, medical_staff_id, activated_at').maybeSingle();
     if (updateError) throw updateError;
     if (!activated) return res.status(409).json({error:'Invitation already used or superseded'});
     await recordIdentityEvent(target.id, target.id, 'account_activated', null, { method: 'invitation' });
@@ -1976,6 +1978,7 @@ app.put('/api/identity/users/:id', authenticateToken, requireAuthority('identity
     const target = await getIdentityUser(req.params.id);
     if (!target) return res.status(404).json({ error: 'User not found' });
     const patch = { ...req.validatedData, updated_at: new Date().toISOString() };
+    if(patch.user_role==='system_admin'&&target.password_reset_required)return res.status(409).json({error:'Complete personal password setup before granting system administration.'});
     if(target.development_credentials && patch.user_role && !['clinician','resident'].includes(patch.user_role)) return res.status(409).json({error:'Require an individual password before assigning an administrative role.'});
     const identityBindingChanged =
       (Object.prototype.hasOwnProperty.call(patch, 'user_role') && patch.user_role !== target.user_role) ||
@@ -2062,14 +2065,16 @@ app.put('/api/users/profile', authenticateToken, validate(schemas.userProfile), 
 
 app.put('/api/users/change-password', authenticateToken, validate(schemas.changePassword), async (req, res) => {
   try {
+    if(Authority.normalizeRole(req.user.user_role)==='system_admin')return res.status(403).json({error:'Administrator password protected',message:'System-administrator passwords cannot be changed in this application.'});
     const { current_password, new_password } = req.validatedData || req.body;
-    const { data: user, error: fetchError } = await supabase.from('app_users').select('password_hash, auth_version').eq('id', req.user.id).single();
+    const { data: user, error: fetchError } = await supabase.from('app_users').select('password_hash, auth_version, user_role').eq('id', req.user.id).single();
     if (fetchError) throw fetchError;
+    if(Authority.normalizeRole(user.user_role)==='system_admin')return res.status(403).json({error:'Administrator password protected'});
     const validPassword = await bcrypt.compare(current_password, user.password_hash || '');
     if (!validPassword) return res.status(401).json({ error: 'Current password is incorrect' });
     if(Buffer.byteLength(new_password)>72 || await bcrypt.compare(new_password,user.password_hash)) return res.status(400).json({error:'Choose a different password, at most 72 bytes.'});
     const passwordHash = await bcrypt.hash(new_password, 12);
-    const { data: changed, error } = await supabase.from('app_users').update({ password_hash: passwordHash, development_credentials:false, password_reset_required:false, reset_token:null, reset_token_expires_at:null, auth_version: Number(user.auth_version || 1) + 1, updated_at: new Date().toISOString() }).eq('id', req.user.id).eq('auth_version',user.auth_version).eq('account_status','active').select('id').maybeSingle();
+    const { data: changed, error } = await supabase.from('app_users').update({ password_hash: passwordHash, development_credentials:false, password_reset_required:false, reset_token:null, reset_token_expires_at:null, auth_version: Number(user.auth_version || 1) + 1, updated_at: new Date().toISOString() }).eq('id', req.user.id).eq('auth_version',user.auth_version).eq('user_role',user.user_role).eq('account_status','active').select('id').maybeSingle();
     if (error) throw error;
     if(!changed) return res.status(409).json({error:'Account changed. Sign in and try again.'});
     await recordIdentityEvent(req.user.id,req.user.id,'password_changed',null,{});

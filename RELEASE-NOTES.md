@@ -1,4 +1,16 @@
-# Release 5.3-production.1 — 30 September 2026
+# Administrator protection update — 5.3-production.2
+
+Existing system-administrator passwords cannot be changed or reset through application routes, including self-change, forgot-password, reset links, forced resets by another administrator, or temporary-credential setup. Initial activation of a new administrator invitation remains possible only when no password exists. Promotion to system administrator is rejected while personal password setup is pending.
+
+The current-administrator-password field only verifies identity before issuing another person's credentials; it does not change the administrator's password. The new user password is visible immediately after issuance, scrolled into view, with explicit hide/show and copy controls. After dismissal or leaving the workspace, it cannot be retrieved; generate a replacement if needed.
+
+No additional database migration beyond the previous 5.3 production migration is required. Deploy BOTH .2 packages as a matched pair. Existing administrator passwords are not modified by this update. Any exceptional administrator password recovery must be handled outside this application's password flows by the authorized database operator.
+
+Tests added: existing administrator passwords and auth versions remain unchanged across password-change, reset-request, reset-token, temporary-setup and invitation replacement attempts; a separate test rejects forced reset by another administrator. Browser checks verify visible receipt and hide/show controls.
+
+---
+
+# Release 5.3-production.2 — 30 September 2026
 
 Baseline confirmed against the current GitHub deployment sources: frontend 813fb4c3a830f692199b56ffea653882cb2b525a; backend 1e9fa8ce57210d08e83233976fc8cb97c2057526. These match the recovery accepted by the user. Unshipped work from the older, regressed 5.3F baseline was not used.
 
@@ -15,7 +27,7 @@ Baseline confirmed against the current GitHub deployment sources: frontend 813fb
 
 ## Validation
 - All packaged JavaScript syntax and local dependency/asset references verified.
-- 13 production credential test scenarios, covering production availability, administrator role and password confirmation, issuance, hashing, forced setup, expiration, token-purpose separation, replay rejection, suspended accounts, account creation and rate limiting.
+- 14 production credential test scenarios, covering production availability, administrator role and password confirmation, issuance, hashing, forced setup, expiration, token-purpose separation, replay rejection, suspended accounts, account creation and rate limiting.
 - Actual backend integration: startup/health, release endpoint, mismatched/unversioned sign-in rejection, matching login returning a setup-only token, protected API rejecting that token, release-header CORS.
 - Browser: application mount and invitation/recovery screens; production account workspace and one-time receipt; mobile layout; personal-password setup; no setup token in browser storage. Mock APIs and test identities were used.
 - Operational review tests: inclusive leave overlap, resident on-call assignment, cancelled-record exclusion, actual-end-date omissions and overdue rotations. Grounded confirmation/authority regression tests.
