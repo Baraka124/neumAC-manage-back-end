@@ -728,6 +728,9 @@ const schemas = {
     authors_text:       Joi.string().max(2000).allow('', null).optional(),
     doi:                Joi.string().max(200).allow('', null).optional(),
     word_count:         Joi.number().integer().min(0).allow(null).optional(),
+    is_featured:        Joi.boolean().optional(),
+    image_urls:         Joi.array().items(Joi.string().max(2000)).max(5).optional(),
+    published_at:       Joi.string().isoDate().allow('', null).optional(),
   }),
 
   // ── Certificate ──────────────────────────────────────────────────────
@@ -760,6 +763,8 @@ const schemas = {
     active:        Joi.boolean().optional(),
   })
 };
+
+const newsPostUpdateSchema = schemas.newsPost.fork(['title','post_type','status','keywords'], field => field.optional()).prefs({noDefaults:true}).min(1);
 
 // ============ VALIDATION MIDDLEWARE ============
 const validate = (schema) => (req, res, next) => {
@@ -4885,10 +4890,12 @@ app.get('/api/team/website', publicApiLimiterGuarded, async (req, res) => {
         research_lines:research_lines!research_lines_coordinator_id_fkey(
           id, line_number, name, short_name,
           clinical_trials(id, status, title, phase, featured_in_website),
-          innovation_projects(id, current_stage, funding_status, title)
+          innovation_projects(id, current_stage, funding_status, title, featured_in_website)
         )
       `)
       .eq('employment_status', 'active')
+      .eq('is_public', true)
+      .is('deleted_at', null)
       .order('full_name', { ascending: true });
 
     if (error) throw error;
@@ -4899,6 +4906,9 @@ app.get('/api/team/website', publicApiLimiterGuarded, async (req, res) => {
       .from('news_posts')
       .select('id, title, journal_name, published_at, doi, authors_text, author_id')
       .eq('status', 'published')
+      .eq('is_public', true)
+      .is('deleted_at', null)
+      .or('expires_at.is.null,expires_at.gt.' + new Date().toISOString())
       .eq('post_type', 'publication')
       .not('journal_name', 'is', null)
       .order('published_at', { ascending: false })
@@ -4918,7 +4928,7 @@ app.get('/api/team/website', publicApiLimiterGuarded, async (req, res) => {
       );
 
       // Projects for this line
-      const lineProjects = line?.innovation_projects || [];
+      const lineProjects = (line?.innovation_projects || []).filter(p => p.featured_in_website === true);
       const activeProjects = lineProjects.filter(p => p.current_stage !== 'completed');
       const seekingProjects = lineProjects.filter(p => p.funding_status === 'seeking');
 
@@ -6518,11 +6528,17 @@ app.post('/api/news', authenticateToken, Portfolio.write('news_posts'), apiLimit
     }
     // Sanitise image_urls — max 5, must be strings
     const VALID_TYPES = ['update','article','publication','highlight'];
+    if (req.body.is_featured === true || req.body.is_featured === 'true') {
+      const { data: current, error: featureError } = await supabase.from('news_posts').select('id').eq('is_featured', true);
+      if (featureError) throw featureError;
+      if ((current || []).length >= 5) return res.status(409).json({error:'Featured limit reached',message:'Maximum 5 featured records. Un-feature an existing record first.'});
+    }
     const cleanImages = Array.isArray(image_urls)
       ? image_urls.filter(u => typeof u === 'string' && u.trim()).slice(0, 5)
       : (featured_image_url ? [featured_image_url] : []);
     const payload = {
       title,
+      is_featured: req.body.is_featured === true || req.body.is_featured === 'true',
       post_type: VALID_TYPES.includes(post_type) ? post_type : 'update',
       body: body || null,
       author_id: author_id || null,
@@ -6549,7 +6565,7 @@ app.post('/api/news', authenticateToken, Portfolio.write('news_posts'), apiLimit
 });
 
 // PUT /api/news/:id — update
-app.put('/api/news/:id', authenticateToken, Portfolio.write('news_posts'), apiLimiter, validate(schemas.newsPost), async (req, res) => {
+app.put('/api/news/:id', authenticateToken, Portfolio.write('news_posts'), apiLimiter, validate(newsPostUpdateSchema), async (req, res) => {
   try {
     const { id } = req.params;
     const b = req.body;
@@ -6581,8 +6597,9 @@ app.put('/api/news/:id', authenticateToken, Portfolio.write('news_posts'), apiLi
     if (b.is_featured !== undefined) {
       const featuring = b.is_featured === true || b.is_featured === 'true';
       if (featuring) {
-        const { data: current } = await supabase.from('news_posts')
+        const { data: current, error: featureError } = await supabase.from('news_posts')
           .select('id').eq('is_featured', true).neq('id', id);
+        if (featureError) throw featureError;
         if ((current || []).length >= 5) {
           return res.status(409).json({
             error: 'Featured limit reached',

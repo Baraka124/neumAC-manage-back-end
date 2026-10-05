@@ -16,3 +16,16 @@ For local use: backend on port 3000, frontend at http://localhost:8080; include 
 Rollback: redeploy BOTH previous recovery packages together. The added nullable database column can remain. Accounts already issued temporary credentials still require individual password setup; use the previous email-reset flow or complete setup before rolling back. Do not remove the migration column during rollback.
 
 Update .2: existing system-administrator passwords cannot be changed or reset within the application. Entering your current administrator password only confirms your identity. Generated user credentials now appear visibly and scroll into view. If the .1 migration was already applied, no further SQL is needed.
+
+
+Milestone 10 — Audited public publishing fixes (2026-10-05)
+
+Matched release: 5.3-production.3. Frontend baseline: Milestone 9, b56e318. Backend baseline: 88604a5. Install both matching packages. No new database migration is required for this update; existing 5.3 schema requirements still apply. Back up the installed files, replace the backend server files and restart, then upload the frontend files and refresh. During the version mismatch the existing release guard blocks writes. Rollback requires restoring both matched previous packages.
+
+The public team endpoint now requires active, public, non-deleted staff. Its publication context requires published, public, unexpired, non-deleted records. Linked project counts include only projects flagged for website display. These corrections can reduce public results; private flags are not automatically changed.
+
+News feature updates use a partial schema without injecting creation defaults. Feature-only updates preserve titles, status and publication dates. New records persist the selected feature flag, subject to the existing five-record check; count failures abort the write. The existing count-then-write limit is not a database-atomic concurrent quota.
+
+Public visibility is distinguished from public-feed eligibility. Grounded and publishing messages no longer assert website delivery based solely on the public flag. The publication review shows proposed eligibility, expiry, content fields and image URLs. Metadata exposed by the public API is described separately. This is a preview of feed content, not a rendering or delivery receipt from neumact.org. Existing website refresh/caching behaviour has not been inspected or changed.
+
+Validation: actual backend handler tests with a mock database cover public staff/publication exclusion, feature creation and partial update, limit rejection and database errors. Vue browser tests cover review eligibility, expired records, content preview, mobile controls and feature-only writes. Research and Grounded regression suites passed. Actual backend startup/integration checks preserve administrator password protections and release matching. Release verification covers hashes, JavaScript syntax, modules, assets and archive integrity. No live production reads or writes, deployment or repository push occurred.

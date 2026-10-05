@@ -1,7 +1,8 @@
 {
-  "id": "5.3-production.2",
-  "date": "2026-09-30",
+  "id": "5.3-production.3",
+  "date": "2026-10-05",
   "frontend_baseline": "813fb4c3a830f692199b56ffea653882cb2b525a",
   "backend_baseline": "1e9fa8ce57210d08e83233976fc8cb97c2057526",
-  "migration": "MIGRATION-5.3-PRODUCTION.sql"
+  "migration": "MIGRATION-5.3-PRODUCTION.sql",
+  "backend_patch": "publishing-milestone10-2026-10-05"
 }
