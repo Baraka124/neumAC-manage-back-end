@@ -915,7 +915,12 @@ app.use('/uploads', authenticateToken, express.static(path.join(__dirname, 'uplo
 // meaning it blocked admins from everything else too.
 let _maintenanceCache = { value: false, at: 0 }
 app.use('/api', async (req, res, next) => {
-  if (req.path.startsWith('/auth/') || req.path.startsWith('/api/auth/') || req.path.startsWith('/public/') || req.path.startsWith('/api/public/')) return next()
+  // Public read endpoints stay up during maintenance: maintenance mode is for the
+  // internal management app, not the public neumact.org website. /website data and
+  // the public status/contact routes are always served.
+  if (req.path.startsWith('/auth/') || req.path.startsWith('/api/auth/') ||
+      req.path.startsWith('/public/') || req.path.startsWith('/api/public/') ||
+      req.path.includes('/website') || req.path.endsWith('/contact')) return next()
   const now = Date.now()
   if (now - _maintenanceCache.at > 30000) {
     try {
