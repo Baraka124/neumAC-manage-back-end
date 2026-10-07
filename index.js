@@ -767,6 +767,20 @@ const schemas = {
 const newsPostUpdateSchema = schemas.newsPost.fork(['title','post_type','status','keywords'], field => field.optional()).prefs({noDefaults:true}).min(1);
 
 // ============ DATABASE ERROR TRANSLATION ============
+// Known CHECK constraints → human label + the values the DB actually permits.
+// Lets a rejected value tell the user WHICH field and WHAT is allowed, instead of
+// a blank "not allowed". Keep each list in sync with the column's CHECK constraint.
+const CHECK_FIELDS = {
+  clinical_trials_study_type_check:     { label: 'Study type',     allowed: ['Interventional','Observational','Expanded Access','Prospective','Retrospective','Clinical Trial','Registry','Cohort','Experimental','Other'] },
+  clinical_trials_sponsor_type_check:   { label: 'Sponsor type',   allowed: ['Pharma','MedTech','Academic','Foundation','Government','Private','Other'] },
+  clinical_trials_status_check:         { label: 'Status',         allowed: ['Reclutando','Activo','Completado','En preparación','Suspendido'] },
+  clinical_trials_phase_check:          { label: 'Phase',          allowed: ['Phase I','Phase II','Phase III','Phase IV'] },
+  clinical_trials_ethics_status_check:  { label: 'Ethics status',  allowed: ['pending','approved','exempt','not_required'] },
+  clinical_trials_funding_status_check: { label: 'Funding status', allowed: ['not_applicable','seeking','funded','completed'] },
+  clinical_trials_population_type_check:{ label: 'Population type', allowed: ['adult','paediatric','mixed','not_applicable'] },
+  clinical_trials_scope_type_check:     { label: 'Scope type',     allowed: ['specific','general'] },
+};
+
 // Maps raw Postgres/PostgREST errors to clean, user-facing messages + HTTP status,
 // so a constraint failure reads sensibly instead of leaking internal SQL text.
 function dbError(error) {
@@ -776,12 +790,31 @@ function dbError(error) {
     const m = raw.match(/column "?([a-z0-9_]+)"?/i);
     return m ? m[1].replace(/_/g, ' ') : null;
   };
+  // Resolve the constraint name from the error object or the raw SQL text.
+  const constraintName = () =>
+    (error && error.constraint) ||
+    (raw.match(/constraint "([a-z0-9_]+)"/i) || [])[1] || null;
+  // Turn a "<table>_<column>_check" constraint into a readable field label.
+  const fieldFromConstraint = (cn) => {
+    if (!cn) return null;
+    const stem = cn.replace(/_check$/i, '').replace(/_(status|type)$/i, m => m); // keep status/type suffix
+    const col = stem.replace(/^[a-z0-9]+?_(?=[a-z])/i, ''); // best-effort: drop a leading table token
+    return (col || stem).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()).trim();
+  };
   switch (code) {
-    case '23514': return { status: 400, message: `That value isn't allowed. Please choose one of the permitted options.` };
+    case '23514': {
+      const cn = constraintName();
+      const known = cn && CHECK_FIELDS[cn];
+      if (known) return { status: 400, message: `${known.label} must be one of: ${known.allowed.join(', ')}.` };
+      const field = fieldFromConstraint(cn) || column();
+      return { status: 400, message: field
+        ? `The value for "${field}" isn't allowed. Please choose one of the permitted options.`
+        : `That value isn't allowed. Please choose one of the permitted options.` };
+    }
     case '23502': return { status: 400, message: `A required field${column() ? ` (${column()})` : ''} is missing.` };
     case '23503': return { status: 400, message: 'A linked record was not found — please select a valid reference.' };
     case '23505': return { status: 409, message: `That value${column() ? ` for ${column()}` : ''} is already in use.` };
-    case '22P02': return { status: 400, message: 'One of the fields has an invalid format.' };
+    case '22P02': return { status: 400, message: `One of the fields has an invalid format${column() ? ` (${column()})` : ''}.` };
     case '22007': case '22008': return { status: 400, message: 'A date or time value is invalid.' };
     default:      return { status: 500, message: 'The server could not complete the request. Please try again, and contact an administrator if it persists.' };
   }
