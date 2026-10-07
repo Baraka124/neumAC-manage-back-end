@@ -779,6 +779,19 @@ const CHECK_FIELDS = {
   clinical_trials_funding_status_check: { label: 'Funding status', allowed: ['not_applicable','seeking','funded','completed'] },
   clinical_trials_population_type_check:{ label: 'Population type', allowed: ['adult','paediatric','mixed','not_applicable'] },
   clinical_trials_scope_type_check:     { label: 'Scope type',     allowed: ['specific','general'] },
+  // Innovation projects
+  chk_current_stage_en:                     { label: 'Development stage', allowed: ['concept','development','pilot','validation','scaling','completed'] },
+  chk_funding_status:                       { label: 'Funding status',   allowed: ['not_applicable','seeking','funded','completed','applied','self_funded','closed'] },
+  innovation_projects_category_check:       { label: 'Category',         allowed: ['Dispositivo','Salud Digital','IA / ML','Tecnología Quirúrgica'] },
+  innovation_projects_scope_type_check:     { label: 'Scope type',       allowed: ['specific','general','cross_respiratory','pathway','service'] },
+  innovation_projects_ip_status_check:      { label: 'IP status',        allowed: ['Patent pending','Patent granted','Software registered','Trade secret','None'] },
+  innovation_projects_population_type_check:{ label: 'Population type',   allowed: ['adult','paediatric','mixed','not_applicable'] },
+  innovation_projects_project_nature_check: { label: 'Project nature',   allowed: ['clinical_study','clinical_innovation','hybrid'] },
+  innovation_projects_regulatory_pathway_check:{ label: 'Regulatory pathway', allowed: ['none','ce_mdr','samd','aemps','fda','other'] },
+  // News & partners
+  news_posts_post_type_check:               { label: 'Post type',        allowed: ['update','article','publication','highlight'] },
+  news_posts_status_check:                  { label: 'Status',           allowed: ['draft','published','archived'] },
+  partners_type_check:                      { label: 'Partner type',     allowed: ['Pharma','MedTech','Tech','Academic','Hospital','SME','Foundation','Government'] },
 };
 
 // Maps raw Postgres/PostgREST errors to clean, user-facing messages + HTTP status,
@@ -5578,16 +5591,18 @@ app.put('/api/innovation-projects/:id', authenticateToken, Portfolio.write('inno
     // FIX: VALID_STAGES must be the English DB values — the old Spanish list silently
     // dropped every stage update (the condition below never matched), so the stage never changed.
     const VALID_STAGES = ['concept','development','pilot','validation','scaling','completed'];
-    const VALID_FUNDING = ['not_applicable','seeking','funded','completed'];
-    const VALID_SCOPE = ['specific','general'];
+    const VALID_FUNDING = ['not_applicable','seeking','funded','completed','applied','self_funded','closed'];
+    const VALID_SCOPE = ['specific','general','cross_respiratory','pathway','service'];
     const VALID_POPULATION = ['adult','paediatric','mixed','not_applicable'];
     const VALID_REGULATORY = ['none','ce_mdr','samd','aemps','fda','other'];
+    const VALID_NATURE = ['clinical_study','clinical_innovation','hybrid'];
     const STAGE_MAP = { concept:'Fase Piloto', development:'En Desarrollo', pilot:'Fase Piloto', validation:'Validación', scaling:'Validación', completed:'Validación' };
     const b = req.body;
     const updatePayload = {
       updated_at: new Date().toISOString(),
       ...(b.title               !== undefined && { title: b.title }),
       ...(b.category            !== undefined && { category: b.category }),
+      ...(b.project_nature      !== undefined && { project_nature: VALID_NATURE.includes(b.project_nature) ? b.project_nature : 'clinical_innovation' }),
       ...(b.current_stage !== undefined && VALID_STAGES.includes(b.current_stage) && {
         current_stage: b.current_stage,
         development_stage: STAGE_MAP[b.current_stage] || 'En Desarrollo'
