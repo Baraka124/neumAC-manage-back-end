@@ -480,7 +480,7 @@ const schemas = {
 
   onCall: Joi.object({
     duty_date: Joi.date().required(),
-    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'on_call_home', 'on_call_mixed', 'on_call_present').default('primary_call'),
+    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'weekend_coverage', 'on_call_home', 'on_call_mixed', 'on_call_present').default('primary_call'), // FIX: added weekend_coverage (DB allows it; API was rejecting)
     coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
     start_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
     end_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
@@ -493,7 +493,7 @@ const schemas = {
   }),
   onCallUpdate: Joi.object({
     duty_date: Joi.date().optional(),
-    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'on_call_home', 'on_call_mixed', 'on_call_present').optional(),
+    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'weekend_coverage', 'on_call_home', 'on_call_mixed', 'on_call_present').optional(), // FIX: added weekend_coverage to match DB
     coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
     start_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).optional(),
     end_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).optional(),
@@ -507,7 +507,7 @@ const schemas = {
   // not required from client
   absenceRecord: Joi.object({
     staff_member_id: Joi.string().uuid().required(),
-    absence_type: Joi.string().valid('planned', 'unplanned', 'medical', 'personal', 'administrative').required(),
+    absence_type: Joi.string().valid('planned', 'unplanned').required(), // FIX: DB allows only planned/unplanned; medical/personal/administrative belong to absence_reason
     absence_reason: Joi.string().valid('vacation', 'conference', 'sick_leave', 'training', 'personal', 'other').required(),
     start_date: Joi.date().required(),
     end_date: Joi.date().required(),
@@ -521,7 +521,7 @@ const schemas = {
   }),
   absenceRecordUpdate: Joi.object({
     staff_member_id: Joi.string().uuid().optional(),
-    absence_type: Joi.string().valid('planned', 'unplanned', 'medical', 'personal', 'administrative').optional(),
+    absence_type: Joi.string().valid('planned', 'unplanned').optional(), // FIX: align with DB check constraint
     absence_reason: Joi.string().valid('vacation', 'conference', 'sick_leave', 'training', 'personal', 'other').optional(),
     start_date: Joi.date().optional(),
     end_date: Joi.date().optional(),
@@ -701,7 +701,7 @@ const schemas = {
     title:             Joi.string().min(2).max(400).required(),
     research_line_id:  Joi.string().uuid().allow('', null).optional(),
     lead_id:           Joi.string().uuid().allow('', null).optional(),
-    current_stage:     Joi.string().valid('Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización').allow('', null).optional(),
+    current_stage:     Joi.string().valid('concept','development','pilot','validation','scaling','completed').allow('', null).optional(), // FIX: match DB chk_current_stage_en (was stale Spanish list, blocked stage updates)
     category:          Joi.string().valid('Dispositivo','Salud Digital','IA / ML','Tecnología Quirúrgica').default('Salud Digital'),
     development_stage: Joi.string().valid('Fase Piloto','En Desarrollo','Validación','Validación Clínica').default('En Desarrollo'),
     funding_status:    Joi.string().max(60).allow('', null).optional(),
@@ -715,7 +715,7 @@ const schemas = {
   // ── News / Post ──────────────────────────────────────────────────────
   newsPost: Joi.object({
     title:              Joi.string().min(2).max(400).required(),
-    post_type:          Joi.string().valid('update','article','publication','photo_story','highlight','news').required(),
+    post_type:          Joi.string().valid('update','article','publication','highlight').required(), // FIX: match DB check (was silently coercing photo_story/news to 'update')
     keywords:           Joi.array().items(Joi.string().max(28).trim()).max(10).default([]),
     body:               Joi.string().max(20000).allow('', null).optional(),
     author_id:          Joi.string().uuid().allow('', null).optional(),
@@ -766,6 +766,29 @@ const schemas = {
 
 const newsPostUpdateSchema = schemas.newsPost.fork(['title','post_type','status','keywords'], field => field.optional()).prefs({noDefaults:true}).min(1);
 
+// ============ DATABASE ERROR TRANSLATION ============
+// Maps raw Postgres/PostgREST errors to clean, user-facing messages + HTTP status,
+// so a constraint failure reads sensibly instead of leaking internal SQL text.
+function dbError(error) {
+  const code = error && error.code;
+  const raw  = (error && error.message) || 'Unknown error';
+  const column = () => {
+    const m = raw.match(/column "?([a-z0-9_]+)"?/i);
+    return m ? m[1].replace(/_/g, ' ') : null;
+  };
+  switch (code) {
+    case '23514': return { status: 400, message: `That value isn't allowed. Please choose one of the permitted options.` };
+    case '23502': return { status: 400, message: `A required field${column() ? ` (${column()})` : ''} is missing.` };
+    case '23503': return { status: 400, message: 'A linked record was not found — please select a valid reference.' };
+    case '23505': return { status: 409, message: `That value${column() ? ` for ${column()}` : ''} is already in use.` };
+    case '22P02': return { status: 400, message: 'One of the fields has an invalid format.' };
+    case '22007': case '22008': return { status: 400, message: 'A date or time value is invalid.' };
+    default:      return { status: 500, message: 'The server could not complete the request. Please try again, and contact an administrator if it persists.' };
+  }
+}
+// Convenience: send a translated DB error directly.
+const sendDbError = (res, error) => { const m = dbError(error); return res.status(m.status).json({ error: m.message }); };
+
 // ============ VALIDATION MIDDLEWARE ============
 const validate = (schema) => (req, res, next) => {
   try {
@@ -782,9 +805,9 @@ const validate = (schema) => (req, res, next) => {
     req.validatedData = value;
     next();
   } catch (err) {
-    console.warn('Validation middleware error:', err.message);
-    req.validatedData = req.body;
-    next();
+    // FIX: a validator exception must NOT fall through with unvalidated raw input.
+    console.error('Validation middleware error:', err.message);
+    return res.status(400).json({ error: 'Validation failed', message: 'The submitted data could not be validated. Please check the form and try again.' });
   }
 };
 
@@ -4152,7 +4175,7 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
     });
   } catch (error) {
     console.error('💥 Failed to create absence record:', error);
-    res.status(500).json({ error: 'Failed to create absence record', message: error.message });
+    sendDbError(res, error);
   }
 });
 
@@ -4243,7 +4266,7 @@ app.put('/api/absence-records/:id', authenticateToken, checkPermission('staff_ab
 
     res.json({ success:true, data, message:'Absence record updated successfully' });
   } catch (error) {
-    res.status(500).json({ error:'Failed to update absence record', message:error.message });
+    sendDbError(res, error);
   }
 });
 
@@ -5148,11 +5171,18 @@ app.post('/api/research-lines', authenticateToken, Portfolio.write('research_lin
     const { line_number, description, capabilities, sort_order, active, keywords } = req.body;
     const name = req.body.name || req.body.research_line_name;
     if (!name) return res.status(400).json({ error: 'Research line name is required' });
-    const { data, error } = await supabase.from('research_lines').insert([{ line_number: line_number || null, name, description: description || '', capabilities: (capabilities !== undefined && capabilities !== null) ? capabilities : 'Alcance y capacidades', sort_order: sort_order || 0, active: active !== undefined ? active : true, keywords: Array.isArray(keywords) ? keywords : [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
+    // FIX: line_number is NOT NULL with no default — auto-assign the next value when the client omits it
+    // (previously inserted null, which failed with a cryptic DB error on every create without a number)
+    let resolvedLineNumber = line_number;
+    if (resolvedLineNumber === undefined || resolvedLineNumber === null || resolvedLineNumber === '') {
+      const { data: maxRow } = await supabase.from('research_lines').select('line_number').order('line_number', { ascending: false }).limit(1).maybeSingle();
+      resolvedLineNumber = (maxRow && Number.isInteger(maxRow.line_number)) ? maxRow.line_number + 1 : 1;
+    }
+    const { data, error } = await supabase.from('research_lines').insert([{ line_number: resolvedLineNumber, name, description: description || '', capabilities: (capabilities !== undefined && capabilities !== null) ? capabilities : 'Alcance y capacidades', sort_order: sort_order || 0, active: active !== undefined ? active : true, keywords: Array.isArray(keywords) ? keywords : [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() }]).select().single();
     if (error) throw error;
     res.status(201).json({ success: true, data, message: 'Research line created successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendDbError(res, error);
   }
 });
 
@@ -5177,7 +5207,7 @@ app.put('/api/research-lines/:id', authenticateToken, Portfolio.write('research_
     }
     res.json({ success: true, data, message: 'Research line updated successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendDbError(res, error);
   }
 });
 
@@ -5306,7 +5336,7 @@ app.post('/api/clinical-trials', authenticateToken, Portfolio.write('clinical_tr
 
     res.status(201).json({ success: true, data, message: 'Clinical study created successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendDbError(res, error);
   }
 });
 
@@ -5395,7 +5425,7 @@ app.put('/api/clinical-trials/:id', authenticateToken, Portfolio.write('clinical
 
     res.json({ success: true, data, message: 'Clinical study updated successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendDbError(res, error);
   }
 });
 
@@ -5506,18 +5536,20 @@ app.post('/api/innovation-projects', authenticateToken, Portfolio.write('innovat
 
     res.status(201).json({ data, message: 'Innovation project created successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendDbError(res, error);
   }
 });
 
 app.put('/api/innovation-projects/:id', authenticateToken, Portfolio.write('innovation_projects'), validate(schemas.innovationProject), async (req, res) => {
   try {
-    const VALID_STAGES = ['Idea','Prototipo','Piloto','Validación','Escalamiento','Comercialización'];
+    // FIX: VALID_STAGES must be the English DB values — the old Spanish list silently
+    // dropped every stage update (the condition below never matched), so the stage never changed.
+    const VALID_STAGES = ['concept','development','pilot','validation','scaling','completed'];
     const VALID_FUNDING = ['not_applicable','seeking','funded','completed'];
     const VALID_SCOPE = ['specific','general'];
     const VALID_POPULATION = ['adult','paediatric','mixed','not_applicable'];
     const VALID_REGULATORY = ['none','ce_mdr','samd','aemps','fda','other'];
-    const STAGE_MAP = {'Idea':'En Desarrollo','Prototipo':'En Desarrollo','Piloto':'Fase Piloto','Validación':'Validación Clínica','Escalamiento':'Validación Clínica','Comercialización':'Validación Clínica'};
+    const STAGE_MAP = { concept:'Fase Piloto', development:'En Desarrollo', pilot:'Fase Piloto', validation:'Validación', scaling:'Validación', completed:'Validación' };
     const b = req.body;
     const updatePayload = {
       updated_at: new Date().toISOString(),
@@ -5587,7 +5619,7 @@ app.put('/api/innovation-projects/:id', authenticateToken, Portfolio.write('inno
 
     res.json({ success: true, data, message: 'Innovation project updated successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendDbError(res, error);
   }
 });
 
@@ -5611,11 +5643,13 @@ app.get('/api/analytics/research-dashboard', authenticateToken, Portfolio.all('r
     ]);
     const trialsByPhase = { 'Phase I': 0, 'Phase II': 0, 'Phase III': 0, 'Phase IV': 0 };
     const trialsByStatus = { 'Reclutando': 0, 'Activo': 0, 'Completado': 0, 'En preparación': 0 };
-    const projectsByStage = { 'Idea': 0, 'Prototipo': 0, 'Piloto': 0, 'Validación': 0, 'Escalamiento': 0, 'Comercialización': 0 };
+    // FIX: bucket by the English current_stage values the DB actually stores
+    // (was Spanish keys, so every project fell through and all stage counts read 0)
+    const projectsByStage = { 'concept': 0, 'development': 0, 'pilot': 0, 'validation': 0, 'scaling': 0, 'completed': 0 };
     const projectsByCategory = { 'Dispositivo': 0, 'Salud Digital': 0, 'IA / ML': 0, 'Tecnología Quirúrgica': 0 };
     const partnerNeeds = {};
-    // Map legacy development_stage values → current_stage keys
-    const DEV_STAGE_MAP = { 'En Desarrollo': 'Prototipo', 'Fase Piloto': 'Piloto', 'Validación Clínica': 'Validación' };
+    // Map legacy Spanish development_stage values → English current_stage keys
+    const DEV_STAGE_MAP = { 'En Desarrollo': 'development', 'Fase Piloto': 'pilot', 'Validación': 'validation', 'Validación Clínica': 'validation' };
     trials?.forEach(t => { if (trialsByPhase[t.phase] !== undefined) trialsByPhase[t.phase]++; if (trialsByStatus[t.status] !== undefined) trialsByStatus[t.status]++; });
     projects?.forEach(p => {
       const stage = p.current_stage || DEV_STAGE_MAP[p.development_stage] || null;
@@ -5624,7 +5658,7 @@ app.get('/api/analytics/research-dashboard', authenticateToken, Portfolio.all('r
       p.partner_needs?.forEach(n => { partnerNeeds[n] = (partnerNeeds[n] || 0) + 1; });
     });
     const activeTrialsCount = (trialsByStatus['Activo'] || 0) + (trialsByStatus['Reclutando'] || 0);
-    const activeProjectsCount = (projectsByStage['Piloto'] || 0) + (projectsByStage['Validación'] || 0) + (projectsByStage['Escalamiento'] || 0) + (projectsByStage['Comercialización'] || 0);
+    const activeProjectsCount = (projectsByStage['pilot'] || 0) + (projectsByStage['validation'] || 0) + (projectsByStage['scaling'] || 0) + (projectsByStage['completed'] || 0);
     res.json({ success: true, data: { summary: { totalResearchLines: researchLines?.length || 0, activeResearchLines: researchLines?.filter(l => l.active !== false).length || 0, totalTrials: trials?.length || 0, totalStudies: trials?.length || 0, activeTrials: activeTrialsCount, activeStudies: activeTrialsCount, totalProjects: projects?.length || 0, activeProjects: activeProjectsCount }, clinicalTrials: { byPhase: trialsByPhase, byStatus: trialsByStatus }, innovationProjects: { byStage: projectsByStage, byCategory: projectsByCategory, partnerNeeds: Object.entries(partnerNeeds).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count) } } });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -5648,8 +5682,9 @@ app.get('/api/analytics/research-lines-performance', authenticateToken, Portfoli
     ]);
 
     const staffMap = Object.fromEntries((allStaff || []).map(s => [s.id, s.full_name]));
-    const ACTIVE_PROJECT_STAGES = ['Prototipo', 'Piloto', 'Validación', 'Escalamiento'];
-    const COMMERCIALIZED_STAGES = ['Comercialización'];
+    // FIX: English current_stage values (were stale Spanish, so counts read 0)
+    const ACTIVE_PROJECT_STAGES = ['development', 'pilot', 'validation', 'scaling'];
+    const COMMERCIALIZED_STAGES = ['completed'];
     const projectStage = (p) => p.current_stage || p.development_stage || '';
 
     const performance = (researchLines || []).map(line => {
