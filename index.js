@@ -643,7 +643,7 @@ const schemas = {
 
   systemSettings: Joi.object({
     hospital_name: Joi.string().required(),
-    default_department_id: Joi.string().uuid().optional(),
+    default_department_id: Joi.string().uuid().allow('', null).optional(),
     max_residents_per_unit: Joi.number().integer().min(1).default(10),
     default_rotation_duration: Joi.number().integer().min(1).max(24).default(12),
     enable_audit_logging: Joi.boolean().default(true),
@@ -1400,6 +1400,21 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     if(challenge){res.setHeader('Cache-Control','no-store');return res.json(challenge)}
     const blocked = IdentityWorkspace.credentialBlock(user, IdentityWorkspace.developmentEnabled());
     if (blocked) return res.status(403).json({error:'Password setup required',message:blocked});
+
+    // Maintenance mode gates sign-in itself: only administrators may authenticate
+    // while it is on. Previously /auth was fully exempt, so anyone could log in and
+    // then hit 503 on every call — confusing, and not "authorized access only".
+    if (!['system_admin','department_head'].includes(Authority.normalizeRole(user.user_role))) {
+      let maint = _maintenanceCache.value;
+      if (Date.now() - _maintenanceCache.at > 30000) {
+        try {
+          const { data: ms } = await supabase.from('system_settings').select('maintenance_mode').limit(1).single();
+          maint = ms?.maintenance_mode === true;
+          _maintenanceCache = { value: maint, at: Date.now() };
+        } catch { /* fall back to cached value */ }
+      }
+      if (maint) return res.status(503).json({ error: 'maintenance', message: 'The system is in maintenance mode. Only administrators can sign in right now — please try again shortly.' });
+    }
 
     // Load this user's explicit permissions from DB
     const permMap = await loadUserPermissions(user.id)
