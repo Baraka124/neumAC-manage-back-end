@@ -915,7 +915,7 @@ app.use('/uploads', authenticateToken, express.static(path.join(__dirname, 'uplo
 // meaning it blocked admins from everything else too.
 let _maintenanceCache = { value: false, at: 0 }
 app.use('/api', async (req, res, next) => {
-  if (req.path.startsWith('/auth/') || req.path.startsWith('/api/auth/')) return next()
+  if (req.path.startsWith('/auth/') || req.path.startsWith('/api/auth/') || req.path.startsWith('/public/') || req.path.startsWith('/api/public/')) return next()
   const now = Date.now()
   if (now - _maintenanceCache.at > 30000) {
     try {
@@ -4948,6 +4948,15 @@ app.get('/api/research-lines', authenticateToken, Portfolio.read('research_lines
 // GET /api/team/website — staff marked is_public = true
 // No authentication required — publicApiLimiter only
 // ================================================================
+// Public, unauthenticated status for the login screen — lets it show a maintenance
+// banner before anyone tries to sign in. Exposes only the maintenance flag.
+app.get('/api/public/status', publicApiLimiterGuarded, async (req, res) => {
+  try {
+    const { data } = await supabase.from('system_settings').select('maintenance_mode').limit(1).single();
+    res.json({ maintenance_mode: data?.maintenance_mode === true });
+  } catch { res.json({ maintenance_mode: false }); }
+});
+
 app.get('/api/team/website', publicApiLimiterGuarded, async (req, res) => {
   try {
     const { data, error } = await supabase
