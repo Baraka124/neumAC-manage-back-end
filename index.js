@@ -3767,29 +3767,8 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
     if (error) throw error;
     await recordOperationalDecisionEvent({decision,req,domain:'oncall_schedule',action:'assign',subjectId:d.primary_physician_id,recordId:data.id,status:'committed',override:enforcement.override});
 
-    // ── NOTIFICATION: On-call scheduled without backup ───────────────────
-    if (!scheduleData.backup_physician_id) {
-      getPhysicianName(scheduleData.primary_physician_id).then(async name => {
-        // Check if this area requires coverage
-        let areaName = 'Unknown area';
-        if (scheduleData.coverage_area_id) {
-          const { data: area } = await supabase.from('coverage_areas').select('name,requires_coverage').eq('id', scheduleData.coverage_area_id).single();
-          if (area) {
-            areaName = area.name;
-            if (!area.requires_coverage) return; // only notify for required areas
-          }
-        }
-        sendNotification(
-          `On-call without backup — ${areaName} on ${scheduleData.duty_date}`,
-          `<h2 style="margin:0 0 12px;color:#0a1628">On-call shift has no backup</h2>
-          <p style="color:#374151"><strong>${name}</strong> is scheduled for <strong>${areaName}</strong> 
-          on <strong>${scheduleData.duty_date}</strong> with no backup assigned.</p>
-          <p style="color:#f59e0b;font-weight:600">⚠ Consider assigning a backup physician.</p>
-          <a href="${APP_URL}" style="display:inline-block;margin-top:8px;padding:8px 16px;background:#00b3b3;color:#fff;text-decoration:none;border-radius:6px;font-size:13px">Open neumDesk →</a>`,
-          false
-        );
-      });
-    }
+    // The "on-call without backup" concept was removed — the department does not
+    // operate a formal backup physician, so the system no longer flags its absence.
 
     res.status(201).json(data);
   } catch (error) {
