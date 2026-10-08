@@ -480,12 +480,11 @@ const schemas = {
 
   onCall: Joi.object({
     duty_date: Joi.date().required(),
-    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'weekend_coverage', 'on_call_home', 'on_call_mixed', 'on_call_present').default('primary_call'), // FIX: added weekend_coverage (DB allows it; API was rejecting)
+    shift_type: Joi.string().valid('primary_call', 'float_physician', 'weekend_coverage', 'on_call_home', 'on_call_mixed', 'on_call_present').default('primary_call'), // FIX: added weekend_coverage (DB allows it; API was rejecting)
     coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
     start_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
     end_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).required(),
     primary_physician_id: Joi.string().uuid().required(),
-    backup_physician_id: Joi.string().uuid().optional().allow(null),
     coverage_notes: Joi.string().optional().allow(''),
     schedule_id: Joi.string().optional(),
     created_by: Joi.string().uuid().optional().allow(null),
@@ -493,12 +492,11 @@ const schemas = {
   }),
   onCallUpdate: Joi.object({
     duty_date: Joi.date().optional(),
-    shift_type: Joi.string().valid('primary_call', 'backup_call', 'float_physician', 'weekend_coverage', 'on_call_home', 'on_call_mixed', 'on_call_present').optional(), // FIX: added weekend_coverage to match DB
+    shift_type: Joi.string().valid('primary_call', 'float_physician', 'weekend_coverage', 'on_call_home', 'on_call_mixed', 'on_call_present').optional(), // FIX: added weekend_coverage to match DB
     coverage_area_id: Joi.string().uuid().optional().allow(null, ''),
     start_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).optional(),
     end_time: Joi.string().pattern(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/).optional(),
     primary_physician_id: Joi.string().uuid().optional(),
-    backup_physician_id: Joi.string().uuid().optional().allow(null, ''),
     coverage_notes: Joi.string().optional().allow(''),
     decision_override: Joi.object({ accepted: Joi.boolean().valid(true).required(), reason: Joi.string().trim().min(8).max(2000).required(), review_contract: Joi.string().optional(), finding_codes: Joi.array().items(Joi.string()).optional() }).optional()
   }).min(1),
@@ -3760,7 +3758,6 @@ app.post('/api/oncall', authenticateToken, checkPermission('oncall_schedule', 'c
       start_time:           d.start_time,
       end_time:             d.end_time,
       primary_physician_id: d.primary_physician_id,
-      backup_physician_id:  d.backup_physician_id  || null,
       coverage_notes:       d.coverage_notes       || null,
       coverage_area_id:     d.coverage_area_id     || null,
       schedule_id:          generateId('SCH'),   // always server-generated — never trust client value
@@ -3810,7 +3807,6 @@ app.put('/api/oncall/:id', authenticateToken, checkPermission('oncall_schedule',
       start_time: d.start_time !== undefined ? d.start_time : current.start_time,
       end_time: d.end_time !== undefined ? d.end_time : current.end_time,
       primary_physician_id: d.primary_physician_id !== undefined ? d.primary_physician_id : current.primary_physician_id,
-      backup_physician_id: d.backup_physician_id !== undefined ? (d.backup_physician_id || null) : (current.backup_physician_id || null),
       coverage_notes: d.coverage_notes !== undefined ? (d.coverage_notes || null) : (current.coverage_notes || null),
       coverage_area_id: d.coverage_area_id !== undefined ? (d.coverage_area_id || null) : (current.coverage_area_id || null)
     };
