@@ -692,6 +692,8 @@ const schemas = {
     sponsor:                   Joi.string().max(200).allow('', null).optional(),
     eudract_number:            Joi.string().max(100).allow('', null).optional(),
     clinicaltrials_id:         Joi.string().max(100).allow('', null).optional(),
+    nct_number:                Joi.string().max(100).allow('', null).optional(),
+    registry_url:              Joi.string().max(500).allow('', null).optional(),
   }),
 
   // ── Innovation Project ───────────────────────────────────────────────
@@ -5409,6 +5411,9 @@ app.put('/api/clinical-trials/:id', authenticateToken, Portfolio.write('clinical
       ...(b.sponsor_name                !== undefined && { sponsor_name: b.sponsor_name }),
       ...(b.sponsor_type                !== undefined && { sponsor_type: b.sponsor_type }),
       ...(b.study_type                  !== undefined && { study_type: b.study_type }),
+      ...(b.nct_number                  !== undefined && { nct_number: b.nct_number || null }),
+      ...(b.eudract_number              !== undefined && { eudract_number: b.eudract_number || null }),
+      ...(b.registry_url                !== undefined && { registry_url: b.registry_url || null }),
       ...(b.enrollment_target           !== undefined && { enrollment_target: b.enrollment_target || null }),
       ...(b.actual_enrollment           !== undefined && { actual_enrollment: b.actual_enrollment || null }),
       ...(b.funding_amount              !== undefined && { funding_amount: b.funding_amount || null }),
