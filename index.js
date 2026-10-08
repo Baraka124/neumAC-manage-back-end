@@ -936,7 +936,7 @@ app.use('/api', async (req, res, next) => {
   if (header?.startsWith('Bearer ')) {
     try { user = jwt.verify(header.slice(7), JWT_SECRET) } catch { /* not authenticated */ }
   }
-  if (['system_admin','department_head'].includes(Authority.normalizeRole(user?.role || user?.user_role))) { req.user = user; return next() }
+  if (['system_admin'].includes(Authority.normalizeRole(user?.role || user?.user_role))) { req.user = user; return next() }
   if (req.path === '/api/auth/me') return next()
   return res.status(503).json({ error: 'maintenance', message: 'System is under scheduled maintenance. Please try again shortly.' })
 })
@@ -1404,10 +1404,10 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const blocked = IdentityWorkspace.credentialBlock(user, IdentityWorkspace.developmentEnabled());
     if (blocked) return res.status(403).json({error:'Password setup required',message:blocked});
 
-    // Maintenance mode gates sign-in itself: only administrators may authenticate
+    // Maintenance mode gates sign-in itself: only system administrators may authenticate
     // while it is on. Previously /auth was fully exempt, so anyone could log in and
     // then hit 503 on every call — confusing, and not "authorized access only".
-    if (!['system_admin','department_head'].includes(Authority.normalizeRole(user.user_role))) {
+    if (!['system_admin'].includes(Authority.normalizeRole(user.user_role))) {
       let maint = _maintenanceCache.value;
       if (Date.now() - _maintenanceCache.at > 30000) {
         try {
