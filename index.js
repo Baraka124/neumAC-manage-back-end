@@ -707,6 +707,7 @@ const schemas = {
     budget:            Joi.number().min(0).allow(null).optional(),
     start_date:        Joi.string().allow('', null).optional(),
     expected_end_date: Joi.string().allow('', null).optional(),
+    actual_end_date:   Joi.string().allow('', null).optional(), // real completion date, set when a project is marked completed
     patent_status:     Joi.string().max(60).allow('', null).optional(),
   }),
 
@@ -5617,6 +5618,7 @@ app.put('/api/innovation-projects/:id', authenticateToken, Portfolio.write('inno
       ...(b.display_order       !== undefined && { display_order: b.display_order }),
       ...(b.start_date          !== undefined && { start_date: b.start_date || null }),
       ...(b.estimated_end_date  !== undefined && { estimated_end_date: b.estimated_end_date || null }),
+      ...(b.actual_end_date     !== undefined && { actual_end_date: b.actual_end_date || null }),
       // New fields
       ...(b.scope_finalized     !== undefined && { scope_finalized: Boolean(b.scope_finalized) }),
       ...(b.target_diseases     !== undefined && { target_diseases: Array.isArray(b.target_diseases) ? b.target_diseases : [] }),
