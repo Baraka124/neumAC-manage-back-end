@@ -1918,7 +1918,8 @@ app.post('/api/identity/invitations', authenticateToken, requireAuthority('ident
         existing_user: existingForStaff
       });
     }
-    const accountEmail = String(input.email || staff.professional_email || '').trim().toLowerCase();
+    // Single source of truth: the login email comes from the staff profile.
+    const accountEmail = String(staff.professional_email || input.email || '').trim().toLowerCase();
     if (!accountEmail) return res.status(400).json({ error: 'Registered email required', message: 'The staff profile has no professional email. Provide the approved account email explicitly.' });
     const { data: emailOwner } = await supabase.from('app_users').select('id, medical_staff_id, account_status').eq('email', accountEmail).maybeSingle();
     if (emailOwner) return res.status(409).json({ error: 'Email already registered', existing_user_id: emailOwner.id, account_status: emailOwner.account_status });
@@ -2313,6 +2314,30 @@ app.get('/api/medical-staff/:id', authenticateToken, apiLimiter, async (req, res
   }
 });
 
+// Keep a staff member's LOGIN email (app_users.email) in lockstep with their
+// PROFILE email (medical_staff.professional_email). The profile is the single
+// source of truth: whenever the profile email changes, the linked login account
+// follows, so the two can never diverge. Returns a human-readable warning if it
+// could not sync (e.g. the email already belongs to another account), otherwise
+// null. Never throws — email sync must not break a staff save.
+async function syncLoginEmailToProfile(medicalStaffId, profileEmail) {
+  try {
+    const email = (profileEmail || '').trim().toLowerCase();
+    if (!email) return null;
+    const { data: acct } = await supabase.from('app_users')
+      .select('id, email').eq('medical_staff_id', medicalStaffId).maybeSingle();
+    if (!acct || (acct.email || '').toLowerCase() === email) return null; // no account, or already in sync
+    const { data: clash } = await supabase.from('app_users')
+      .select('id').eq('email', email).neq('id', acct.id).maybeSingle();
+    if (clash) return `Login email not synced: ${email} is already used by another account.`;
+    const { error } = await supabase.from('app_users')
+      .update({ email, updated_at: new Date().toISOString() }).eq('id', acct.id);
+    return error ? `Login email could not be synced: ${error.message}` : null;
+  } catch (e) {
+    return `Login email could not be synced: ${e.message}`;
+  }
+}
+
 app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff', 'create'), validate(schemas.medicalStaff), async (req, res) => {
   try {
     const dataSource = req.validatedData || req.body;
@@ -2340,7 +2365,7 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
       full_name: dataSource.full_name,
       staff_type: dataSource.staff_type,
       staff_id: dataSource.staff_id || generateId('MD'),
-      professional_email: dataSource.professional_email,
+      professional_email: (dataSource.professional_email || '').trim().toLowerCase() || null,
       employment_status: dataSource.employment_status || 'active',
       department_id: dataSource.department_id || null,
       affiliation_type: dataSource.affiliation_type || 'primary',
@@ -2406,9 +2431,13 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
   const validated=schema.validate(req.body);
   if(validated.error) return res.status(400).json({error:'Self-service edits support professional email, mobile phone and biography only.'});
   try {
+    if (validated.value.professional_email) validated.value.professional_email = String(validated.value.professional_email).trim().toLowerCase();
     const {data,error}=await supabase.from('medical_staff').update({...validated.value,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('id,professional_email,mobile_phone,public_bio').single();
     if(error) throw error;
-    return res.json(data);
+    // Single source of truth: keep the login email aligned with the profile email.
+    const emailWarning = Object.prototype.hasOwnProperty.call(validated.value,'professional_email')
+      ? await syncLoginEmailToProfile(req.params.id, validated.value.professional_email) : null;
+    return res.json(emailWarning ? { ...data, warnings: [{ type:'login_email', message: emailWarning }] } : data);
   } catch(e){ return res.status(500).json({error:'Profile update failed'}); }
   } catch(e){ return res.status(500).json({error:'Profile access check failed'}); }
 }, validate(schemas.medicalStaff), async (req, res) => {
@@ -2422,7 +2451,7 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       staff_type: dataSource.staff_type,
       staff_id: dataSource.staff_id,
       employment_status: dataSource.employment_status,
-      professional_email: dataSource.professional_email,
+      professional_email: (dataSource.professional_email || '').trim().toLowerCase() || null,
       department_id: dataSource.department_id || null,
       academic_degree: dataSource.academic_degree || null,
       academic_degree_id: dataSource.academic_degree_id || null,
@@ -2468,8 +2497,14 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       throw error;
     }
 
-    // If marking inactive: scan for future records that are now orphaned
     const warnings = [];
+    // Single source of truth: keep the login email aligned with the profile email.
+    if (Object.prototype.hasOwnProperty.call(dataSource, 'professional_email')) {
+      const emailWarning = await syncLoginEmailToProfile(req.params.id, updateData.professional_email);
+      if (emailWarning) warnings.push({ type: 'login_email', message: emailWarning });
+    }
+
+    // If marking inactive: scan for future records that are now orphaned
     if (dataSource.employment_status === 'inactive') {
       const today = new Date().toISOString().split('T')[0];
       const [rotationCheck, oncallCheck, absenceCheck] = await Promise.all([
