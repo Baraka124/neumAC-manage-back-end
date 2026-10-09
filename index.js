@@ -418,7 +418,10 @@ const schemas = {
     // Public profile fields — surfaced on neumact.org's team page when is_public=true
     is_public:        Joi.boolean().optional().default(false),
     public_bio:       Joi.string().max(2000).optional().allow('', null),
-    public_photo_url: Joi.string().uri().optional().allow('', null)
+    public_photo_url: Joi.string().uri().optional().allow('', null),
+    // Honorific prefix (Dr., Dra., Prof., …) — plain string chosen from the
+    // Settings-managed honorifics list; blank/none for non-clinical staff.
+    title:            Joi.string().max(40).optional().allow('', null)
   }),
 
   announcement: Joi.object({
@@ -2375,6 +2378,7 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
       is_public:        dataSource.is_public        ?? false,
       public_bio:       dataSource.public_bio        || null,
       public_photo_url: dataSource.public_photo_url  || null,
+      title: dataSource.title || null,
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('medical_staff').insert([staffData]).select().single();
@@ -2448,6 +2452,7 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       is_public:        dataSource.is_public        ?? false,
       public_bio:       dataSource.public_bio        || null,
       public_photo_url: dataSource.public_photo_url  || null,
+      title: dataSource.title || null,
       updated_at: new Date().toISOString()
     };
     // Read current staff_type BEFORE update so we can detect type changes
@@ -6779,6 +6784,71 @@ app.delete('/api/academic-degrees/:id', authenticateToken, checkPermission('depa
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to delete academic degree', message: err.message });
+  }
+});
+
+// ============ HONORIFICS (title dropdown vocabulary) ============
+// Settings-managed list of allowed honorifics (Dr., Dra., Prof., …).
+// The chosen value is stored as a plain string in medical_staff.title
+// (Option A — no FK, no change to the public display logic). Mutations are
+// gated on system_settings since this list is managed in Settings.
+
+app.get('/api/honorifics', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const includeInactive = req.query.include_inactive === 'true';
+    let query = supabase.from('honorifics').select('*').order('display_order', { ascending: true });
+    if (!includeInactive) query = query.eq('is_active', true);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch honorifics', message: err.message });
+  }
+});
+
+app.post('/api/honorifics', authenticateToken, checkPermission('system_settings', 'create'), async (req, res) => {
+  try {
+    const { value, display_order } = req.body;
+    if (!value?.trim()) return res.status(400).json({ error: 'value is required' });
+    const { data, error } = await supabase.from('honorifics')
+      .insert([{ value: value.trim(), display_order: display_order || 0 }])
+      .select().single();
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'That honorific already exists' });
+      throw error;
+    }
+    res.status(201).json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to create honorific', message: err.message });
+  }
+});
+
+app.put('/api/honorifics/:id', authenticateToken, checkPermission('system_settings', 'update'), async (req, res) => {
+  try {
+    const { value, display_order, is_active } = req.body;
+    const updates = { updated_at: new Date().toISOString() };
+    if (value !== undefined)         updates.value = value.trim();
+    if (display_order !== undefined) updates.display_order = display_order;
+    if (is_active !== undefined)     updates.is_active = is_active;
+    const { data, error } = await supabase.from('honorifics')
+      .update(updates).eq('id', req.params.id).select().single();
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update honorific', message: err.message });
+  }
+});
+
+app.delete('/api/honorifics/:id', authenticateToken, checkPermission('system_settings', 'delete'), async (req, res) => {
+  try {
+    // Soft delete — deactivate so historical records keep their title string
+    const { error } = await supabase.from('honorifics')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete honorific', message: err.message });
   }
 });
 
