@@ -421,7 +421,10 @@ const schemas = {
     public_photo_url: Joi.string().uri().optional().allow('', null),
     // Honorific prefix (Dr., Dra., Prof., …) — plain string chosen from the
     // Settings-managed honorifics list; blank/none for non-clinical staff.
-    title:            Joi.string().max(40).optional().allow('', null)
+    title:            Joi.string().max(40).optional().allow('', null),
+    // Grammatical/display gender for Spanish role-label agreement
+    // (Médico/Médica…). 'other'/blank keeps the neutral "/a" form.
+    gender:           Joi.string().valid('female', 'male', 'other').optional().allow('', null)
   }),
 
   announcement: Joi.object({
@@ -2379,6 +2382,7 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
       public_bio:       dataSource.public_bio        || null,
       public_photo_url: dataSource.public_photo_url  || null,
       title: dataSource.title || null,
+      gender: dataSource.gender || null,
       updated_at: new Date().toISOString()
     };
     const { data, error } = await supabase.from('medical_staff').insert([staffData]).select().single();
@@ -2453,6 +2457,7 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       public_bio:       dataSource.public_bio        || null,
       public_photo_url: dataSource.public_photo_url  || null,
       title: dataSource.title || null,
+      gender: dataSource.gender || null,
       updated_at: new Date().toISOString()
     };
     // Read current staff_type BEFORE update so we can detect type changes
@@ -5023,6 +5028,7 @@ app.get('/api/team/website', publicApiLimiterGuarded, async (req, res) => {
         full_name:        m.full_name,
         display_name:     displayName,
         title:            m.title || null,
+        gender:           m.gender || null,
         staff_type:       m.staff_type,
         specialization:   m.specialization || null,
         public_bio:       m.public_bio || null,
