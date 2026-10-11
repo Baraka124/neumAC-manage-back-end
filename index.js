@@ -135,6 +135,7 @@ const app = express();
 app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // ============ CONFIGURATION ============
 const {
@@ -384,6 +385,16 @@ const schemas = {
     resolution_note: Joi.string().max(2000).optional().allow('', null),
     assigned_to_staff_id: Joi.string().uuid().optional().allow(null)
   }).min(1),
+  lineMember: Joi.object({
+    staff_id: Joi.string().uuid().required(),
+    role_on_line: Joi.string().max(40).optional().allow('', null),
+    sort_order: Joi.number().integer().min(0).optional().allow(null)
+  }),
+  publicationAuthor: Joi.object({
+    staff_id: Joi.string().uuid().required(),
+    author_order: Joi.number().integer().min(0).optional().allow(null),
+    is_corresponding: Joi.boolean().optional()
+  }),
   medicalStaff: Joi.object({
     full_name: Joi.string().required(),
     staff_type: Joi.string().min(1).max(80).required(), // dynamic — validated against staff_types table at runtime
@@ -1581,16 +1592,120 @@ app.put('/api/discrepancies/:id', authenticateToken, apiLimiter, validate(schema
     if (d.resolution_note !== undefined) patch.resolution_note = (d.resolution_note || '').trim() || null;
     if (d.assigned_to_staff_id !== undefined) patch.assigned_to_staff_id = d.assigned_to_staff_id || null;
     if (d.status === 'accepted' || d.status === 'rejected') { patch.resolved_at = new Date().toISOString(); patch.resolved_by = req.user.id; }
+
+    // Read the report first: accepting a line/authorship claim populates the
+    // structured link for the reporter — this is where the claim/verify loop
+    // actually closes. Best-effort: a failed link never fails the resolution.
+    const { data: report, error: readErr } = await supabase.from('discrepancy_reports')
+      .select('id, reporter_staff_id, subject_type, subject_id').eq('id', req.params.id).single();
+    if (readErr) {
+      if (readErr.code === 'PGRST116') return res.status(404).json({ error: 'Report not found' });
+      throw readErr;
+    }
+
     const { data, error } = await supabase.from('discrepancy_reports')
       .update(patch).eq('id', req.params.id).select('id, status, resolution_note, resolved_at').single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Report not found' });
       throw error;
     }
-    res.json(data);
+
+    let linked = null;
+    if (d.status === 'accepted' && UUID_RE.test(report.reporter_staff_id || '') && UUID_RE.test(report.subject_id || '')) {
+      try {
+        if (report.subject_type === 'line') {
+          await supabase.from('research_line_members')
+            .upsert({ research_line_id: report.subject_id, staff_id: report.reporter_staff_id, role_on_line: 'member' },
+                    { onConflict: 'research_line_id,staff_id', ignoreDuplicates: true });
+          linked = 'line_member';
+        } else if (report.subject_type === 'publication') {
+          await supabase.from('publication_authors')
+            .upsert({ news_post_id: report.subject_id, staff_id: report.reporter_staff_id },
+                    { onConflict: 'news_post_id,staff_id', ignoreDuplicates: true });
+          linked = 'publication_author';
+        }
+      } catch (linkErr) { console.error('discrepancy auto-link failed (non-fatal):', linkErr.message); linked = 'failed'; }
+    }
+    res.json({ ...data, linked });
   } catch (e) {
     res.status(500).json({ error: 'Failed to update report', message: e.message });
   }
+});
+
+// ============================================================================
+// Structured membership & authorship — the links Mi espacio's research and
+// publications sections rest on. Reviewers (admin_level >= 1) manage them
+// directly; the claim/verify loop above also populates them on accept.
+// ============================================================================
+
+// Research-line members
+app.get('/api/research-lines/:lineId/members', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('research_line_members')
+      .select('id, role_on_line, sort_order, staff:medical_staff!research_line_members_staff_id_fkey(id, full_name, staff_type)')
+      .eq('research_line_id', req.params.lineId)
+      .order('sort_order', { ascending: true, nullsFirst: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: 'Failed to load line members', message: e.message }); }
+});
+
+app.post('/api/research-lines/:lineId/members', authenticateToken, apiLimiter, validate(schemas.lineMember), async (req, res) => {
+  try {
+    if (Number(req.user.admin_level) < 1) return res.status(403).json({ error: 'Not authorized to manage line membership' });
+    const d = req.validatedData || req.body;
+    const { data, error } = await supabase.from('research_line_members')
+      .upsert({ research_line_id: req.params.lineId, staff_id: d.staff_id, role_on_line: (d.role_on_line || 'member'), sort_order: d.sort_order ?? null },
+              { onConflict: 'research_line_id,staff_id' })
+      .select('id, role_on_line, sort_order, staff_id').single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) { res.status(500).json({ error: 'Failed to add line member', message: e.message }); }
+});
+
+app.delete('/api/research-lines/:lineId/members/:staffId', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    if (Number(req.user.admin_level) < 1) return res.status(403).json({ error: 'Not authorized to manage line membership' });
+    const { error } = await supabase.from('research_line_members')
+      .delete().eq('research_line_id', req.params.lineId).eq('staff_id', req.params.staffId);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to remove line member', message: e.message }); }
+});
+
+// Publication authorship
+app.get('/api/publications/:postId/authors', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('publication_authors')
+      .select('id, author_order, is_corresponding, staff:medical_staff!publication_authors_staff_id_fkey(id, full_name, orcid)')
+      .eq('news_post_id', req.params.postId)
+      .order('author_order', { ascending: true, nullsFirst: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: 'Failed to load publication authors', message: e.message }); }
+});
+
+app.post('/api/publications/:postId/authors', authenticateToken, apiLimiter, validate(schemas.publicationAuthor), async (req, res) => {
+  try {
+    if (Number(req.user.admin_level) < 1) return res.status(403).json({ error: 'Not authorized to manage authorship' });
+    const d = req.validatedData || req.body;
+    const { data, error } = await supabase.from('publication_authors')
+      .upsert({ news_post_id: req.params.postId, staff_id: d.staff_id, author_order: d.author_order ?? null, is_corresponding: !!d.is_corresponding },
+              { onConflict: 'news_post_id,staff_id' })
+      .select('id, author_order, is_corresponding, staff_id').single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) { res.status(500).json({ error: 'Failed to add author', message: e.message }); }
+});
+
+app.delete('/api/publications/:postId/authors/:staffId', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    if (Number(req.user.admin_level) < 1) return res.status(403).json({ error: 'Not authorized to manage authorship' });
+    const { error } = await supabase.from('publication_authors')
+      .delete().eq('news_post_id', req.params.postId).eq('staff_id', req.params.staffId);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to remove author', message: e.message }); }
 });
 
 // ============================================================================
@@ -1639,7 +1754,7 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
       return res.json({ identity, agenda: { guardias: [], rotations: [], absences: [] }, research: { lines: [], studies: [], projects: [] }, publications: { available: false, note: 'Structured authorship pending.' } });
     }
 
-    const [guardiasRes, rotationsRes, supervisedRes, absencesRes, coordLinesRes, memberLinesRes, trialsRes, projectsRes] = await Promise.all([
+    const [guardiasRes, rotationsRes, supervisedRes, absencesRes, coordLinesRes, memberLinesRes, trialsRes, projectsRes, pubsRes] = await Promise.all([
       supabase.from('oncall_schedule')
         .select('id, duty_date, shift_type, primary_physician_id, backup_physician_id, resident_physician_id')
         .is('deleted_at', null).gte('duty_date', today)
@@ -1668,7 +1783,11 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
       supabase.from('innovation_projects')
         .select('id, title, development_stage, current_stage, category, lead_investigator_id, co_investigators')
         .or(`lead_investigator_id.eq.${sid},co_investigators.cs.{${sid}}`)
-        .order('updated_at', { ascending: false })
+        .order('updated_at', { ascending: false }),
+      supabase.from('publication_authors')
+        .select('author_order, is_corresponding, news_post:news_posts(id, title, authors_text)')
+        .eq('staff_id', sid)
+        .order('author_order', { ascending: true, nullsFirst: false })
     ]);
 
     const inArr = (arr, v) => Array.isArray(arr) && arr.includes(v);
@@ -1702,11 +1821,17 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
       role: p.lead_investigator_id === sid ? 'lead' : 'co-investigator'
     }));
 
+    const publicationItems = (pubsRes.data || []).filter(p => p.news_post).map(p => ({
+      id: p.news_post.id, title: p.news_post.title, byline: p.news_post.authors_text || null,
+      author_order: typeof p.author_order === 'number' ? p.author_order : null,
+      corresponding: !!p.is_corresponding
+    }));
+
     res.json({
       identity,
       agenda: { guardias, rotations, absences },
       research: { lines, studies, projects },
-      publications: { available: false, note: 'Structured authorship pending.' }
+      publications: { available: true, items: publicationItems, note: publicationItems.length ? null : 'Aún no se te ha vinculado ninguna publicación. Si falta alguna, comunícalo abajo.' }
     });
   } catch (e) {
     console.error('GET /api/me/context failed:', e.message);
