@@ -370,6 +370,20 @@ const hashPassword = async (password) => await bcrypt.hash(password, 10);
 
 // ============ VALIDATION SCHEMAS ============
 const schemas = {
+  // Mi espacio — self-service discrepancy reports (reporter identity comes from
+  // the session, never the body; reviewers resolve, reporters never edit records).
+  discrepancyReport: Joi.object({
+    subject_type: Joi.string().valid('guardia','rotation','absence','line','study','project','publication','profile','other').required(),
+    subject_id: Joi.string().max(64).optional().allow('', null),
+    subject_label: Joi.string().max(300).optional().allow('', null),
+    kind: Joi.string().valid('missing','incorrect','authorship','schedule','other').required(),
+    message: Joi.string().max(2000).optional().allow('', null)
+  }),
+  discrepancyResolve: Joi.object({
+    status: Joi.string().valid('open','in_review','accepted','rejected').optional(),
+    resolution_note: Joi.string().max(2000).optional().allow('', null),
+    assigned_to_staff_id: Joi.string().uuid().optional().allow(null)
+  }).min(1),
   medicalStaff: Joi.object({
     full_name: Joi.string().required(),
     staff_type: Joi.string().min(1).max(80).required(), // dynamic — validated against staff_types table at runtime
@@ -1496,6 +1510,87 @@ app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
     }
     res.json({ ...data, permissions, linked_staff: linkedStaff, test_session:req.testSession||null })
   } catch (e) { res.status(401).json({ error: 'Session validation failed' }) }
+});
+
+// ============================================================================
+// Mi espacio — self-service discrepancy reports (the claim/verify loop)
+// A linked person flags that something on their own space is missing or wrong;
+// a reviewer (admin/head) triages and resolves. The reporter never edits a
+// governed record — they raise a request, attributed from the session.
+// ============================================================================
+app.post('/api/me/discrepancies', authenticateToken, apiLimiter, validate(schemas.discrepancyReport), async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    if (!sid) return res.status(400).json({ error: 'No linked staff profile', message: 'Your account is not linked to a staff profile, so a report cannot be attributed.' });
+    const d = req.validatedData || req.body;
+    const row = {
+      reporter_staff_id: sid,
+      reporter_user_id: req.user.id,
+      subject_type: d.subject_type,
+      subject_id: (d.subject_id || '').trim() || null,
+      subject_label: (d.subject_label || '').trim() || null,
+      kind: d.kind,
+      message: (d.message || '').trim() || null,
+      status: 'open'
+    };
+    const { data, error } = await supabase.from('discrepancy_reports')
+      .insert([row]).select('id, subject_type, subject_id, kind, status, created_at').single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to submit report', message: e.message });
+  }
+});
+
+app.get('/api/me/discrepancies', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    if (!sid) return res.json([]);
+    const { data, error } = await supabase.from('discrepancy_reports')
+      .select('id, subject_type, subject_id, subject_label, kind, message, status, resolution_note, created_at, resolved_at')
+      .eq('reporter_staff_id', sid).order('created_at', { ascending: false }).limit(100);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load your reports', message: e.message });
+  }
+});
+
+app.get('/api/discrepancies', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    if (Number(req.user.admin_level) < 1) return res.status(403).json({ error: 'Not authorized to review discrepancy reports' });
+    let query = supabase.from('discrepancy_reports')
+      .select('id, reporter_staff_id, subject_type, subject_id, subject_label, kind, message, status, assigned_to_staff_id, resolution_note, created_at, updated_at, resolved_at, reporter:medical_staff!discrepancy_reports_reporter_staff_id_fkey(full_name)')
+      .order('created_at', { ascending: false }).limit(200);
+    const status = req.query.status;
+    if (status && ['open','in_review','accepted','rejected'].includes(status)) query = query.eq('status', status);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load the review queue', message: e.message });
+  }
+});
+
+app.put('/api/discrepancies/:id', authenticateToken, apiLimiter, validate(schemas.discrepancyResolve), async (req, res) => {
+  try {
+    if (Number(req.user.admin_level) < 1) return res.status(403).json({ error: 'Not authorized to resolve discrepancy reports' });
+    const d = req.validatedData || req.body;
+    const patch = { updated_at: new Date().toISOString() };
+    if (d.status !== undefined) patch.status = d.status;
+    if (d.resolution_note !== undefined) patch.resolution_note = (d.resolution_note || '').trim() || null;
+    if (d.assigned_to_staff_id !== undefined) patch.assigned_to_staff_id = d.assigned_to_staff_id || null;
+    if (d.status === 'accepted' || d.status === 'rejected') { patch.resolved_at = new Date().toISOString(); patch.resolved_by = req.user.id; }
+    const { data, error } = await supabase.from('discrepancy_reports')
+      .update(patch).eq('id', req.params.id).select('id, status, resolution_note, resolved_at').single();
+    if (error) {
+      if (error.code === 'PGRST116') return res.status(404).json({ error: 'Report not found' });
+      throw error;
+    }
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to update report', message: e.message });
+  }
 });
 
 // ============================================================================
