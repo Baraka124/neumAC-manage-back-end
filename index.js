@@ -1498,6 +1498,127 @@ app.get('/api/auth/me', authenticateToken, apiLimiter, async (req, res) => {
   } catch (e) { res.status(401).json({ error: 'Session validation failed' }) }
 });
 
+// ============================================================================
+// Mi espacio — personal context resolver
+// One server-authoritative endpoint that resolves everything the logged-in
+// person is linked to, from their medical_staff_id. It is the shared backbone
+// of the personal space ("Mi espacio") and of Grounded's answers: permission
+// is enforced HERE, not in the UI. Scope is the person's own activity (own);
+// department/all overlays come later. Sections rest only on relationships that
+// are already reliable — publications wait on structured authorship.
+// ============================================================================
+app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    const today = new Date().toISOString().split('T')[0];
+
+    let staff = null;
+    if (sid) {
+      const { data } = await supabase.from('medical_staff')
+        .select('id, full_name, professional_email, staff_type, specialization, department_id, is_chief_of_department, is_research_coordinator, is_resident_manager, is_oncall_manager, title, gender')
+        .eq('id', sid).maybeSingle();
+      staff = data || null;
+    }
+
+    const identity = {
+      user_id: req.user.id,
+      medical_staff_id: sid,
+      full_name: staff?.full_name || req.user.full_name,
+      email: staff?.professional_email || req.user.email,
+      title: staff?.title || null,
+      user_role: req.user.user_role,
+      staff_type: staff?.staff_type || null,
+      specialization: staff?.specialization || null,
+      department_id: staff?.department_id || req.user.department_id || null,
+      scope: Number(req.user.admin_level) >= 1 ? 'department' : 'own',
+      hats: {
+        chief_of_department: !!staff?.is_chief_of_department,
+        research_coordinator: !!staff?.is_research_coordinator,
+        resident_manager: !!staff?.is_resident_manager,
+        oncall_manager: !!staff?.is_oncall_manager
+      }
+    };
+
+    // No linked staff record → nothing personal to resolve, return identity only.
+    if (!sid) {
+      return res.json({ identity, agenda: { guardias: [], rotations: [], absences: [] }, research: { lines: [], studies: [], projects: [] }, publications: { available: false, note: 'Structured authorship pending.' } });
+    }
+
+    const [guardiasRes, rotationsRes, supervisedRes, absencesRes, coordLinesRes, memberLinesRes, trialsRes, projectsRes] = await Promise.all([
+      supabase.from('oncall_schedule')
+        .select('id, duty_date, shift_type, primary_physician_id, backup_physician_id, resident_physician_id')
+        .is('deleted_at', null).gte('duty_date', today)
+        .or(`primary_physician_id.eq.${sid},backup_physician_id.eq.${sid},resident_physician_id.eq.${sid}`)
+        .order('duty_date', { ascending: true }).limit(30),
+      supabase.from('resident_rotations')
+        .select('id, start_date, end_date, rotation_status, training_unit:training_units(unit_name)')
+        .is('deleted_at', null).eq('resident_id', sid).gte('end_date', today)
+        .order('start_date', { ascending: true }),
+      supabase.from('resident_rotations')
+        .select('id, start_date, end_date, rotation_status, resident:medical_staff!resident_rotations_resident_id_fkey(full_name)')
+        .is('deleted_at', null).eq('supervising_attending_id', sid).gte('end_date', today)
+        .order('start_date', { ascending: true }),
+      supabase.from('staff_absence_records')
+        .select('id, absence_type, start_date, end_date, current_status')
+        .is('deleted_at', null).eq('staff_member_id', sid).in('current_status', ['pending','active'])
+        .order('start_date', { ascending: true }),
+      supabase.from('research_lines')
+        .select('id, line_number, name, short_name').eq('coordinator_id', sid).order('line_number', { ascending: true }),
+      supabase.from('research_line_members')
+        .select('role_on_line, research_line:research_lines(id, line_number, name, short_name)').eq('staff_id', sid),
+      supabase.from('clinical_trials')
+        .select('id, title, protocol_id, status, principal_investigator_id, co_investigators, sub_investigators')
+        .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}},sub_investigators.cs.{${sid}}`)
+        .order('updated_at', { ascending: false }),
+      supabase.from('innovation_projects')
+        .select('id, title, development_stage, current_stage, category, lead_investigator_id, co_investigators')
+        .or(`lead_investigator_id.eq.${sid},co_investigators.cs.{${sid}}`)
+        .order('updated_at', { ascending: false })
+    ]);
+
+    const inArr = (arr, v) => Array.isArray(arr) && arr.includes(v);
+
+    const guardias = (guardiasRes.data || []).map(g => ({
+      id: g.id, date: g.duty_date, shift: g.shift_type,
+      role: g.primary_physician_id === sid ? 'primary' : (g.backup_physician_id === sid ? 'backup' : 'resident')
+    }));
+
+    const rotations = (rotationsRes.data || []).map(r => ({
+      id: r.id, unit: r.training_unit?.unit_name || null, start: r.start_date, end: r.end_date, status: r.rotation_status, role: 'resident'
+    })).concat((supervisedRes.data || []).map(r => ({
+      id: r.id, resident: r.resident?.full_name || null, start: r.start_date, end: r.end_date, status: r.rotation_status, role: 'supervisor'
+    })));
+
+    const absences = (absencesRes.data || []).map(a => ({ id: a.id, type: a.absence_type, start: a.start_date, end: a.end_date, status: a.current_status }));
+
+    const lines = (coordLinesRes.data || []).map(l => ({
+      id: l.id, line_number: l.line_number, name: l.short_name || l.name, role: 'coordinator'
+    })).concat((memberLinesRes.data || []).filter(m => m.research_line).map(m => ({
+      id: m.research_line.id, line_number: m.research_line.line_number, name: m.research_line.short_name || m.research_line.name, role: m.role_on_line || 'member'
+    })));
+
+    const studies = (trialsRes.data || []).map(t => ({
+      id: t.id, title: t.title, protocol_id: t.protocol_id, status: t.status,
+      role: t.principal_investigator_id === sid ? 'PI' : (inArr(t.co_investigators, sid) ? 'co-investigator' : 'sub-investigator')
+    }));
+
+    const projects = (projectsRes.data || []).map(p => ({
+      id: p.id, title: p.title, stage: p.development_stage || p.current_stage || null, category: p.category,
+      role: p.lead_investigator_id === sid ? 'lead' : 'co-investigator'
+    }));
+
+    res.json({
+      identity,
+      agenda: { guardias, rotations, absences },
+      research: { lines, studies, projects },
+      publications: { available: false, note: 'Structured authorship pending.' }
+    });
+  } catch (e) {
+    console.error('GET /api/me/context failed:', e.message);
+    res.status(500).json({ error: 'Failed to build personal context', message: e.message });
+  }
+});
+
 app.post('/api/auth/register', authenticateToken, requireAuthority('identity.users.manage', { scopes: ['all'] }), validate(schemas.register), async (req, res) => {
   try {
     const { email, password, ...userData } = req.validatedData || req.body;
