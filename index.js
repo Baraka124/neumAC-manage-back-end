@@ -2178,7 +2178,9 @@ app.post('/api/identity/invitations', authenticateToken, requireAuthority('ident
       delivery = { delivered: false, mode: 'delivery_failed', error: mailError.message };
     }
     await recordIdentityEvent(req.user.id, created.id, 'invitation_created', input.reason || null, { email: accountEmail, role: input.user_role, delivery: delivery.mode });
-    res.status(201).json({ success: true, user: created, delivery });
+    // Return the shareable link so a coordinator can send it directly (WhatsApp,
+    // SMS, in person) instead of depending on email delivery.
+    res.status(201).json({ success: true, user: created, delivery, invite_link: inviteLink });
   } catch (e) {
     res.status(500).json({ error: 'Failed to create invitation', message: e.message });
   }
@@ -2211,10 +2213,31 @@ app.post('/api/identity/users/:id/resend-invitation', authenticateToken, require
       delivery = { delivered: false, mode: 'delivery_failed', error: mailError.message };
     }
     await recordIdentityEvent(req.user.id, target.id, 'invitation_resent', null, { delivery: delivery.mode });
-    res.json({ success: true, invitation_expires_at: expiresAt, delivery });
+    res.json({ success: true, invitation_expires_at: expiresAt, delivery, invite_link: inviteLink });
   } catch (e) {
     res.status(500).json({ error: 'Failed to resend invitation', message: e.message });
   }
+});
+
+// Public preview of an invitation, so the entry page can greet the invitee by
+// name before they set a password. Returns only name + email + expiry, and only
+// for a token that is valid, unused and unexpired — the holder is the invitee.
+app.get('/api/auth/invitation', authLimiter, async (req, res) => {
+  try {
+    const token = String(req.query.token || '');
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); } catch { return res.status(400).json({ valid: false, error: 'Invalid or expired invitation' }); }
+    if (decoded.purpose !== 'account_invitation') return res.status(400).json({ valid: false, error: 'Invalid invitation token' });
+    let query = supabase.from('app_users')
+      .select('id, email, full_name, account_status, invitation_token_hash, invitation_expires_at')
+      .eq('email', String(decoded.email || '').toLowerCase());
+    if (decoded.userId) query = query.eq('id', decoded.userId);
+    const { data: target } = await query.maybeSingle();
+    if (!target || target.account_status !== 'invited') return res.status(400).json({ valid: false, error: 'Invitation is no longer active' });
+    if (!target.invitation_token_hash || target.invitation_token_hash !== tokenDigest(token)) return res.status(400).json({ valid: false, error: 'Invitation has been superseded' });
+    if (!target.invitation_expires_at || new Date(target.invitation_expires_at) < new Date()) return res.status(400).json({ valid: false, error: 'Invitation expired' });
+    res.json({ valid: true, full_name: target.full_name, email: target.email, expires_at: target.invitation_expires_at });
+  } catch (e) { res.status(500).json({ valid: false, error: 'Failed to read invitation' }); }
 });
 
 app.post('/api/auth/accept-invitation', authLimiter, validate(schemas.acceptInvitation), async (req, res) => {
