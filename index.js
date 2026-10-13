@@ -1608,41 +1608,7 @@ app.get('/api/me/profile', authenticateToken, apiLimiter, async (req, res) => {
   }
 });
 
-// POST /api/me/photo — self-service profile photo upload
-// Reuses the existing staff-photos Supabase Storage bucket.
-// Scoped to the logged-in person's own record only — no admin required.
-app.post('/api/me/photo', authenticateToken, apiLimiter, uploadToMemory.single('file'), async (req, res) => {
-  try {
-    const sid = req.user.medical_staff_id;
-    if (!sid) return res.status(400).json({ error: 'No linked staff profile' });
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-
-    const ext = path.extname(req.file.originalname).toLowerCase() || '.jpg';
-    const fileName = `self/${sid}-${Date.now()}${ext}`;
-
-    const { error: uploadError } = await supabase.storage
-      .from('staff-photos')
-      .upload(fileName, req.file.buffer, {
-        contentType: req.file.mimetype,
-        cacheControl: '3600',
-        upsert: false
-      });
-    if (uploadError) throw uploadError;
-
-    const { data: urlData } = supabase.storage.from('staff-photos').getPublicUrl(fileName);
-    const publicUrl = urlData.publicUrl;
-
-    // Update the staff record with the new photo URL
-    const { error: updateError } = await supabase.from('medical_staff')
-      .update({ public_photo_url: publicUrl, updated_at: new Date().toISOString() })
-      .eq('id', sid);
-    if (updateError) throw updateError;
-
-    res.json({ success: true, url: publicUrl });
-  } catch (e) {
-    res.status(500).json({ error: 'Photo upload failed', message: e.message });
-  }
-});
+// POST /api/me/photo — moved after uploadToMemory definition (section 16)
 
 // GET /api/me/certificates — own certificates without admin authority
 app.get('/api/me/certificates', authenticateToken, apiLimiter, async (req, res) => {
@@ -5171,6 +5137,42 @@ const uploadToMemory = multer({
     const ok = allowed.test(path.extname(file.originalname).toLowerCase()) && allowed.test(file.mimetype);
     if (ok) return cb(null, true);
     cb(new Error('Only JPEG, PNG, WEBP, or GIF images are allowed'));
+  }
+});
+
+// POST /api/me/photo — self-service profile photo upload
+// Reuses the existing staff-photos Supabase Storage bucket.
+// Scoped to the logged-in person's own record only — no admin required.
+app.post('/api/me/photo', authenticateToken, apiLimiter, uploadToMemory.single('file'), async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    if (!sid) return res.status(400).json({ error: 'No linked staff profile' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const ext = path.extname(req.file.originalname).toLowerCase() || '.jpg';
+    const fileName = `self/${sid}-${Date.now()}${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('staff-photos')
+      .upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype,
+        cacheControl: '3600',
+        upsert: false
+      });
+    if (uploadError) throw uploadError;
+
+    const { data: urlData } = supabase.storage.from('staff-photos').getPublicUrl(fileName);
+    const publicUrl = urlData.publicUrl;
+
+    // Update the staff record with the new photo URL
+    const { error: updateError } = await supabase.from('medical_staff')
+      .update({ public_photo_url: publicUrl, updated_at: new Date().toISOString() })
+      .eq('id', sid);
+    if (updateError) throw updateError;
+
+    res.json({ success: true, url: publicUrl });
+  } catch (e) {
+    res.status(500).json({ error: 'Photo upload failed', message: e.message });
   }
 });
 
