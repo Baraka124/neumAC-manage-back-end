@@ -1596,19 +1596,24 @@ app.get('/api/me/profile', authenticateToken, apiLimiter, async (req, res) => {
     if (!data) return res.status(404).json({ error: 'Staff record not found' });
 
     // Profile completeness score — counts key self-service and research fields
-    const completenessFields = [
-      data.public_photo_url, data.public_bio, data.mobile_phone,
-      data.orcid_id, data.scholar_url, data.researchgate_url
+    const completenessChecks = [
+      { key: 'photo', label: 'Foto de perfil', filled: !!(data.public_photo_url && String(data.public_photo_url).trim()) },
+      { key: 'bio', label: 'Biografía pública', filled: !!(data.public_bio && String(data.public_bio).trim()) },
+      { key: 'phone', label: 'Teléfono móvil', filled: !!(data.mobile_phone && String(data.mobile_phone).trim()) },
+      { key: 'orcid', label: 'ORCID', filled: !!(data.orcid_id && String(data.orcid_id).trim()) },
+      { key: 'scholar', label: 'Google Scholar', filled: !!(data.scholar_url && String(data.scholar_url).trim()) },
+      { key: 'researchgate', label: 'ResearchGate', filled: !!(data.researchgate_url && String(data.researchgate_url).trim()) }
     ];
-    const filled = completenessFields.filter(v => v && String(v).trim()).length;
-    const completeness = Math.round((filled / completenessFields.length) * 100);
+    const filled = completenessChecks.filter(c => c.filled).length;
+    const completeness = Math.round((filled / completenessChecks.length) * 100);
+    const missingFields = completenessChecks.filter(c => !c.filled).map(c => ({ key: c.key, label: c.label }));
 
     // Fetch notification preferences from app_users
     const { data: userPrefs } = await supabase.from('app_users')
       .select('notifications_enabled, absence_notifications, announcement_notifications')
       .eq('id', req.user.id).single();
 
-    res.json({ ...data, profile_completeness: completeness, notification_prefs: userPrefs || { notifications_enabled: true, absence_notifications: true, announcement_notifications: true } });
+    res.json({ ...data, profile_completeness: completeness, missing_fields: missingFields, notification_prefs: userPrefs || { notifications_enabled: true, absence_notifications: true, announcement_notifications: true } });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load your profile', message: e.message });
   }
@@ -1663,6 +1668,75 @@ app.get('/api/me/activity', authenticateToken, apiLimiter, async (req, res) => {
     res.json(data || []);
   } catch (e) {
     res.status(500).json({ error: 'Failed to load your activity', message: e.message });
+  }
+});
+
+// GET /api/me/colleagues — authenticated colleague directory (public profiles only)
+app.get('/api/me/colleagues', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    const { data, error } = await supabase.from('medical_staff')
+      .select('id, full_name, title, staff_type, specialization, public_photo_url, public_bio, orcid_id, scholar_url, researchgate_url, department:departments!medical_staff_department_id_fkey(name)')
+      .eq('employment_status', 'active')
+      .eq('is_public', true)
+      .is('deleted_at', null)
+      .order('full_name', { ascending: true });
+    if (error) throw error;
+    // Exclude the requesting user from the list
+    const colleagues = (data || []).filter(c => c.id !== sid).map(c => ({
+      id: c.id, name: c.full_name, title: c.title, staffType: c.staff_type,
+      specialization: c.specialization, photo: c.public_photo_url, bio: c.public_bio,
+      department: c.department?.name || '', orcid: c.orcid_id, scholar: c.scholar_url, researchgate: c.researchgate_url
+    }));
+    res.json(colleagues);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load colleagues', message: e.message });
+  }
+});
+
+// GET /api/me/dashboard — personal KPI summary
+app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    if (!sid) return res.json({ stats: {} });
+
+    // Parallel queries for stats
+    const [studiesRes, projectsRes, pubsRes, certsRes, absencesRes] = await Promise.all([
+      supabase.from('clinical_trials').select('id, status, role', { count: 'exact' })
+        .or(`pi_id.eq.${sid},co_pi_id.eq.${sid}`).is('deleted_at', null),
+      supabase.from('innovation_projects').select('id, current_stage, role', { count: 'exact' })
+        .or(`pi_id.eq.${sid},co_pi_id.eq.${sid}`).is('deleted_at', null),
+      supabase.from('publication_authors').select('id', { count: 'exact' })
+        .eq('staff_id', sid),
+      supabase.from('staff_certificates').select('id, expiry_date')
+        .eq('staff_id', sid),
+      supabase.from('absence_records').select('id, total_days')
+        .eq('staff_member_id', sid).is('deleted_at', null)
+        .gte('start_date', new Date().getFullYear() + '-01-01')
+    ]);
+
+    const now = new Date();
+    const certs = certsRes.data || [];
+    const expiredCerts = certs.filter(c => c.expiry_date && new Date(c.expiry_date) < now).length;
+    const expiringCerts = certs.filter(c => {
+      if (!c.expiry_date) return false;
+      const exp = new Date(c.expiry_date);
+      const diffDays = Math.ceil((exp - now) / (1000*60*60*24));
+      return diffDays >= 0 && diffDays <= 90;
+    }).length;
+    const absenceDaysUsed = (absencesRes.data || []).reduce((sum, a) => sum + (a.total_days || 0), 0);
+
+    res.json({
+      activeStudies: studiesRes.count || 0,
+      activeProjects: projectsRes.count || 0,
+      publications: pubsRes.count || 0,
+      totalCertificates: certs.length,
+      expiredCertificates: expiredCerts,
+      expiringCertificates: expiringCerts,
+      absenceDaysThisYear: absenceDaysUsed
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load dashboard', message: e.message });
   }
 });
 
