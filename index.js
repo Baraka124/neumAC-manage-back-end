@@ -1603,7 +1603,12 @@ app.get('/api/me/profile', authenticateToken, apiLimiter, async (req, res) => {
     const filled = completenessFields.filter(v => v && String(v).trim()).length;
     const completeness = Math.round((filled / completenessFields.length) * 100);
 
-    res.json({ ...data, profile_completeness: completeness });
+    // Fetch notification preferences from app_users
+    const { data: userPrefs } = await supabase.from('app_users')
+      .select('notifications_enabled, absence_notifications, announcement_notifications')
+      .eq('id', req.user.id).single();
+
+    res.json({ ...data, profile_completeness: completeness, notification_prefs: userPrefs || { notifications_enabled: true, absence_notifications: true, announcement_notifications: true } });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load your profile', message: e.message });
   }
@@ -1865,8 +1870,8 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
         .is('deleted_at', null).eq('supervising_attending_id', sid).gte('end_date', today)
         .order('start_date', { ascending: true }),
       supabase.from('staff_absence_records')
-        .select('id, absence_type, start_date, end_date, current_status')
-        .is('deleted_at', null).eq('staff_member_id', sid).in('current_status', ['pending','active'])
+        .select('id, absence_type, absence_reason, start_date, end_date, current_status, total_days')
+        .is('deleted_at', null).eq('staff_member_id', sid).in('current_status', ['pending','active','approved'])
         .order('start_date', { ascending: true }),
       supabase.from('research_lines')
         .select('id, line_number, name, short_name').eq('coordinator_id', sid).order('line_number', { ascending: true }),
@@ -1899,7 +1904,7 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
       id: r.id, resident: r.resident?.full_name || null, start: r.start_date, end: r.end_date, status: r.rotation_status, role: 'supervisor'
     })));
 
-    const absences = (absencesRes.data || []).map(a => ({ id: a.id, type: a.absence_type, start: a.start_date, end: a.end_date, status: a.current_status }));
+    const absences = (absencesRes.data || []).map(a => ({ id: a.id, type: a.absence_type, reason: a.absence_reason, start: a.start_date, end: a.end_date, status: a.current_status, days: a.total_days }));
 
     const lines = (coordLinesRes.data || []).map(l => ({
       id: l.id, line_number: l.line_number, name: l.short_name || l.name, role: 'coordinator'
