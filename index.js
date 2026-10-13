@@ -3190,9 +3190,11 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
   // handler which requires full_name + staff_type and fails with a validation error.
   const isOwnRecord = staff?.id && req.user?.medical_staff_id && String(staff.id) === String(req.user.medical_staff_id);
   if(!isOwnRecord) return next();
-  const schema=Joi.object({professional_email:Joi.string().email().allow('',null),mobile_phone:Joi.string().max(40).allow('',null),public_bio:Joi.string().max(2000).allow('',null),orcid_id:Joi.string().max(40).allow('',null),scholar_url:Joi.string().uri().max(500).allow('',null),researchgate_url:Joi.string().uri().max(500).allow('',null),pubmed_query:Joi.string().max(500).allow('',null),is_public:Joi.boolean(),indexed_publications_count:Joi.number().integer().min(0).max(9999).allow(null),h_index:Joi.number().integer().min(0).max(999).allow(null)}).min(1);
+  const schema=Joi.object({mobile_phone:Joi.string().max(40).allow('',null),public_bio:Joi.string().max(2000).allow('',null),orcid_id:Joi.string().max(40).allow('',null),scholar_url:Joi.string().uri().max(500).allow('',null),researchgate_url:Joi.string().uri().max(500).allow('',null),pubmed_query:Joi.string().max(500).allow('',null),is_public:Joi.boolean(),indexed_publications_count:Joi.number().integer().min(0).max(9999).allow(null),h_index:Joi.number().integer().min(0).max(999).allow(null)}).min(1);
+  // Strip professional_email if sent by older clients — email changes affect login and are admin-only
+  delete req.body.professional_email;
   const validated=schema.validate(req.body);
-  if(validated.error) return res.status(400).json({error:'Self-service edits support professional email, mobile phone, biography, research profile links, academic metrics and public visibility.'});
+  if(validated.error) return res.status(400).json({error:'Self-service edits support mobile phone, biography, research profile links, academic metrics and public visibility. Professional email changes require an administrator.'});
   try {
     if (validated.value.professional_email) validated.value.professional_email = String(validated.value.professional_email).trim().toLowerCase();
     if (validated.value.orcid_id) validated.value.orcid_id = String(validated.value.orcid_id).trim();
@@ -3201,10 +3203,7 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
     if (validated.value.pubmed_query) validated.value.pubmed_query = String(validated.value.pubmed_query).trim();
     const {data,error}=await supabase.from('medical_staff').update({...validated.value,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('id,professional_email,mobile_phone,public_bio,orcid_id,scholar_url,researchgate_url,pubmed_query,is_public,indexed_publications_count,h_index').single();
     if(error) throw error;
-    // Single source of truth: keep the login email aligned with the profile email.
-    const emailWarning = Object.prototype.hasOwnProperty.call(validated.value,'professional_email')
-      ? await syncLoginEmailToProfile(req.params.id, validated.value.professional_email) : null;
-    return res.json(emailWarning ? { ...data, warnings: [{ type:'login_email', message: emailWarning }] } : data);
+    return res.json(data);
   } catch(e){ return res.status(500).json({error:'Profile update failed'}); }
   } catch(e){ return res.status(500).json({error:'Profile access check failed'}); }
 }, validate(schemas.medicalStaff), async (req, res) => {
