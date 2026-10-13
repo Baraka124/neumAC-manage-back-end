@@ -1701,7 +1701,7 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
     if (!sid) return res.json({ stats: {} });
 
     // Parallel queries for stats
-    const [studiesRes, projectsRes, pubsRes, certsRes, absencesRes] = await Promise.all([
+    const [studiesRes, projectsRes, pubsRes, certsRes, absencesRes, piStudiesRes, piProjectsRes, staffRes] = await Promise.all([
       supabase.from('clinical_trials').select('id, status, role', { count: 'exact' })
         .or(`pi_id.eq.${sid},co_pi_id.eq.${sid}`).is('deleted_at', null),
       supabase.from('innovation_projects').select('id, current_stage, role', { count: 'exact' })
@@ -1712,7 +1712,13 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
         .eq('staff_id', sid),
       supabase.from('absence_records').select('id, total_days')
         .eq('staff_member_id', sid).is('deleted_at', null)
-        .gte('start_date', new Date().getFullYear() + '-01-01')
+        .gte('start_date', new Date().getFullYear() + '-01-01'),
+      supabase.from('clinical_trials').select('id', { count: 'exact' })
+        .eq('pi_id', sid).is('deleted_at', null),
+      supabase.from('innovation_projects').select('id', { count: 'exact' })
+        .eq('pi_id', sid).is('deleted_at', null),
+      supabase.from('medical_staff').select('h_index, indexed_publications_count')
+        .eq('id', sid).maybeSingle()
     ]);
 
     const now = new Date();
@@ -1726,6 +1732,7 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
     }).length;
     const absenceDaysUsed = (absencesRes.data || []).reduce((sum, a) => sum + (a.total_days || 0), 0);
 
+    const staffData = staffRes.data || {};
     res.json({
       activeStudies: studiesRes.count || 0,
       activeProjects: projectsRes.count || 0,
@@ -1733,7 +1740,11 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
       totalCertificates: certs.length,
       expiredCertificates: expiredCerts,
       expiringCertificates: expiringCerts,
-      absenceDaysThisYear: absenceDaysUsed
+      absenceDaysThisYear: absenceDaysUsed,
+      piStudies: piStudiesRes.count || 0,
+      piProjects: piProjectsRes.count || 0,
+      hIndex: staffData.h_index || null,
+      indexedPublications: staffData.indexed_publications_count || null
     });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load dashboard', message: e.message });
