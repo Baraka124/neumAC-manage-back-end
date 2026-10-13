@@ -1588,6 +1588,7 @@ app.get('/api/me/profile', authenticateToken, apiLimiter, async (req, res) => {
         has_medical_license, medical_license,
         can_be_pi, can_be_coi, can_supervise_residents,
         years_experience, primary_clinic,
+        indexed_publications_count, h_index,
         department:departments!medical_staff_department_id_fkey(id, name)
       `)
       .eq('id', sid).single();
@@ -2890,16 +2891,16 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
   // handler which requires full_name + staff_type and fails with a validation error.
   const isOwnRecord = staff?.id && req.user?.medical_staff_id && String(staff.id) === String(req.user.medical_staff_id);
   if(!isOwnRecord) return next();
-  const schema=Joi.object({professional_email:Joi.string().email().allow('',null),mobile_phone:Joi.string().max(40).allow('',null),public_bio:Joi.string().max(2000).allow('',null),orcid_id:Joi.string().max(40).allow('',null),scholar_url:Joi.string().uri().max(500).allow('',null),researchgate_url:Joi.string().uri().max(500).allow('',null),pubmed_query:Joi.string().max(500).allow('',null),is_public:Joi.boolean()}).min(1);
+  const schema=Joi.object({professional_email:Joi.string().email().allow('',null),mobile_phone:Joi.string().max(40).allow('',null),public_bio:Joi.string().max(2000).allow('',null),orcid_id:Joi.string().max(40).allow('',null),scholar_url:Joi.string().uri().max(500).allow('',null),researchgate_url:Joi.string().uri().max(500).allow('',null),pubmed_query:Joi.string().max(500).allow('',null),is_public:Joi.boolean(),indexed_publications_count:Joi.number().integer().min(0).max(9999).allow(null),h_index:Joi.number().integer().min(0).max(999).allow(null)}).min(1);
   const validated=schema.validate(req.body);
-  if(validated.error) return res.status(400).json({error:'Self-service edits support professional email, mobile phone, biography, research profile links and public visibility.'});
+  if(validated.error) return res.status(400).json({error:'Self-service edits support professional email, mobile phone, biography, research profile links, academic metrics and public visibility.'});
   try {
     if (validated.value.professional_email) validated.value.professional_email = String(validated.value.professional_email).trim().toLowerCase();
     if (validated.value.orcid_id) validated.value.orcid_id = String(validated.value.orcid_id).trim();
     if (validated.value.scholar_url) validated.value.scholar_url = String(validated.value.scholar_url).trim();
     if (validated.value.researchgate_url) validated.value.researchgate_url = String(validated.value.researchgate_url).trim();
     if (validated.value.pubmed_query) validated.value.pubmed_query = String(validated.value.pubmed_query).trim();
-    const {data,error}=await supabase.from('medical_staff').update({...validated.value,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('id,professional_email,mobile_phone,public_bio,orcid_id,scholar_url,researchgate_url,pubmed_query,is_public').single();
+    const {data,error}=await supabase.from('medical_staff').update({...validated.value,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('id,professional_email,mobile_phone,public_bio,orcid_id,scholar_url,researchgate_url,pubmed_query,is_public,indexed_publications_count,h_index').single();
     if(error) throw error;
     // Single source of truth: keep the login email aligned with the profile email.
     const emailWarning = Object.prototype.hasOwnProperty.call(validated.value,'professional_email')
