@@ -1567,6 +1567,99 @@ app.get('/api/me/discrepancies', authenticateToken, apiLimiter, async (req, res)
   }
 });
 
+// ── Mi Espacio — self-service profile & photo ──────────────────────────────
+// GET /api/me/profile — returns the logged-in person's full staff record
+// plus research profile links and public-website fields. Scoped to own
+// record only, no authority escalation possible.
+app.get('/api/me/profile', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    if (!sid) return res.status(400).json({ error: 'No linked staff profile' });
+    const { data, error } = await supabase.from('medical_staff')
+      .select(`
+        id, full_name, title, gender, staff_type, specialization,
+        professional_email, mobile_phone, work_phone, office_phone,
+        public_bio, public_photo_url, is_public,
+        orcid_id, scholar_url, researchgate_url, pubmed_query,
+        affiliation_type, primary_dept_name,
+        academic_degree, has_phd, phd_field,
+        employment_status, training_year, training_level,
+        residency_start_date, resident_category, resident_type,
+        has_medical_license, medical_license,
+        can_be_pi, can_be_coi, can_supervise_residents,
+        years_experience, primary_clinic,
+        department:departments!medical_staff_department_id_fkey(id, name)
+      `)
+      .eq('id', sid).single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Staff record not found' });
+
+    // Profile completeness score — counts key self-service and research fields
+    const completenessFields = [
+      data.public_photo_url, data.public_bio, data.mobile_phone,
+      data.orcid_id, data.scholar_url, data.researchgate_url
+    ];
+    const filled = completenessFields.filter(v => v && String(v).trim()).length;
+    const completeness = Math.round((filled / completenessFields.length) * 100);
+
+    res.json({ ...data, profile_completeness: completeness });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load your profile', message: e.message });
+  }
+});
+
+// POST /api/me/photo — self-service profile photo upload
+// Reuses the existing staff-photos Supabase Storage bucket.
+// Scoped to the logged-in person's own record only — no admin required.
+app.post('/api/me/photo', authenticateToken, apiLimiter, uploadToMemory.single('file'), async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    if (!sid) return res.status(400).json({ error: 'No linked staff profile' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const ext = path.extname(req.file.originalname).toLowerCase() || '.jpg';
+    const fileName = `self/${sid}-${Date.now()}${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from('staff-photos')
+      .upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype,
+        cacheControl: '3600',
+        upsert: false
+      });
+    if (uploadError) throw uploadError;
+
+    const { data: urlData } = supabase.storage.from('staff-photos').getPublicUrl(fileName);
+    const publicUrl = urlData.publicUrl;
+
+    // Update the staff record with the new photo URL
+    const { error: updateError } = await supabase.from('medical_staff')
+      .update({ public_photo_url: publicUrl, updated_at: new Date().toISOString() })
+      .eq('id', sid);
+    if (updateError) throw updateError;
+
+    res.json({ success: true, url: publicUrl });
+  } catch (e) {
+    res.status(500).json({ error: 'Photo upload failed', message: e.message });
+  }
+});
+
+// GET /api/me/certificates — own certificates without admin authority
+app.get('/api/me/certificates', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    if (!sid) return res.json([]);
+    const { data, error } = await supabase.from('staff_certificates')
+      .select('id, certificate_name, issued_date, expiry_date, renewal_months, notes')
+      .eq('staff_id', sid)
+      .order('expiry_date', { ascending: true });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load your certificates', message: e.message });
+  }
+});
+
 app.get('/api/discrepancies', authenticateToken, apiLimiter, async (req, res) => {
   try {
     if (Number(req.user.admin_level) < 1) return res.status(403).json({ error: 'Not authorized to review discrepancy reports' });
@@ -2793,12 +2886,16 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
   const staff=await loadStaffScopeRecord(req.params.id);
   const decision=await resolveStaffTargetAuthority(req,'staff.profile.edit',staff);
   if(decision.matched_scope!=='own') return next();
-  const schema=Joi.object({professional_email:Joi.string().email().allow('',null),mobile_phone:Joi.string().max(40).allow('',null),public_bio:Joi.string().max(2000).allow('',null)}).min(1);
+  const schema=Joi.object({professional_email:Joi.string().email().allow('',null),mobile_phone:Joi.string().max(40).allow('',null),public_bio:Joi.string().max(2000).allow('',null),orcid_id:Joi.string().max(40).allow('',null),scholar_url:Joi.string().uri().max(500).allow('',null),researchgate_url:Joi.string().uri().max(500).allow('',null),pubmed_query:Joi.string().max(500).allow('',null),is_public:Joi.boolean()}).min(1);
   const validated=schema.validate(req.body);
-  if(validated.error) return res.status(400).json({error:'Self-service edits support professional email, mobile phone and biography only.'});
+  if(validated.error) return res.status(400).json({error:'Self-service edits support professional email, mobile phone, biography, research profile links and public visibility.'});
   try {
     if (validated.value.professional_email) validated.value.professional_email = String(validated.value.professional_email).trim().toLowerCase();
-    const {data,error}=await supabase.from('medical_staff').update({...validated.value,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('id,professional_email,mobile_phone,public_bio').single();
+    if (validated.value.orcid_id) validated.value.orcid_id = String(validated.value.orcid_id).trim();
+    if (validated.value.scholar_url) validated.value.scholar_url = String(validated.value.scholar_url).trim();
+    if (validated.value.researchgate_url) validated.value.researchgate_url = String(validated.value.researchgate_url).trim();
+    if (validated.value.pubmed_query) validated.value.pubmed_query = String(validated.value.pubmed_query).trim();
+    const {data,error}=await supabase.from('medical_staff').update({...validated.value,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('id,professional_email,mobile_phone,public_bio,orcid_id,scholar_url,researchgate_url,pubmed_query,is_public').single();
     if(error) throw error;
     // Single source of truth: keep the login email aligned with the profile email.
     const emailWarning = Object.prototype.hasOwnProperty.call(validated.value,'professional_email')
