@@ -1740,6 +1740,215 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
   }
 });
 
+// ── Phase 21: Notifications, Calendar, Digest ──────────────────────────────
+
+// GET /api/me/notifications — cert expiry, upcoming oncall, study milestones
+app.get('/api/me/notifications', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    if (!sid) return res.json([]);
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    const in7  = new Date(now.getTime() + 7  * 86400000).toISOString().slice(0, 10);
+    const in30 = new Date(now.getTime() + 30 * 86400000).toISOString().slice(0, 10);
+    const in90 = new Date(now.getTime() + 90 * 86400000).toISOString().slice(0, 10);
+
+    const [certsRes, oncallRes, studiesRes] = await Promise.all([
+      supabase.from('staff_certificates').select('id, certificate_name, expiry_date')
+        .eq('staff_id', sid).not('expiry_date', 'is', null)
+        .lte('expiry_date', in90),
+      supabase.from('oncall_schedule')
+        .select('id, duty_date, shift_type')
+        .or(`primary_physician_id.eq.${sid},backup_physician_id.eq.${sid},resident_physician_id.eq.${sid}`)
+        .gte('duty_date', today).lte('duty_date', in7)
+        .is('deleted_at', null)
+        .order('duty_date', { ascending: true }),
+      supabase.from('clinical_trials')
+        .select('id, protocol_title, status, target_enrollment, current_enrollment')
+        .or(`pi_id.eq.${sid},co_pi_id.eq.${sid}`)
+        .is('deleted_at', null)
+        .in('status', ['active', 'enrolling', 'recruiting'])
+    ]);
+
+    const notifs = [];
+
+    // Certificate notifications
+    (certsRes.data || []).forEach(c => {
+      const exp = new Date(c.expiry_date);
+      const diffDays = Math.ceil((exp - now) / 86400000);
+      if (diffDays < 0) {
+        notifs.push({ id: 'cert-exp-' + c.id, type: 'cert_expired', severity: 'error',
+          title: 'Certificado caducado', message: c.certificate_name || 'Certificado',
+          detail: 'Caducó hace ' + Math.abs(diffDays) + ' días', date: c.expiry_date, refId: c.id });
+      } else if (diffDays <= 30) {
+        notifs.push({ id: 'cert-soon-' + c.id, type: 'cert_expiring', severity: 'warning',
+          title: 'Certificado próximo a caducar', message: c.certificate_name || 'Certificado',
+          detail: 'Caduca en ' + diffDays + ' días', date: c.expiry_date, refId: c.id });
+      } else {
+        notifs.push({ id: 'cert-info-' + c.id, type: 'cert_expiring', severity: 'info',
+          title: 'Certificado a renovar', message: c.certificate_name || 'Certificado',
+          detail: 'Caduca en ' + diffDays + ' días', date: c.expiry_date, refId: c.id });
+      }
+    });
+
+    // Upcoming oncall
+    (oncallRes.data || []).forEach(o => {
+      notifs.push({ id: 'oncall-' + o.id, type: 'oncall_upcoming', severity: 'info',
+        title: 'Guardia próxima', message: (o.shift_type || 'Guardia') + ' — ' + o.duty_date,
+        detail: o.duty_date === today ? 'Hoy' : o.duty_date, date: o.duty_date, refId: o.id });
+    });
+
+    // Study milestones (enrollment targets)
+    (studiesRes.data || []).forEach(s => {
+      const target = s.target_enrollment || 0;
+      const current = s.current_enrollment || 0;
+      if (target > 0 && current >= target) {
+        notifs.push({ id: 'study-full-' + s.id, type: 'study_milestone', severity: 'success',
+          title: 'Objetivo de reclutamiento alcanzado', message: s.protocol_title || 'Estudio',
+          detail: current + '/' + target + ' participantes', date: today, refId: s.id });
+      } else if (target > 0 && current >= target * 0.9) {
+        notifs.push({ id: 'study-near-' + s.id, type: 'study_milestone', severity: 'info',
+          title: 'Reclutamiento al 90%', message: s.protocol_title || 'Estudio',
+          detail: current + '/' + target + ' participantes', date: today, refId: s.id });
+      }
+    });
+
+    // Sort: errors first, then warnings, then info, then by date
+    const sev = { error: 0, warning: 1, success: 2, info: 3 };
+    notifs.sort((a, b) => (sev[a.severity] || 9) - (sev[b.severity] || 9) || (a.date || '').localeCompare(b.date || ''));
+    res.json(notifs);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load notifications', message: e.message });
+  }
+});
+
+// GET /api/me/calendar?month=YYYY-MM — oncall shifts, absences, training for a month
+app.get('/api/me/calendar', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const sid = req.user.medical_staff_id;
+    if (!sid) return res.json({ events: [] });
+    const month = req.query.month || new Date().toISOString().slice(0, 7);
+    const start = month + '-01';
+    const endDate = new Date(Number(month.slice(0, 4)), Number(month.slice(5, 7)), 0);
+    const end = month + '-' + String(endDate.getDate()).padStart(2, '0');
+
+    const [oncallRes, absenceRes, trainingRes] = await Promise.all([
+      supabase.from('oncall_schedule')
+        .select('id, duty_date, shift_type')
+        .or(`primary_physician_id.eq.${sid},backup_physician_id.eq.${sid},resident_physician_id.eq.${sid}`)
+        .gte('duty_date', start).lte('duty_date', end)
+        .is('deleted_at', null)
+        .order('duty_date', { ascending: true }),
+      supabase.from('staff_absence_records')
+        .select('id, start_date, end_date, absence_type, absence_reason, current_status')
+        .eq('staff_member_id', sid)
+        .neq('current_status', 'cancelled')
+        .lte('start_date', end).gte('end_date', start),
+      supabase.from('staff_certificates')
+        .select('id, certificate_name, issue_date, expiry_date')
+        .eq('staff_id', sid)
+        .not('issue_date', 'is', null)
+        .gte('issue_date', start).lte('issue_date', end)
+    ]);
+
+    const events = [];
+
+    (oncallRes.data || []).forEach(o => {
+      events.push({ id: 'oncall-' + o.id, type: 'oncall', date: o.duty_date,
+        title: o.shift_type || 'Guardia', color: '#158a89' });
+    });
+
+    (absenceRes.data || []).forEach(a => {
+      // Expand date range into individual day events within the month
+      const aStart = a.start_date > start ? a.start_date : start;
+      const aEnd = a.end_date < end ? a.end_date : end;
+      let d = new Date(aStart);
+      const dEnd = new Date(aEnd);
+      while (d <= dEnd) {
+        const ds = d.toISOString().slice(0, 10);
+        events.push({ id: 'absence-' + a.id + '-' + ds, type: 'absence', date: ds,
+          title: a.absence_type || a.absence_reason || 'Ausencia', color: '#e8913a',
+          status: a.current_status });
+        d.setDate(d.getDate() + 1);
+      }
+    });
+
+    (trainingRes.data || []).forEach(t => {
+      events.push({ id: 'training-' + t.id, type: 'training', date: t.issue_date,
+        title: t.certificate_name || 'Formación', color: '#6366f1' });
+    });
+
+    events.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+    res.json({ month, events });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load calendar', message: e.message });
+  }
+});
+
+// GET /api/me/digest?period=week|month — activity summary
+app.get('/api/me/digest', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const sid = req.user.medical_staff_id;
+    if (!userId) return res.json({ period: 'week', items: [] });
+    const period = req.query.period === 'month' ? 'month' : 'week';
+    const now = new Date();
+    const since = new Date(now);
+    if (period === 'month') {
+      since.setDate(since.getDate() - 30);
+    } else {
+      since.setDate(since.getDate() - 7);
+    }
+    const sinceISO = since.toISOString();
+
+    const queries = [
+      supabase.from('audit_logs')
+        .select('id, action, resource, resource_id, details, created_at')
+        .eq('user_id', userId)
+        .gte('created_at', sinceISO)
+        .order('created_at', { ascending: false })
+        .limit(100)
+    ];
+
+    if (sid) {
+      queries.push(
+        supabase.from('staff_certificates').select('id, certificate_name, issue_date')
+          .eq('staff_id', sid).gte('issue_date', sinceISO.slice(0, 10)),
+        supabase.from('publication_authors').select('id, publication:publications(title, publication_date)')
+          .eq('staff_id', sid)
+      );
+    }
+
+    const results = await Promise.all(queries);
+    const logs = results[0].data || [];
+
+    // Summarize by resource type
+    const summary = {};
+    logs.forEach(l => {
+      const key = l.resource || 'other';
+      if (!summary[key]) summary[key] = { resource: key, actions: 0, lastAction: l.action, lastDate: l.created_at };
+      summary[key].actions++;
+    });
+
+    const digest = {
+      period,
+      since: sinceISO.slice(0, 10),
+      totalActions: logs.length,
+      byResource: Object.values(summary).sort((a, b) => b.actions - a.actions),
+      recentCerts: sid && results[1] ? (results[1].data || []).map(c => ({
+        name: c.certificate_name, date: c.issue_date
+      })) : [],
+      recentPublications: sid && results[2] ? (results[2].data || []).filter(p => p.publication).map(p => ({
+        title: p.publication.title, date: p.publication.publication_date
+      })) : []
+    };
+
+    res.json(digest);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load digest', message: e.message });
+  }
+});
+
 app.get('/api/discrepancies', authenticateToken, apiLimiter, async (req, res) => {
   try {
     if (Number(req.user.admin_level) < 1) return res.status(403).json({ error: 'Not authorized to review discrepancy reports' });
