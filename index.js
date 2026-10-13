@@ -2884,8 +2884,12 @@ app.post('/api/medical-staff', authenticateToken, checkPermission('medical_staff
 app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_staff', 'update'), async (req,res,next) => {
   try {
   const staff=await loadStaffScopeRecord(req.params.id);
-  const decision=await resolveStaffTargetAuthority(req,'staff.profile.edit',staff);
-  if(decision.matched_scope!=='own') return next();
+  // Use direct ID comparison instead of matched_scope — attending physicians and
+  // department heads have 'department' scope for staff.profile.edit, not 'own',
+  // so matched_scope==='own' would route their Mi Espacio self-edits to the admin
+  // handler which requires full_name + staff_type and fails with a validation error.
+  const isOwnRecord = staff?.id && req.user?.medical_staff_id && String(staff.id) === String(req.user.medical_staff_id);
+  if(!isOwnRecord) return next();
   const schema=Joi.object({professional_email:Joi.string().email().allow('',null),mobile_phone:Joi.string().max(40).allow('',null),public_bio:Joi.string().max(2000).allow('',null),orcid_id:Joi.string().max(40).allow('',null),scholar_url:Joi.string().uri().max(500).allow('',null),researchgate_url:Joi.string().uri().max(500).allow('',null),pubmed_query:Joi.string().max(500).allow('',null),is_public:Joi.boolean()}).min(1);
   const validated=schema.validate(req.body);
   if(validated.error) return res.status(400).json({error:'Self-service edits support professional email, mobile phone, biography, research profile links and public visibility.'});
