@@ -1610,7 +1610,7 @@ app.get('/api/me/profile', authenticateToken, apiLimiter, async (req, res) => {
 
 // POST /api/me/photo — moved after uploadToMemory definition (section 16)
 
-// GET /api/me/certificates — own certificates without admin authority
+// GET /api/me/certificates — own certificates with expiry urgency flags
 app.get('/api/me/certificates', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const sid = req.user.medical_staff_id;
@@ -1620,9 +1620,43 @@ app.get('/api/me/certificates', authenticateToken, apiLimiter, async (req, res) 
       .eq('staff_id', sid)
       .order('expiry_date', { ascending: true });
     if (error) throw error;
-    res.json(data || []);
+    const now = new Date();
+    const enriched = (data || []).map(c => {
+      const out = { ...c };
+      if (c.expiry_date) {
+        const expiry = new Date(c.expiry_date);
+        const diffMs = expiry - now;
+        const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+        out.days_until_expiry = diffDays;
+        out.urgency = diffDays < 0 ? 'expired' : diffDays <= 90 ? 'expiring_soon' : 'ok';
+      } else {
+        out.days_until_expiry = null;
+        out.urgency = 'ok';
+      }
+      return out;
+    });
+    res.json(enriched);
   } catch (e) {
     res.status(500).json({ error: 'Failed to load your certificates', message: e.message });
+  }
+});
+
+// GET /api/me/activity — personal activity timeline from audit logs
+// Returns the last 25 audit entries for the logged-in user, scoped to
+// their own actions. No admin authority needed.
+app.get('/api/me/activity', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    if (!userId) return res.json([]);
+    const { data, error } = await supabase.from('audit_logs')
+      .select('id, action, resource, resource_id, details, created_at')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(25);
+    if (error) throw error;
+    res.json(data || []);
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load your activity', message: e.message });
   }
 });
 
