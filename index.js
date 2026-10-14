@@ -2158,10 +2158,12 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
       supabase.from('resident_rotations')
         .select('id, start_date, end_date, rotation_status, training_unit:training_units(unit_name)')
         .is('deleted_at', null).eq('resident_id', sid).gte('end_date', today)
+        .in('rotation_status', ['scheduled', 'active', 'extended'])
         .order('start_date', { ascending: true }),
       supabase.from('resident_rotations')
         .select('id, start_date, end_date, rotation_status, resident:medical_staff!resident_rotations_resident_id_fkey(full_name)')
         .is('deleted_at', null).eq('supervising_attending_id', sid).gte('end_date', today)
+        .in('rotation_status', ['scheduled', 'active', 'extended'])
         .order('start_date', { ascending: true }),
       supabase.from('staff_absence_records')
         .select('id, absence_type, absence_reason, start_date, end_date, current_status, total_days')
@@ -3277,7 +3279,7 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
         supabase.from('resident_rotations')
           .select('id, training_unit_id, start_date, end_date, rotation_status')
           .eq('resident_id', req.params.id)
-          .in('rotation_status', ['active','scheduled'])
+          .is('deleted_at', null).in('rotation_status', ['active','scheduled'])
           .gte('end_date', today),
         supabase.from('oncall_schedule')
           .select('id, duty_date, shift_type')
@@ -3308,12 +3310,24 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
       const wasResident = prevType.data?.is_resident_type;
       const nowResident = newType.data?.is_resident_type;
       if (wasResident && !nowResident) {
-        // Promoted to attending — terminate their rotations
-        const { data: terminated } = await supabase.from('resident_rotations')
-          .update({ rotation_status: 'terminated_early', updated_at: new Date().toISOString() })
-          .eq('resident_id', req.params.id)
-          .in('rotation_status', ['active','scheduled'])
+        // Promoted to attending: rotations not yet started are cancelled (never
+        // happened); a running rotation ends today with a recorded actual end date.
+        const nowIso = new Date().toISOString();
+        const todayStr = nowIso.split('T')[0];
+        const { data: cancelledFuture } = await supabase.from('resident_rotations')
+          .update({ rotation_status: 'cancelled', deleted_at: nowIso, updated_at: nowIso })
+          .eq('resident_id', req.params.id).is('deleted_at', null)
+          .in('rotation_status', ['active','scheduled','extended'])
+          .gt('start_date', todayStr)
           .select('id');
+        const { data: terminatedRunning } = await supabase.from('resident_rotations')
+          .update({ rotation_status: 'terminated_early', actual_end_date: todayStr, termination_recorded_at: nowIso,
+                    termination_reason: 'Promoted from resident to attending', updated_at: nowIso })
+          .eq('resident_id', req.params.id).is('deleted_at', null)
+          .in('rotation_status', ['active','scheduled','extended'])
+          .lte('start_date', todayStr).gte('end_date', todayStr)
+          .select('id');
+        const terminated = [...(cancelledFuture || []), ...(terminatedRunning || [])];
         if (terminated?.length) {
           warnings.push({ type: 'rotations_terminated', count: terminated.length, message: `${terminated.length} rotation(s) automatically terminated — staff promoted from resident to attending` });
         }
@@ -3603,7 +3617,7 @@ app.put('/api/training-units/:id', authenticateToken, Portfolio.write('training_
           .from('resident_rotations')
           .select('id')
           .eq('training_unit_id', req.params.id)
-          .in('rotation_status', ['active', 'scheduled'])
+          .is('deleted_at', null).in('rotation_status', ['active', 'scheduled'])
           .gte('end_date', today);
         const occupied = activeRots?.length || 0;
         if (occupied > dataSource.maximum_residents) {
@@ -3791,7 +3805,7 @@ app.get('/api/rotations/availability', authenticateToken, apiLimiter, async (req
       .from('resident_rotations')
       .select('id, resident_id, start_date, end_date, rotation_status, resident:medical_staff!resident_rotations_resident_id_fkey(id, full_name)')
       .eq('training_unit_id', training_unit_id)
-      .in('rotation_status', ['active', 'scheduled'])
+      .is('deleted_at', null).in('rotation_status', ['active', 'scheduled'])
 
     if (start_date && end_date) {
       // Overlapping: existing.start <= new.end AND existing.end >= new.start
@@ -3931,7 +3945,7 @@ const loadRotationDecisionState = async ({residentId,unitId,supervisorId,start,e
   const [staffR, unitR, rotationsR, absencesR, oncallR] = await Promise.all([
     ids.length ? supabase.from('medical_staff').select('id,full_name,staff_type,employment_status,can_supervise_residents').in('id',ids) : Promise.resolve({data:[]}),
     unitId ? supabase.from('training_units').select('id,unit_name,unit_status,maximum_residents,department_id').eq('id',unitId).maybeSingle() : Promise.resolve({data:null}),
-    supabase.from('resident_rotations').select('id,resident_id,training_unit_id,supervising_attending_id,start_date,end_date,actual_start_date,actual_end_date,rotation_status,rotation_category,training_unit:training_units(unit_name)').in('rotation_status',['scheduled','active','extended']).lte('start_date',end).gte('end_date',start),
+    supabase.from('resident_rotations').select('id,resident_id,training_unit_id,supervising_attending_id,start_date,end_date,actual_start_date,actual_end_date,rotation_status,rotation_category,training_unit:training_units(unit_name)').is('deleted_at', null).in('rotation_status',['scheduled','active','extended']).lte('start_date',end).gte('end_date',start),
     ids.length ? supabase.from('staff_absence_records').select('id,staff_member_id,start_date,end_date,actual_start_date,actual_return_date,current_status,absence_reason,absence_type').in('staff_member_id',ids).neq('current_status','cancelled').lte('start_date',end).gte('end_date',start) : Promise.resolve({data:[]}),
     residentId ? supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,resident_physician_id,duty_date,shift_type').or(`primary_physician_id.eq.${residentId},backup_physician_id.eq.${residentId},resident_physician_id.eq.${residentId}`).gte('duty_date',start).lte('duty_date',end).is('deleted_at',null) : Promise.resolve({data:[]})
   ]);
@@ -4035,7 +4049,7 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
     const { data: existingRotations, error: checkError } = await supabase.from('resident_rotations')
       .select('id, start_date, end_date, rotation_status')
       .eq('resident_id', dataSource.resident_id)
-      .in('rotation_status', ['scheduled', 'active', 'extended'])
+      .is('deleted_at', null).in('rotation_status', ['scheduled', 'active', 'extended'])
       .not('end_date', 'lt', startDate).not('start_date', 'gt', endDate);
     if (checkError) throw checkError;
     if (existingRotations && existingRotations.length > 0) {
@@ -4054,7 +4068,7 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
         .from('resident_rotations')
         .select('id, resident_id, start_date, end_date')
         .eq('training_unit_id', dataSource.training_unit_id)
-        .in('rotation_status', ['active', 'scheduled'])
+        .is('deleted_at', null).in('rotation_status', ['active', 'scheduled'])
         .lte('start_date', endDate)
         .gte('end_date', startDate);
       const occupied = overlappingInUnit?.length || 0;
@@ -4203,7 +4217,7 @@ app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotat
       if (nextStatus !== 'terminated_early' && daysLeft >= 0 && daysLeft <= 7) {
         const { data: nextRots } = await supabase.from('resident_rotations')
           .select('id').eq('training_unit_id', rotationData.training_unit_id || currentRecord.training_unit_id)
-          .in('rotation_status', ['scheduled','active'])
+          .is('deleted_at', null).in('rotation_status', ['scheduled','active'])
           .gte('start_date', rotationData.end_date).limit(1);
         if (!nextRots || nextRots.length === 0) {
           const residentId = rotationData.resident_id || currentRecord.resident_id;
@@ -4378,7 +4392,7 @@ const loadLeaveDecisionState = async ({staffId, coveringStaffId=null, start, end
     staffIds.length
       ? supabase.from('staff_absence_records').select('id,staff_member_id,start_date,end_date,actual_start_date,actual_return_date,current_status,absence_reason,absence_type,coverage_arranged,covering_staff_id').in('staff_member_id',staffIds).neq('current_status','cancelled').lte('start_date',end).gte('end_date',start)
       : Promise.resolve({data:[]}),
-    supabase.from('resident_rotations').select('id,resident_id,training_unit_id,supervising_attending_id,start_date,end_date,actual_start_date,actual_end_date,rotation_status,rotation_category').in('rotation_status',['scheduled','active','extended']).lte('start_date',end).gte('end_date',start),
+    supabase.from('resident_rotations').select('id,resident_id,training_unit_id,supervising_attending_id,start_date,end_date,actual_start_date,actual_end_date,rotation_status,rotation_category').is('deleted_at', null).in('rotation_status',['scheduled','active','extended']).lte('start_date',end).gte('end_date',start),
     supabase.from('oncall_schedule').select('id,primary_physician_id,backup_physician_id,resident_physician_id,duty_date,shift_type,coverage_area_id').gte('duty_date',start).lte('duty_date',end).is('deleted_at',null)
   ]);
   for (const r of [staffR,absencesR,rotationsR,oncallR]) if (r?.error) throw r.error;
