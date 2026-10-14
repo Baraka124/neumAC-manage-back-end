@@ -1701,22 +1701,25 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
     if (!sid) return res.json({ stats: {} });
 
     // Parallel queries for stats
+    // FIX: Use correct column names — principal_investigator_id / lead_investigator_id / co_investigators (uuid[])
+    // FIX: clinical_trials and innovation_projects have no deleted_at or role columns
+    // FIX: absence table is staff_absence_records, not absence_records
     const [studiesRes, projectsRes, pubsRes, certsRes, absencesRes, piStudiesRes, piProjectsRes, staffRes] = await Promise.all([
-      supabase.from('clinical_trials').select('id, status, role', { count: 'exact' })
-        .or(`pi_id.eq.${sid},co_pi_id.eq.${sid}`).is('deleted_at', null),
-      supabase.from('innovation_projects').select('id, current_stage, role', { count: 'exact' })
-        .or(`pi_id.eq.${sid},co_pi_id.eq.${sid}`).is('deleted_at', null),
+      supabase.from('clinical_trials').select('id', { count: 'exact' })
+        .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}},sub_investigators.cs.{${sid}}`),
+      supabase.from('innovation_projects').select('id', { count: 'exact' })
+        .or(`lead_investigator_id.eq.${sid},co_investigators.cs.{${sid}}`),
       supabase.from('publication_authors').select('id', { count: 'exact' })
         .eq('staff_id', sid),
       supabase.from('staff_certificates').select('id, expiry_date')
         .eq('staff_id', sid),
-      supabase.from('absence_records').select('id, total_days')
+      supabase.from('staff_absence_records').select('id, total_days')
         .eq('staff_member_id', sid).is('deleted_at', null)
         .gte('start_date', new Date().getFullYear() + '-01-01'),
       supabase.from('clinical_trials').select('id', { count: 'exact' })
-        .eq('pi_id', sid).is('deleted_at', null),
+        .eq('principal_investigator_id', sid),
       supabase.from('innovation_projects').select('id', { count: 'exact' })
-        .eq('pi_id', sid).is('deleted_at', null),
+        .eq('lead_investigator_id', sid),
       supabase.from('medical_staff').select('h_index, indexed_publications_count')
         .eq('id', sid).maybeSingle()
     ]);
@@ -1774,10 +1777,10 @@ app.get('/api/me/notifications', authenticateToken, apiLimiter, async (req, res)
         .gte('duty_date', today).lte('duty_date', in7)
         .is('deleted_at', null)
         .order('duty_date', { ascending: true }),
+      // FIX: correct column names — title not protocol_title, principal_investigator_id not pi_id, no deleted_at
       supabase.from('clinical_trials')
-        .select('id, protocol_title, status, target_enrollment, current_enrollment')
-        .or(`pi_id.eq.${sid},co_pi_id.eq.${sid}`)
-        .is('deleted_at', null)
+        .select('id, title, status')
+        .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}}`)
         .in('status', ['active', 'enrolling', 'recruiting'])
     ]);
 
@@ -1809,18 +1812,15 @@ app.get('/api/me/notifications', authenticateToken, apiLimiter, async (req, res)
         detail: o.duty_date === today ? 'Hoy' : o.duty_date, date: o.duty_date, refId: o.id });
     });
 
-    // Study milestones (enrollment targets)
+    // Study notifications — active studies the user is involved in
+    // NOTE: enrollment tracking columns (target_enrollment, current_enrollment) do not exist yet;
+    // when added, milestone notifications can be restored here.
     (studiesRes.data || []).forEach(s => {
-      const target = s.target_enrollment || 0;
-      const current = s.current_enrollment || 0;
-      if (target > 0 && current >= target) {
-        notifs.push({ id: 'study-full-' + s.id, type: 'study_milestone', severity: 'success',
-          title: 'Objetivo de reclutamiento alcanzado', message: s.protocol_title || 'Estudio',
-          detail: current + '/' + target + ' participantes', date: today, refId: s.id });
-      } else if (target > 0 && current >= target * 0.9) {
-        notifs.push({ id: 'study-near-' + s.id, type: 'study_milestone', severity: 'info',
-          title: 'Reclutamiento al 90%', message: s.protocol_title || 'Estudio',
-          detail: current + '/' + target + ' participantes', date: today, refId: s.id });
+      // Placeholder: surface active studies as low-priority info items
+      if (s.status === 'recruiting' || s.status === 'enrolling') {
+        notifs.push({ id: 'study-active-' + s.id, type: 'study_active', severity: 'info',
+          title: 'Estudio en reclutamiento', message: s.title || 'Estudio',
+          detail: 'Estado: ' + s.status, date: today, refId: s.id });
       }
     });
 
@@ -1855,11 +1855,12 @@ app.get('/api/me/calendar', authenticateToken, apiLimiter, async (req, res) => {
         .eq('staff_member_id', sid)
         .neq('current_status', 'cancelled')
         .lte('start_date', end).gte('end_date', start),
+      // FIX: column is issued_date not issue_date
       supabase.from('staff_certificates')
-        .select('id, certificate_name, issue_date, expiry_date')
+        .select('id, certificate_name, issued_date, expiry_date')
         .eq('staff_id', sid)
-        .not('issue_date', 'is', null)
-        .gte('issue_date', start).lte('issue_date', end)
+        .not('issued_date', 'is', null)
+        .gte('issued_date', start).lte('issued_date', end)
     ]);
 
     const events = [];
@@ -1885,7 +1886,7 @@ app.get('/api/me/calendar', authenticateToken, apiLimiter, async (req, res) => {
     });
 
     (trainingRes.data || []).forEach(t => {
-      events.push({ id: 'training-' + t.id, type: 'training', date: t.issue_date,
+      events.push({ id: 'training-' + t.id, type: 'training', date: t.issued_date,
         title: t.certificate_name || 'Formación', color: '#6366f1' });
     });
 
