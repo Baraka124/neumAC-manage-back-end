@@ -3349,7 +3349,24 @@ app.delete('/api/medical-staff/:id', authenticateToken, checkPermission('medical
       .update({ employment_status: 'inactive', deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
       .eq('id', req.params.id).select('full_name, staff_id').single();
     if (error) throw error;
-    res.json({ message: 'Medical staff deleted successfully', staff_name: data.full_name });
+    // A removed resident must not keep occupying units: cancel rotations that
+    // have not started and close a running one today with its real end date.
+    const nowIso = new Date().toISOString();
+    const todayStr = nowIso.split('T')[0];
+    const { data: cancelledRot } = await supabase.from('resident_rotations')
+      .update({ rotation_status: 'cancelled', deleted_at: nowIso, updated_at: nowIso })
+      .eq('resident_id', req.params.id).is('deleted_at', null)
+      .in('rotation_status', ['scheduled', 'active', 'extended']).gt('start_date', todayStr)
+      .select('id');
+    const { data: closedRot } = await supabase.from('resident_rotations')
+      .update({ rotation_status: 'terminated_early', actual_end_date: todayStr, termination_recorded_at: nowIso,
+                termination_reason: 'Staff record removed', updated_at: nowIso })
+      .eq('resident_id', req.params.id).is('deleted_at', null)
+      .in('rotation_status', ['scheduled', 'active', 'extended'])
+      .lte('start_date', todayStr).gte('end_date', todayStr)
+      .select('id');
+    res.json({ message: 'Medical staff deleted successfully', staff_name: data.full_name,
+      rotations_cancelled: cancelledRot?.length || 0, rotations_closed: closedRot?.length || 0 });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete medical staff', message: error.message });
   }
