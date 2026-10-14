@@ -2169,19 +2169,24 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
       supabase.from('staff_absence_records')
         .select('id, absence_type, absence_reason, start_date, end_date, current_status, total_days')
         .is('deleted_at', null).eq('staff_member_id', sid).in('current_status', ['pending','active','approved'])
+        .gte('end_date', today)
         .order('start_date', { ascending: true }),
       supabase.from('research_lines')
-        .select('id, line_number, name, short_name').eq('coordinator_id', sid).order('line_number', { ascending: true }),
+        .select('id, line_number, name').eq('coordinator_id', sid).order('line_number', { ascending: true }),
       supabase.from('research_line_members')
-        .select('role_on_line, research_line:research_lines(id, line_number, name, short_name)').eq('staff_id', sid),
+        .select('role_on_line, research_line:research_lines(id, line_number, name)').eq('staff_id', sid),
       supabase.from('clinical_trials')
         .select('id, title, protocol_id, status, principal_investigator_id, co_investigators, sub_investigators')
+        .is('deleted_at', null)
+        .not('status', 'in', '("Completado","Terminado","Retirado","completed","terminated","withdrawn")')
         .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}},sub_investigators.cs.{${sid}}`)
-        .order('updated_at', { ascending: false }),
+        .order('updated_at', { ascending: false }).limit(20),
       supabase.from('innovation_projects')
         .select('id, title, development_stage, current_stage, category, lead_investigator_id, co_investigators')
+        .is('deleted_at', null)
+        .neq('current_stage', 'completed')
         .or(`lead_investigator_id.eq.${sid},co_investigators.cs.{${sid}}`)
-        .order('updated_at', { ascending: false }),
+        .order('updated_at', { ascending: false }).limit(20),
       supabase.from('publication_authors')
         .select('author_order, is_corresponding, news_post:news_posts(id, title, authors_text)')
         .eq('staff_id', sid)
@@ -2204,9 +2209,9 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
     const absences = (absencesRes.data || []).map(a => ({ id: a.id, type: a.absence_type, reason: a.absence_reason, start: a.start_date, end: a.end_date, status: a.current_status, days: a.total_days }));
 
     const lines = (coordLinesRes.data || []).map(l => ({
-      id: l.id, line_number: l.line_number, name: l.short_name || l.name, role: 'coordinator'
+      id: l.id, line_number: l.line_number, name: l.name, role: 'coordinator'
     })).concat((memberLinesRes.data || []).filter(m => m.research_line).map(m => ({
-      id: m.research_line.id, line_number: m.research_line.line_number, name: m.research_line.short_name || m.research_line.name, role: m.role_on_line || 'member'
+      id: m.research_line.id, line_number: m.research_line.line_number, name: m.research_line.name, role: m.role_on_line || 'member'
     })));
 
     const studies = (trialsRes.data || []).map(t => ({
