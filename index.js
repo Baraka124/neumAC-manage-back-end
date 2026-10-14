@@ -1713,9 +1713,9 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
         .eq('staff_id', sid),
       supabase.from('staff_certificates').select('id, expiry_date')
         .eq('staff_id', sid),
-      supabase.from('staff_absence_records').select('id, total_days')
+      supabase.from('staff_absence_records').select('id, start_date, end_date')
         .eq('staff_member_id', sid).is('deleted_at', null)
-        .gte('start_date', new Date().getFullYear() + '-01-01'),
+        .in('current_status', ['planned_leave', 'currently_absent']).gte('end_date', new Date().toISOString().slice(0, 10)),
       supabase.from('clinical_trials').select('id', { count: 'exact' })
         .eq('principal_investigator_id', sid),
       supabase.from('innovation_projects').select('id', { count: 'exact' })
@@ -1733,7 +1733,11 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
       const diffDays = Math.ceil((exp - now) / (1000*60*60*24));
       return diffDays >= 0 && diffDays <= 90;
     }).length;
-    const absenceDaysUsed = (absencesRes.data || []).reduce((sum, a) => sum + (a.total_days || 0), 0);
+    const todayIso = now.toISOString().slice(0, 10);
+    const upcomingAbsenceDays = (absencesRes.data || []).reduce((sum, a) => {
+      const from = a.start_date > todayIso ? a.start_date : todayIso;
+      return sum + Math.round((Date.parse(a.end_date + 'T00:00:00Z') - Date.parse(from + 'T00:00:00Z')) / 86400000) + 1;
+    }, 0);
 
     const staffData = staffRes.data || {};
     res.json({
@@ -1743,7 +1747,7 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
       totalCertificates: certs.length,
       expiredCertificates: expiredCerts,
       expiringCertificates: expiringCerts,
-      absenceDaysThisYear: absenceDaysUsed,
+      upcomingAbsenceDays,
       piStudies: piStudiesRes.count || 0,
       piProjects: piProjectsRes.count || 0,
       hIndex: staffData.h_index || null,
@@ -1767,7 +1771,7 @@ app.get('/api/me/notifications', authenticateToken, apiLimiter, async (req, res)
     const in30 = new Date(now.getTime() + 30 * 86400000).toISOString().slice(0, 10);
     const in90 = new Date(now.getTime() + 90 * 86400000).toISOString().slice(0, 10);
 
-    const [certsRes, oncallRes, studiesRes] = await Promise.all([
+    const [certsRes, oncallRes, studiesRes, absencesRes, prefsRes] = await Promise.all([
       supabase.from('staff_certificates').select('id, certificate_name, expiry_date')
         .eq('staff_id', sid).not('expiry_date', 'is', null)
         .lte('expiry_date', in90),
@@ -1780,8 +1784,15 @@ app.get('/api/me/notifications', authenticateToken, apiLimiter, async (req, res)
       // FIX: correct column names — title not protocol_title, principal_investigator_id not pi_id, no deleted_at
       supabase.from('clinical_trials')
         .select('id, title, status')
-        .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}}`)
-        .in('status', ['active', 'enrolling', 'recruiting'])
+        .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}},sub_investigators.cs.{${sid}}`)
+        .in('status', ['Reclutando', 'recruiting', 'enrolling']),
+      supabase.from('staff_absence_records')
+        .select('id, start_date, end_date, absence_reason')
+        .eq('staff_member_id', sid).is('deleted_at', null)
+        .in('current_status', ['planned_leave', 'currently_absent'])
+        .lte('start_date', in7).gte('end_date', today)
+        .order('start_date', { ascending: true }),
+      supabase.from('app_users').select('absence_notifications').eq('id', req.user.id).maybeSingle()
     ]);
 
     const notifs = [];
@@ -1812,12 +1823,26 @@ app.get('/api/me/notifications', authenticateToken, apiLimiter, async (req, res)
         detail: o.duty_date === today ? 'Hoy' : o.duty_date, date: o.duty_date, refId: o.id });
     });
 
+    // Absence reminders: starting within 7 days, or in progress (respects user preference)
+    const ABS_REASON = { vacation: 'Vacaciones', conference: 'Congreso', sick_leave: 'Baja médica', training: 'Formación', personal: 'Personal', other: 'Ausencia' };
+    if (prefsRes.data?.absence_notifications !== false) {
+      (absencesRes.data || []).forEach(a => {
+        const inProgress = a.start_date <= today;
+        const daysTo = Math.round((Date.parse(a.start_date + 'T00:00:00Z') - Date.parse(today + 'T00:00:00Z')) / 86400000);
+        notifs.push({ id: 'absence-' + a.id, type: inProgress ? 'absence_current' : 'absence_upcoming', severity: 'info',
+          title: inProgress ? 'Ausente ahora' : 'Ausencia próxima',
+          message: (ABS_REASON[a.absence_reason] || 'Ausencia') + ' — ' + a.start_date + (a.end_date !== a.start_date ? ' → ' + a.end_date : ''),
+          detail: inProgress ? 'Hasta el ' + a.end_date : (daysTo === 1 ? 'Empieza mañana' : 'Empieza en ' + daysTo + ' días'),
+          date: a.start_date, refId: a.id });
+      });
+    }
+
     // Study notifications — active studies the user is involved in
     // NOTE: enrollment tracking columns (target_enrollment, current_enrollment) do not exist yet;
     // when added, milestone notifications can be restored here.
     (studiesRes.data || []).forEach(s => {
       // Placeholder: surface active studies as low-priority info items
-      if (s.status === 'recruiting' || s.status === 'enrolling') {
+      if (['Reclutando', 'recruiting', 'enrolling'].includes(s.status)) {
         notifs.push({ id: 'study-active-' + s.id, type: 'study_active', severity: 'info',
           title: 'Estudio en reclutamiento', message: s.title || 'Estudio',
           detail: 'Estado: ' + s.status, date: today, refId: s.id });
@@ -1851,8 +1876,8 @@ app.get('/api/me/calendar', authenticateToken, apiLimiter, async (req, res) => {
         .is('deleted_at', null)
         .order('duty_date', { ascending: true }),
       supabase.from('staff_absence_records')
-        .select('id, start_date, end_date, absence_type, absence_reason, current_status')
-        .eq('staff_member_id', sid)
+        .select('id, start_date, end_date, absence_type, absence_reason, current_status, actual_return_date')
+        .eq('staff_member_id', sid).is('deleted_at', null)
         .neq('current_status', 'cancelled')
         .lte('start_date', end).gte('end_date', start),
       // FIX: column is issued_date not issue_date
@@ -1873,13 +1898,19 @@ app.get('/api/me/calendar', authenticateToken, apiLimiter, async (req, res) => {
     (absenceRes.data || []).forEach(a => {
       // Expand date range into individual day events within the month
       const aStart = a.start_date > start ? a.start_date : start;
-      const aEnd = a.end_date < end ? a.end_date : end;
+      // Early return: the person was back on actual_return_date, so the absence ends the day before.
+      let effEnd = a.end_date;
+      if (a.actual_return_date && a.actual_return_date <= a.end_date) {
+        const r = new Date(a.actual_return_date + 'T00:00:00Z'); r.setUTCDate(r.getUTCDate() - 1);
+        effEnd = r.toISOString().slice(0, 10);
+      }
+      const aEnd = effEnd < end ? effEnd : end;
       let d = new Date(aStart);
       const dEnd = new Date(aEnd);
       while (d <= dEnd) {
         const ds = d.toISOString().slice(0, 10);
         events.push({ id: 'absence-' + a.id + '-' + ds, type: 'absence', date: ds,
-          title: a.absence_type || a.absence_reason || 'Ausencia', color: '#e8913a',
+          title: a.absence_reason || a.absence_type || 'Ausencia', color: '#e8913a',
           status: a.current_status });
         d.setDate(d.getDate() + 1);
       }
@@ -2168,8 +2199,8 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
         .order('start_date', { ascending: true }),
       supabase.from('staff_absence_records')
         .select('id, absence_type, absence_reason, start_date, end_date, current_status, total_days')
-        .is('deleted_at', null).eq('staff_member_id', sid).in('current_status', ['pending','active','approved'])
-        .gte('end_date', today)
+        .is('deleted_at', null).eq('staff_member_id', sid)
+        .in('current_status', ['planned_leave', 'currently_absent']).gte('end_date', today)
         .order('start_date', { ascending: true }),
       supabase.from('research_lines')
         .select('id, line_number, name').eq('coordinator_id', sid).order('line_number', { ascending: true }),
@@ -2177,13 +2208,11 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
         .select('role_on_line, research_line:research_lines(id, line_number, name)').eq('staff_id', sid),
       supabase.from('clinical_trials')
         .select('id, title, protocol_id, status, principal_investigator_id, co_investigators, sub_investigators')
-        .is('deleted_at', null)
         .not('status', 'in', '("Completado","Terminado","Retirado","completed","terminated","withdrawn")')
         .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}},sub_investigators.cs.{${sid}}`)
         .order('updated_at', { ascending: false }).limit(20),
       supabase.from('innovation_projects')
         .select('id, title, development_stage, current_stage, category, lead_investigator_id, co_investigators')
-        .is('deleted_at', null)
         .neq('current_stage', 'completed')
         .or(`lead_investigator_id.eq.${sid},co_investigators.cs.{${sid}}`)
         .order('updated_at', { ascending: false }).limit(20),
@@ -2206,7 +2235,16 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
       id: r.id, resident: r.resident?.full_name || null, start: r.start_date, end: r.end_date, status: r.rotation_status, role: 'supervisor'
     })));
 
-    const absences = (absencesRes.data || []).map(a => ({ id: a.id, type: a.absence_type, reason: a.absence_reason, start: a.start_date, end: a.end_date, status: a.current_status, days: a.total_days }));
+    // Ausencias = days the person will be away from now on (current + programmed),
+    // not a historical count. days_ahead counts only the remaining days.
+    const dayDiff = (a, b) => Math.round((Date.parse(b + 'T00:00:00Z') - Date.parse(a + 'T00:00:00Z')) / 86400000);
+    const absences = (absencesRes.data || []).map(a => {
+      const from = a.start_date > today ? a.start_date : today;
+      const current = a.start_date <= today && a.end_date >= today;
+      return { id: a.id, type: a.absence_type, reason: a.absence_reason, start: a.start_date, end: a.end_date,
+        status: current ? 'currently_absent' : 'planned_leave', days: a.total_days,
+        days_ahead: dayDiff(from, a.end_date) + 1, current };
+    });
 
     const lines = (coordLinesRes.data || []).map(l => ({
       id: l.id, line_number: l.line_number, name: l.name, role: 'coordinator'
