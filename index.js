@@ -1590,7 +1590,7 @@ app.get('/api/me/profile', authenticateToken, apiLimiter, async (req, res) => {
         has_medical_license, medical_license,
         can_be_pi, can_be_coi, can_supervise_residents,
         years_experience, primary_clinic,
-        indexed_publications_count, h_index,
+        indexed_publications_count, h_index, metrics_updated_at,
         department:departments!medical_staff_department_id_fkey(id, name)
       `)
       .eq('id', sid).single();
@@ -3283,7 +3283,19 @@ app.put('/api/medical-staff/:id', authenticateToken, checkPermission('medical_st
     if (validated.value.scholar_url) validated.value.scholar_url = String(validated.value.scholar_url).trim();
     if (validated.value.researchgate_url) validated.value.researchgate_url = String(validated.value.researchgate_url).trim();
     if (validated.value.pubmed_query) validated.value.pubmed_query = String(validated.value.pubmed_query).trim();
-    const {data,error}=await supabase.from('medical_staff').update({...validated.value,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('id,professional_email,mobile_phone,public_bio,orcid_id,scholar_url,researchgate_url,pubmed_query,is_public,indexed_publications_count,h_index').single();
+    // Freshness: stamp metrics_updated_at only when a self-reported research metric
+    // actually changes, so the public "actualizado" date reflects the metric itself,
+    // not an unrelated bio or phone edit saved in the same form submission.
+    const touchesMetrics = validated.value.indexed_publications_count !== undefined || validated.value.h_index !== undefined;
+    if (touchesMetrics) {
+      const { data: cur } = await supabase.from('medical_staff')
+        .select('indexed_publications_count, h_index').eq('id', req.params.id).maybeSingle();
+      const changed =
+        (validated.value.indexed_publications_count !== undefined && (cur?.indexed_publications_count ?? null) !== (validated.value.indexed_publications_count ?? null)) ||
+        (validated.value.h_index !== undefined && (cur?.h_index ?? null) !== (validated.value.h_index ?? null));
+      if (changed) validated.value.metrics_updated_at = new Date().toISOString();
+    }
+    const {data,error}=await supabase.from('medical_staff').update({...validated.value,updated_at:new Date().toISOString()}).eq('id',req.params.id).select('id,professional_email,mobile_phone,public_bio,orcid_id,scholar_url,researchgate_url,pubmed_query,is_public,indexed_publications_count,h_index,metrics_updated_at').single();
     if(error) throw error;
     return res.json(data);
   } catch(e){ return res.status(500).json({error:'Profile update failed'}); }
@@ -5881,6 +5893,34 @@ app.get('/api/public/status', publicApiLimiterGuarded, async (req, res) => {
   } catch { res.json({ maintenance_mode: false }); }
 });
 
+// Self-reported research footprint for public profiles. Mirrors the governance-aware
+// contract the public site expects (visibility='approved_public', person_approval,
+// and a source + verified_at provenance line). The person maintains these numbers in
+// Mi espacio; we surface them only when the profile is public and at least one metric
+// is set, labelled "Autoinformado" and dated so a public reader can weigh them. This
+// self-reported count is deliberately distinct from the derived publication_count
+// computed from linked publication_authors records.
+const ES_MONTHS = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+function publicResearchFootprint(m) {
+  if (!m || m.is_public !== true) return null;
+  const pubs = Number.isFinite(m.indexed_publications_count) && m.indexed_publications_count > 0 ? m.indexed_publications_count : null;
+  const h = Number.isFinite(m.h_index) && m.h_index > 0 ? m.h_index : null;
+  if (pubs == null && h == null) return null;
+  let verified = null;
+  if (m.metrics_updated_at) {
+    const d = new Date(m.metrics_updated_at);
+    if (!isNaN(d)) verified = `${ES_MONTHS[d.getUTCMonth()]} de ${d.getUTCFullYear()}`;
+  }
+  return {
+    publications: pubs,
+    h_index: h,
+    visibility: 'approved_public',
+    person_approval: 'approved',
+    source: 'Autoinformado',
+    verified_at: verified
+  };
+}
+
 app.get('/api/team/website', publicApiLimiterGuarded, async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -5890,6 +5930,7 @@ app.get('/api/team/website', publicApiLimiterGuarded, async (req, res) => {
         public_bio, public_photo_url, is_public, affiliation_type, primary_dept_name, can_be_pi,
         is_chief_of_department,
         orcid_id, scholar_url, researchgate_url, pubmed_query,
+        indexed_publications_count, h_index, metrics_updated_at,
         department:departments!medical_staff_department_id_fkey(name, is_primary, is_external),
         research_lines:research_lines!research_lines_coordinator_id_fkey(
           id, line_number, name, short_name,
@@ -5989,6 +6030,13 @@ app.get('/api/team/website', publicApiLimiterGuarded, async (req, res) => {
         recent_pubs:       recentPubsForPerson,
         publication_count: personPubs.length,
         collab_status:    collabStatus,
+        // Research profile links (self-maintained in Mi espacio) — the public
+        // profile's scholar-links row reads these. Null when unset.
+        orcid_id:         m.orcid_id || null,
+        scholar_url:      m.scholar_url || null,
+        researchgate_url: m.researchgate_url || null,
+        // Self-reported, governance-shaped research metrics (see helper above).
+        research_footprint: publicResearchFootprint(m),
       };
     });
 
