@@ -1,0 +1,24 @@
+name: Backend contract
+on:
+  pull_request:
+    paths:
+      - index.js
+      - tests/backend-contract.test.cjs
+      - .github/workflows/backend-contract.yml
+  push:
+    branches: [main]
+    paths:
+      - index.js
+      - tests/backend-contract.test.cjs
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: JavaScript syntax
+        run: node --check index.js
+      - name: Backend contract tests (auth coverage, validation, resolver, invite)
+        run: node --test tests/backend-contract.test.cjs
