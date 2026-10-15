@@ -743,6 +743,7 @@ const schemas = {
     start_date:        Joi.string().allow('', null).optional(),
     expected_end_date: Joi.string().allow('', null).optional(),
     actual_end_date:   Joi.string().allow('', null).optional(), // real completion date, set when a project is marked completed
+    technical_lead_id: Joi.string().uuid().allow('', null).optional(),
     patent_status:     Joi.string().max(60).allow('', null).optional(),
   }),
 
@@ -2216,9 +2217,9 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
         .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}},sub_investigators.cs.{${sid}}`)
         .order('updated_at', { ascending: false }).limit(20),
       supabase.from('innovation_projects')
-        .select('id, title, development_stage, current_stage, category, lead_investigator_id, co_investigators')
+        .select('id, title, development_stage, current_stage, category, lead_investigator_id, technical_lead_id, co_investigators')
         .neq('current_stage', 'completed')
-        .or(`lead_investigator_id.eq.${sid},co_investigators.cs.{${sid}}`)
+        .or(`lead_investigator_id.eq.${sid},technical_lead_id.eq.${sid},co_investigators.cs.{${sid}}`)
         .order('updated_at', { ascending: false }).limit(20),
       supabase.from('publication_authors')
         .select('author_order, is_corresponding, news_post:news_posts(id, title, authors_text)')
@@ -2279,7 +2280,7 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
 
     const projects = (projectsRes.data || []).map(p => ({
       id: p.id, title: p.title, stage: p.development_stage || p.current_stage || null, category: p.category,
-      role: p.lead_investigator_id === sid ? 'lead' : 'co-investigator'
+      role: p.lead_investigator_id === sid ? 'lead' : (p.technical_lead_id === sid ? 'technical-lead' : 'co-investigator')
     }));
 
     const publicationItems = (pubsRes.data || []).filter(p => p.news_post).map(p => ({
@@ -6493,6 +6494,7 @@ app.post('/api/innovation-projects', authenticateToken, Portfolio.write('innovat
     body.demo_url       = body.demo_url       || null;
     body.project_nature = body.project_nature || 'clinical_innovation';
     body.is_featured    = body.is_featured    || false;
+    body.technical_lead_id = body.technical_lead_id || null;
 
     // Array fields
     body.target_diseases  = Array.isArray(body.target_diseases)  ? body.target_diseases  : [];
@@ -6509,7 +6511,7 @@ app.post('/api/innovation-projects', authenticateToken, Portfolio.write('innovat
     const { additional_line_ids, ...projectBody } = body;
     const { data, error } = await supabase.from('innovation_projects')
       .insert([{ ...projectBody, created_at: new Date().toISOString(), updated_at: new Date().toISOString() }])
-      .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)').single();
+      .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name), technical_lead:medical_staff!innovation_projects_technical_lead_id_fkey(id, full_name)').single();
     if (error) throw error;
 
     if (Array.isArray(additional_line_ids) && additional_line_ids.length) {
@@ -6548,6 +6550,7 @@ app.put('/api/innovation-projects/:id', authenticateToken, Portfolio.write('inno
       ...(b.clinical_rationale  !== undefined && { clinical_rationale: b.clinical_rationale }),
       ...(b.research_line_id    !== undefined && { research_line_id: b.research_line_id || null }),
       ...(b.lead_investigator_id!== undefined && { lead_investigator_id: b.lead_investigator_id || null }),
+      ...(b.technical_lead_id   !== undefined && { technical_lead_id: b.technical_lead_id || null }),
       ...(b.co_investigators    !== undefined && { co_investigators: Array.isArray(b.co_investigators) ? b.co_investigators : [] }),
       ...(b.partner_needs       !== undefined && { partner_needs: Array.isArray(b.partner_needs) ? b.partner_needs : [] }),
       ...(b.partner_found       !== undefined && { partner_found: Boolean(b.partner_found) }),
@@ -6584,7 +6587,7 @@ app.put('/api/innovation-projects/:id', authenticateToken, Portfolio.write('inno
     };
     if (updatePayload.scope_type === 'specific') updatePayload.scope_note = null;
     const { data, error } = await supabase.from('innovation_projects').update(updatePayload).eq('id', req.params.id)
-      .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name)').single();
+      .select('*, research_lines(name, line_number), lead:medical_staff!innovation_projects_lead_investigator_id_fkey(id, full_name), technical_lead:medical_staff!innovation_projects_technical_lead_id_fkey(id, full_name)').single();
     if (error) {
       if (error.code === 'PGRST116') return res.status(404).json({ error: 'Innovation project not found' });
       throw error;
