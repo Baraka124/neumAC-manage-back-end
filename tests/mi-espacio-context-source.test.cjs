@@ -68,5 +68,8 @@ test('Phase 43A does not silently broaden historical/withdrawn research or infer
   assert.ok(route.includes(".not('status', 'in',"), 'closed clinical trial filtering remains governed');
   assert.ok(route.includes(".neq('current_stage', 'completed')"), 'completed project coverage requires separate governance');
   assert.ok(route.includes("inArr(t.co_investigators, sid) ? 'co-investigator' : 'sub-investigator'"));
-  assert.ok(route.includes("p.lead_investigator_id === sid ? 'lead' : 'co-investigator'"));
+  // Project role is derived strictly from explicit ownership columns, never inferred.
+  // The technical-lead feature adds a second explicit column (technical_lead_id) with
+  // a fixed precedence lead > technical-lead > co-investigator — still no inference.
+  assert.ok(route.includes("p.lead_investigator_id === sid ? 'lead' : (p.technical_lead_id === sid ? 'technical-lead' : 'co-investigator')"));
 });
