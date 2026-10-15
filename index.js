@@ -1,6 +1,7 @@
 const ProductionCredentials = require('./production-credentials');
 const TestSessions = require('./test-sessions');
 const IdentityWorkspace = require('./identity');
+const MiEspacioSourceIntegrity = require('./mi-espacio-source-integrity');
 // neumDesk V46.14 · Phase 5.3E · Grounded permission-aware retrieval · Production backend · 2026-09-24
 // Stable production filename: index.js. Release identifiers live in comments, not filenames.
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
@@ -2151,10 +2152,12 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
 
     let staff = null;
     if (sid) {
-      const { data } = await supabase.from('medical_staff')
+      const staffResult = await supabase.from('medical_staff')
         .select('id, full_name, professional_email, staff_type, specialization, department_id, is_chief_of_department, is_research_coordinator, is_resident_manager, is_oncall_manager, title, gender')
         .eq('id', sid).maybeSingle();
-      staff = data || null;
+      const unavailableStaff = MiEspacioSourceIntegrity.unavailableSources([{ name: 'medical_staff', result: staffResult, shape: 'single' }]);
+      if (unavailableStaff.length) return MiEspacioSourceIntegrity.sendUnavailable(res, unavailableStaff);
+      staff = staffResult.data || null;
     }
 
     const identity = {
@@ -2222,6 +2225,22 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
         .order('author_order', { ascending: true, nullsFirst: false })
     ]);
 
+    // Fail closed: the nine reads are required to show a trustworthy personal
+    // context. A database error (or missing list payload) is NOT an empty list.
+    // Never send a partial response containing misleading zero responsibilities.
+    const unavailable = MiEspacioSourceIntegrity.unavailableSources([
+      { name: 'oncall_schedule', result: guardiasRes, shape: 'list' },
+      { name: 'resident_rotations', result: rotationsRes, shape: 'list' },
+      { name: 'supervised_rotations', result: supervisedRes, shape: 'list' },
+      { name: 'staff_absence_records', result: absencesRes, shape: 'list' },
+      { name: 'coordinated_research_lines', result: coordLinesRes, shape: 'list' },
+      { name: 'research_line_members', result: memberLinesRes, shape: 'list' },
+      { name: 'clinical_trials', result: trialsRes, shape: 'list' },
+      { name: 'innovation_projects', result: projectsRes, shape: 'list' },
+      { name: 'publication_authors', result: pubsRes, shape: 'list' }
+    ]);
+    if (unavailable.length) return MiEspacioSourceIntegrity.sendUnavailable(res, unavailable);
+
     const inArr = (arr, v) => Array.isArray(arr) && arr.includes(v);
 
     const guardias = (guardiasRes.data || []).map(g => ({
@@ -2276,7 +2295,7 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
     });
   } catch (e) {
     console.error('GET /api/me/context failed:', e.message);
-    res.status(500).json({ error: 'Failed to build personal context', message: e.message });
+    res.status(500).json({ error: 'MI_ESPACIO_CONTEXT_ERROR', message: 'No se ha podido consultar tu actividad en este momento. Vuelve a intentarlo.' });
   }
 });
 

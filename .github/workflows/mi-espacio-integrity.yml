@@ -1,0 +1,28 @@
+name: Mi Espacio source integrity
+on:
+  pull_request:
+    paths:
+      - index.js
+      - mi-espacio-source-integrity.js
+      - tests/mi-espacio-context-source.test.cjs
+      - .github/workflows/mi-espacio-integrity.yml
+  push:
+    branches: [main]
+    paths:
+      - index.js
+      - mi-espacio-source-integrity.js
+      - tests/mi-espacio-context-source.test.cjs
+jobs:
+  me-context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: JavaScript syntax
+        run: |
+          node --check index.js
+          node --check mi-espacio-source-integrity.js
+      - name: Source-integrity and error-contract tests
+        run: node --test tests/mi-espacio-context-source.test.cjs
