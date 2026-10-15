@@ -4,7 +4,7 @@
 // staff member. Never substitute a department-wide portfolio for a personal
 // record. Completed and interrupted studies are distinct clinical lifecycles.
 const DONE_STUDY_STATES = Object.freeze([
-  'Completado', 'Terminado', 'Finalizado',
+  'Completado', 'Finalizado',
   'completed', 'finished', 'finalized'
 ]);
 const PAGE_MAX = 20;
