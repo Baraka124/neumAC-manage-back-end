@@ -2,6 +2,7 @@ const ProductionCredentials = require('./production-credentials');
 const TestSessions = require('./test-sessions');
 const IdentityWorkspace = require('./identity');
 const MiEspacioSourceIntegrity = require('./mi-espacio-source-integrity');
+const MiEspacioResearchHistory = require('./mi-espacio-research-history');
 // neumDesk V46.14 · Phase 5.3E · Grounded permission-aware retrieval · Production backend · 2026-09-24
 // Stable production filename: index.js. Release identifiers live in comments, not filenames.
 // ============ NEUMOCARE HOSPITAL MANAGEMENT SYSTEM API ============
@@ -2296,6 +2297,22 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
   } catch (e) {
     console.error('GET /api/me/context failed:', e.message);
     res.status(500).json({ error: 'MI_ESPACIO_CONTEXT_ERROR', message: 'No se ha podido consultar tu actividad en este momento. Vuelve a intentarlo.' });
+  }
+});
+
+// Phase 43B: opt-in, own-account historical scientific participation.
+app.get('/api/me/research-history', authenticateToken, apiLimiter, async (req, res) => {
+  const sid = req.user.medical_staff_id;
+  if (!sid) return res.status(403).json({ error: 'MI_ESPACIO_UNLINKED', message: 'No hay un perfil profesional vinculado.' });
+  const opts = MiEspacioResearchHistory.parseRequest(req.query);
+  if (opts.error) return res.status(400).json({ error: 'MI_ESPACIO_INVALID_HISTORY_REQUEST', message: 'La consulta de historial no es válida.' });
+  try {
+    const result = await MiEspacioResearchHistory.getHistoryPage(supabase, String(sid), opts);
+    res.json(result);
+  } catch (err) {
+    // Do not leak raw database errors, SQL filters, staff IDs or query details.
+    console.error('Mi Espacio research history unavailable:', String(err?.code || 'SOURCE_ERROR').slice(0,48));
+    res.status(503).json({ error: 'MI_ESPACIO_SOURCE_UNAVAILABLE', message: 'No se puede consultar el historial de investigación en este momento.' });
   }
 });
 
