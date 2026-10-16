@@ -4462,6 +4462,35 @@ app.put('/api/import-layouts/:type', authenticateToken, importAuthority(req => I
 // POST /api/imports/review { kind:'oncall'|'rotations', rows:[...] } — read-only. Reviews the whole
 // selected import against what neumDesk holds (rest, workload, coverage, external rotations, in-file
 // overlaps, training gaps) and returns per-row findings plus an impact summary. Never writes.
+// Import Phase D: what neumDesk already holds for a file's span, WITH provenance (projections drop
+// sync_source), so the preview can show unchanged / changed / removed-upstream rows.
+app.post('/api/imports/existing', authenticateToken, importAuthority(req => ({ oncall: 'sync.oncall.commit', rotations: 'sync.rotations.commit' })[req.body?.kind]), apiLimiter, async (req, res) => {
+  try {
+    const kind = req.body.kind, isoOk = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
+    const from = req.body.from, to = req.body.to;
+    if (!isoOk(from) || !isoOk(to) || from > to) return res.status(400).json({ error: 'from/to (YYYY-MM-DD) are required.' });
+    if (kind === 'rotations') {
+      const ids = Array.isArray(req.body.resident_ids) ? [...new Set(req.body.resident_ids.map(String))].slice(0, 300) : [];
+      if (!ids.length) return res.json({ data: [] });
+      const { data, error } = await supabase.from('resident_rotations')
+        .select('id, rotation_id, resident_id, training_unit_id, start_date, end_date, actual_end_date, rotation_status, sync_source, sync_key, unit:training_units!resident_rotations_training_unit_id_fkey(unit_name, unit_code)')
+        .is('deleted_at', null).in('resident_id', ids).lte('start_date', to).gte('end_date', from).not('rotation_status', 'in', '(cancelled)');
+      if (error) throw error;
+      return res.json({ data: data || [] });
+    }
+    if (kind === 'oncall') {
+      const { data, error } = await supabase.from('oncall_schedule')
+        .select('id, duty_date, primary_physician_id, resident_physician_id, shift_type, sync_source, sync_key')
+        .is('deleted_at', null).gte('duty_date', from).lte('duty_date', to).order('duty_date');
+      if (error) throw error;
+      return res.json({ data: data || [] });
+    }
+    return res.status(400).json({ error: 'Unknown import kind' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to load existing records', message: error.message });
+  }
+});
+
 app.post('/api/imports/review', authenticateToken, importAuthority(req => ({ oncall: 'sync.oncall.commit', rotations: 'sync.rotations.commit' })[req.body?.kind]), apiLimiter, async (req, res) => {
   try {
     const kind = req.body.kind, rows = Array.isArray(req.body.rows) ? req.body.rows : [];

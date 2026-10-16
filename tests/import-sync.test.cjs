@@ -30,3 +30,10 @@ test('applied imports are logged (import_runs) behind the import authority', () 
   assert.match(route("app.post('/api/import-runs'"), /importAuthority\(/);
   assert.match(route("app.get('/api/import-runs'"), /importAuthority\(/);
 });
+
+test('existing-records lookup returns provenance behind the import authority', () => {
+  const r = route("app.post('/api/imports/existing'");
+  assert.match(r, /importAuthority\(/);
+  assert.match(r, /sync_source, sync_key/);
+  assert.match(r, /\.is\('deleted_at', null\)/);
+});
