@@ -4357,6 +4357,106 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
   }
 });
 
+// ===== IMPORT MEMORY (Phase B) =====
+// Confirmed "label in a file → record in neumDesk" choices, shared across users/devices and applied
+// automatically on the next import. Keys use the same normalisation as the browser parsers.
+const IMPORT_ALIAS_TYPES = {
+  rotation_resident: { authority: 'sync.rotations.commit', target: 'resident' },
+  rotation_unit:     { authority: 'sync.rotations.commit', target: 'unit' },
+  oncall_staff:      { authority: 'sync.oncall.commit',    target: 'staff' }
+};
+const IMPORT_LAYOUT_TYPES = { rotations: 'sync.rotations.commit', oncall: 'sync.oncall.commit' };
+const importKey = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim().replace(/^dra?\.?\s+/, '').replace(/\s+/g, ' ').trim();
+const importAuthority = (resolveKey) => (req, res, next) => {
+  const key = resolveKey(req);
+  if (!key) return res.status(400).json({ error: 'Unknown import type' });
+  return requireAuthority(key, { scopes: ['all'] })(req, res, next);
+};
+const RESIDENT_TYPE_RE = /resident|fellow|mir/i;
+
+app.get('/api/import-aliases', authenticateToken, importAuthority(req => IMPORT_ALIAS_TYPES[req.query.type]?.authority), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('import_aliases')
+      .select('id, import_type, source_label, source_key, action, target_id, use_count, last_used_at, updated_at')
+      .eq('import_type', req.query.type).order('source_label');
+    if (error) throw error;
+    res.json({ data: data || [] });
+  } catch (e) { res.status(500).json({ error: 'Failed to load import mappings', message: e.message }); }
+});
+
+// PUT /api/import-aliases  { type, aliases:[{label, target_id|null, action:'map'|'skip'}] }  — upsert, validated.
+app.put('/api/import-aliases', authenticateToken, importAuthority(req => IMPORT_ALIAS_TYPES[req.body?.type]?.authority), async (req, res) => {
+  try {
+    const type = req.body.type, spec = IMPORT_ALIAS_TYPES[type];
+    const items = Array.isArray(req.body.aliases) ? req.body.aliases.slice(0, 200) : [];
+    if (!items.length) return res.status(400).json({ error: 'Provide 1 to 200 mappings.' });
+    const rows = [], rejected = [];
+    const ids = [...new Set(items.filter(a => a.action !== 'skip' && a.target_id).map(a => String(a.target_id)))];
+    let targets = new Map();
+    if (ids.length) {
+      const q = spec.target === 'unit'
+        ? supabase.from('training_units').select('id, unit_status').in('id', ids)
+        : supabase.from('medical_staff').select('id, staff_type, employment_status, deleted_at').in('id', ids);
+      const { data, error } = await q; if (error) throw error;
+      targets = new Map((data || []).map(t => [String(t.id), t]));
+    }
+    for (const a of items) {
+      const label = String(a.label || '').trim().slice(0, 120), key = importKey(label);
+      if (!key) { rejected.push({ label, reason: 'Empty label' }); continue; }
+      if (a.action === 'skip') { rows.push({ import_type: type, source_label: label, source_key: key, action: 'skip', target_id: null }); continue; }
+      const t = targets.get(String(a.target_id || ''));
+      if (!t) { rejected.push({ label, reason: 'Target not found' }); continue; }
+      if (spec.target !== 'unit') {
+        if (t.deleted_at || (t.employment_status || 'active') !== 'active') { rejected.push({ label, reason: 'Person is not active' }); continue; }
+        if (spec.target === 'resident' && !RESIDENT_TYPE_RE.test(String(t.staff_type || ''))) { rejected.push({ label, reason: 'Person is not registered as a resident' }); continue; }
+      }
+      rows.push({ import_type: type, source_label: label, source_key: key, action: 'map', target_id: t.id });
+    }
+    let saved = [];
+    if (rows.length) {
+      const now = new Date().toISOString();
+      const { data, error } = await supabase.from('import_aliases')
+        .upsert(rows.map(r => ({ ...r, updated_by: req.user.id, created_by: req.user.id, updated_at: now })), { onConflict: 'import_type,source_key' })
+        .select('id, import_type, source_label, source_key, action, target_id');
+      if (error) throw error;
+      saved = data || [];
+    }
+    res.json({ saved, rejected });
+  } catch (e) { res.status(500).json({ error: 'Failed to save import mappings', message: e.message }); }
+});
+
+app.delete('/api/import-aliases/:id', authenticateToken, async (req, res, next) => {
+  const { data } = await supabase.from('import_aliases').select('import_type').eq('id', req.params.id).maybeSingle();
+  if (!data) return res.status(404).json({ error: 'Mapping not found' });
+  return importAuthority(() => IMPORT_ALIAS_TYPES[data.import_type]?.authority)(req, res, next);
+}, async (req, res) => {
+  try {
+    const { error } = await supabase.from('import_aliases').delete().eq('id', req.params.id);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to delete import mapping', message: e.message }); }
+});
+
+// Layout memory: the last confirmed file structure per import type.
+app.get('/api/import-layouts/:type', authenticateToken, importAuthority(req => IMPORT_LAYOUT_TYPES[req.params.type]), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('import_layouts').select('fingerprint, layout, file_name, saved_at').eq('import_type', req.params.type).maybeSingle();
+    if (error) throw error;
+    res.json({ data: data || null });
+  } catch (e) { res.status(500).json({ error: 'Failed to load import layout', message: e.message }); }
+});
+app.put('/api/import-layouts/:type', authenticateToken, importAuthority(req => IMPORT_LAYOUT_TYPES[req.params.type]), async (req, res) => {
+  try {
+    const { fingerprint, layout, file_name } = req.body || {};
+    if (!fingerprint || typeof fingerprint !== 'string' || !layout || typeof layout !== 'object') return res.status(400).json({ error: 'fingerprint and layout are required' });
+    if (JSON.stringify(layout).length > 20000) return res.status(413).json({ error: 'Layout too large' });
+    const { error } = await supabase.from('import_layouts').upsert({ import_type: req.params.type, fingerprint: fingerprint.slice(0, 128), layout,
+      file_name: String(file_name || '').slice(0, 200) || null, saved_by: req.user.id, saved_at: new Date().toISOString() }, { onConflict: 'import_type' });
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to save import layout', message: e.message }); }
+});
+
 // POST /api/rotations/batch — reviewed bulk import of the MIR rotations matrix.
 // Mirrors /api/oncall/batch: dry_run=true CHECKS (per-row ready/needs_attention)
 // and dry_run=false COMMITS. Unit references are either an existing
