@@ -1,0 +1,32 @@
+name: Import cross-checks
+on:
+  pull_request:
+    paths:
+      - index.js
+      - import-review.js
+      - tests/import-review.test.cjs
+      - tests/boot-smoke.cjs
+      - package.json
+      - package-lock.json
+      - .github/workflows/import-review.yml
+  push:
+    branches: [main]
+    paths:
+      - index.js
+      - import-review.js
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # supabase-js 2.117 needs Node 22's native WebSocket (package.json engines)
+      - name: JavaScript syntax
+        run: node --check index.js && node --check import-review.js
+      - name: Import cross-check rules
+        run: node --test tests/import-review.test.cjs
+      - name: Install dependencies
+        run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+      - name: Server boots (all routes register)
+        run: node tests/boot-smoke.cjs
