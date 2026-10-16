@@ -5040,7 +5040,7 @@ app.get('/api/absence-records', authenticateToken, apiLimiter, async (req, res) 
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url, department_id),
         recorded_by_user:app_users!staff_absence_records_recorded_by_fkey(id, full_name, email)
-      `, { count: 'exact' });
+      `, { count: 'exact' }).is('deleted_at', null);
     const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
     if (constrained.empty) {
       setProjectionHeaders(res, plan.authority, 'leave');
@@ -5083,7 +5083,7 @@ app.get('/api/absence-records/current', authenticateToken, apiLimiter, async (re
     let query = supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
-      `).eq('current_status', 'currently_absent').is('actual_return_date', null);
+      `).is('deleted_at', null).eq('current_status', 'currently_absent').is('actual_return_date', null);
     const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
     if (constrained.empty) {
       setProjectionHeaders(res, plan.authority, 'leave');
@@ -5109,7 +5109,7 @@ app.get('/api/absence-records/upcoming', authenticateToken, apiLimiter, async (r
     let query = supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
-      `).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek);
+      `).is('deleted_at', null).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek);
     const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
     if (constrained.empty) {
       setProjectionHeaders(res, plan.authority, 'leave');
@@ -5171,7 +5171,7 @@ app.get('/api/absence-records/staff/:staffId', authenticateToken, apiLimiter, as
     const { data, error, count } = await supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
-      `, { count: 'exact' })
+      `, { count: 'exact' }).is('deleted_at', null)
       .eq('staff_member_id', req.params.staffId).order('start_date', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
     const projected = (data || []).map(item => Projection.projectLeave(item, authority.visibility));
@@ -5189,7 +5189,7 @@ app.get('/api/absence-records/dashboard/stats', authenticateToken, apiLimiter, a
     const today = formatDate(new Date());
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     let query = supabase.from('staff_absence_records')
-      .select('staff_member_id,current_status,coverage_arranged,absence_type,absence_reason,start_date');
+      .select('staff_member_id,current_status,coverage_arranged,absence_type,absence_reason,start_date').is('deleted_at', null);
     const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
     let rows = [];
     if (!constrained.empty) {
@@ -5554,6 +5554,15 @@ app.delete('/api/absence-records/:id', authenticateToken, checkPermission('staff
     if (fetchError) {
       if (fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Absence record not found' });
       throw fetchError;
+    }
+    // Remove (any stage, past included): hide the record everywhere without rewriting its
+    // status — a returned absence stays 'returned_to_duty' in the audit trail. Restorable.
+    if (req.query.mode === 'remove') {
+      const nowIso = new Date().toISOString();
+      const { data, error } = await supabase.from('staff_absence_records')
+        .update({ deleted_at: nowIso, last_updated: nowIso }).eq('id', req.params.id).select('id, current_status, deleted_at').single();
+      if (error) throw error;
+      return res.json({ success: true, removed: true, data, message: 'Absence record removed' });
     }
     const cancelNote = `[CANCELLED: ${new Date().toISOString()}] Cancelled by ${req.user.full_name || req.user.email || 'system'}`;
     const { data, error } = await supabase.from('staff_absence_records').update({

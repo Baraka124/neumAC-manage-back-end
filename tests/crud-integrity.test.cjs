@@ -66,3 +66,9 @@ test('saves no longer fail silently', () => {
   assert.match(abs, /recurringWarning/);
   assert.match(route("app.put('/api/notifications/:id/read'"), /if \(error\) throw error/);
 });
+
+test('absences: remove hides any absence without rewriting its status', () => {
+  const r = route("app.delete('/api/absence-records/:id'");
+  const rem = r.slice(r.indexOf("req.query.mode === 'remove'"), r.indexOf('cancelNote'));
+  assert.ok(rem.includes('deleted_at') && !rem.includes("current_status: 'cancelled'"), 'remove keeps the recorded status');
+});
