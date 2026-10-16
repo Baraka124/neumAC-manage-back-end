@@ -13,9 +13,9 @@ test('imported rotations carry structured provenance (file, sheet, actor) and a 
   assert.match(r, /sync_key:r\.sync_key/);
 });
 
-test('replace only ever targets an earlier IMPORTED rotation of the same resident', () => {
+test('replace targets the same resident; a hand-entered rotation only with an approved replacement', () => {
   const r = route("app.post('/api/rotations/batch'");
-  assert.match(r, /Only rotations created by an earlier import can be replaced from a file/);
+  assert.match(r, /if\(!old\.sync_source && r\.replace_confirmed!==true\) throw Error\('This rotation was entered by hand\. Approve the replacement in the preview first\.'\)/);
   assert.match(r, /A rotation can only be replaced by one of the same resident/);
   assert.match(r, /excludeId:replaced\?\.id\|\|null/);                    // the dry run ignores the row being replaced
 });

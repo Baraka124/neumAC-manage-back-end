@@ -1,9 +1,9 @@
 name: Rotations batch import
 on:
   push:
-    paths: [index.js, tests/rotations-batch.test.cjs, .github/workflows/rotations-batch.yml]
+    paths: [index.js, import-capacity.js, decision51.js, tests/rotations-batch.test.cjs, tests/import-capacity.test.cjs, tests/import-sync.test.cjs, .github/workflows/rotations-batch.yml]
   pull_request:
-    paths: [index.js, tests/rotations-batch.test.cjs, .github/workflows/rotations-batch.yml]
+    paths: [index.js, import-capacity.js, decision51.js, tests/rotations-batch.test.cjs, tests/import-capacity.test.cjs, tests/import-sync.test.cjs, .github/workflows/rotations-batch.yml]
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -11,8 +11,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
       - name: Syntax check
-        run: node --check index.js
+        run: node --check index.js && node --check import-capacity.js
       - name: Contract — reviewed rotations import (dry-run/commit, unit creation, dedup, supervisor)
         run: node --test tests/rotations-batch.test.cjs
+      - name: Capacity advice + same-file counting + approved manual replace
+        run: node --test tests/import-capacity.test.cjs tests/import-sync.test.cjs

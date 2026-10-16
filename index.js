@@ -4193,9 +4193,12 @@ const loadRotationDecisionState = async ({residentId,unitId,supervisorId,start,e
   };
 };
 
-const buildRotationDecision = async (payload, {excludeId=null,action='assign'}={}) => {
+// extra / ignore (imports): rows of the same file already accepted in this check count as if saved,
+// and rotations those rows replace no longer count — so the check mirrors the sequential commit.
+const buildRotationDecision = async (payload, {excludeId=null,action='assign',extra=[],ignore=[]}={}) => {
   const start=formatDate(payload.start_date), end=formatDate(payload.end_date);
   const state=await loadRotationDecisionState({residentId:payload.resident_id,unitId:payload.training_unit_id,supervisorId:payload.supervising_attending_id,start,end,excludeId});
+  if(extra.length||ignore.length){ const skip=new Set(ignore.map(String)); state.rotations=[...(state.rotations||[]).filter(r=>!skip.has(String(r.id))),...extra.filter(r=>r.start_date<=end&&r.end_date>=start)]; }
   return Decision51.reviewRotation({
     proposal:{residentId:payload.resident_id,unitId:payload.training_unit_id,supervisorId:payload.supervising_attending_id,start,end,excludeId,category:payload.rotation_category||'clinical_rotation'},
     ...state, action,
@@ -4550,6 +4553,29 @@ app.get('/api/import-runs', authenticateToken, importAuthority(req => IMPORT_LAY
   } catch (e) { res.status(500).json({ error: 'Failed to load import history', message: e.message }); }
 });
 
+// Capacity advice for an import row the decision engine flagged as over capacity: when the unit is
+// full, the next start date that still fits the file's end date, the next opening after it, and
+// units with a free place over the same dates. Pending rows of the same file count as saved.
+const ImportCapacity = require('./import-capacity.js');
+async function importCapacityAdvice(payload, pending = [], replacedIds = new Set()) {
+  const start = payload.start_date, end = payload.end_date, horizon = ImportCapacity.addDays(end, 365);
+  const skip = r => replacedIds.has(r.id);
+  const [unitR, ownR, unitsR, allR] = await Promise.all([
+    supabase.from('training_units').select('id, unit_name, maximum_residents').eq('id', payload.training_unit_id).maybeSingle(),
+    supabase.from('resident_rotations').select('id, training_unit_id, start_date, end_date, actual_start_date, actual_end_date, rotation_status').is('deleted_at', null)
+      .eq('training_unit_id', payload.training_unit_id).neq('rotation_status', 'cancelled').lte('start_date', horizon).gte('end_date', start),
+    supabase.from('training_units').select('id, unit_name, maximum_residents, unit_status').eq('unit_status', 'active'),
+    supabase.from('resident_rotations').select('id, training_unit_id, start_date, end_date, actual_start_date, actual_end_date, rotation_status').is('deleted_at', null)
+      .neq('rotation_status', 'cancelled').lte('start_date', end).gte('end_date', start)
+  ]);
+  for (const r of [unitR, ownR, unitsR, allR]) if (r.error) throw r.error;
+  if (!unitR.data) return null;
+  const advice = ImportCapacity.advise({ unit: unitR.data, start, end, horizonEnd: horizon,
+    rotations: [...(ownR.data || []).filter(r => !skip(r)), ...pending], units: unitsR.data || [],
+    unitRotations: [...(allR.data || []).filter(r => !skip(r)), ...pending] });
+  return { unit_name: unitR.data.unit_name, ...advice };
+}
+
 // POST /api/rotations/batch — reviewed bulk import of the MIR rotations matrix.
 // Mirrors /api/oncall/batch: dry_run=true CHECKS (per-row ready/needs_attention)
 // and dry_run=false COMMITS. Unit references are either an existing
@@ -4593,6 +4619,7 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
   try{ const {data:rm}=await supabase.from('medical_staff').select('id').eq('is_resident_manager',true).is('deleted_at',null).limit(1).maybeSingle(); residentManagerId=rm?.id||null; }catch{}
 
   const results=[]; let inserted=0, skipped=0, ready=0;
+  const pending=[], replacedIds=new Set();     // dry run: rows of this file already accepted, and what they replace
   for(const r of rotations){
     const tag={resident_id:r.resident_id||null, start_date:r.start_date||null, end_date:r.end_date||null, unit_code:r.create_unit?.unit_code||null};
     try{
@@ -4612,7 +4639,8 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
         if(oldErr) throw oldErr;
         if(!old||old.deleted_at) throw Error('The rotation this row replaces no longer exists. Reload the file.');
         if(String(old.resident_id)!==String(r.resident_id)) throw Error('A rotation can only be replaced by one of the same resident.');
-        if(!old.sync_source) throw Error('Only rotations created by an earlier import can be replaced from a file.');
+        // A hand-entered rotation can be replaced too, but only after the reviewer approved it in the preview.
+        if(!old.sync_source && r.replace_confirmed!==true) throw Error('This rotation was entered by hand. Approve the replacement in the preview first.');
         replaced=old;
       }
       // Dedup: identical resident + unit + window already present -> skip (idempotent re-import).
@@ -4623,11 +4651,14 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
         if(dupe){ skipped++; results.push({...tag,status:'skipped',message:'Already imported (same resident, unit and dates).'}); continue; }
         // Overlap/capacity via the shared decision engine (only for real units).
         const payload={resident_id:r.resident_id, training_unit_id, supervising_attending_id:supervisor, start_date:start, end_date:end, rotation_category:r.rotation_category||'clinical_rotation'};
-        const decision=await buildRotationDecision(payload,{action:'assign',excludeId:replaced?.id||null});
+        const decision=await buildRotationDecision(payload,{action:'assign',excludeId:replaced?.id||null,extra:pending,ignore:[...replacedIds]});
         const enforcement=await enforceRotationDecision({decision, override:r.decision_override, req, action:'assign'});
-        if(!enforcement.ok) throw Error((decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.title).join('; ')||'Scheduling conflict requires review');
+        if(!enforcement.ok){ const err=Error((decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.title).join('; ')||'Scheduling conflict requires review'); err.decision=decision; err.payload=payload; throw err; }
       }
-      if(dryRun){ ready++; results.push({...tag,status:'ready',...(replaced?{replaces:replaced.id}:{})}); continue; }
+      if(dryRun){ ready++; results.push({...tag,status:'ready',...(replaced?{replaces:replaced.id}:{})});
+        if(training_unit_id!=='(new)') pending.push({id:'pending-'+pending.length,resident_id:r.resident_id,training_unit_id,start_date:start,end_date:end,rotation_status:'scheduled',training_unit:{unit_name:'(this file)'}});
+        if(replaced) replacedIds.add(replaced.id);
+        continue; }
       const today=formatDate(new Date());
       const rotation_status = start>today ? 'scheduled' : (end<today ? 'completed' : 'active');
       const provenance=`[Imported ${new Date().toISOString().slice(0,10)} from ${String(req.body.source_file||'rotations Excel').slice(0,120)}${r.source_sheet?` · ${String(r.source_sheet).slice(0,40)}`:''}]`;
@@ -4651,8 +4682,14 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
       inserted++; results.push({...tag,status:replaced?'replaced':'inserted',id:data.id,...(replaced?{replaces:replaced.id}:{})});
     }catch(e){
       skipped++;
-      results.push({...tag, status:dryRun?'needs_attention':'not_saved',
+      const codes=(e.decision?.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.code);
+      let capacity=null;
+      if(codes.includes('UNIT_CAPACITY_EXCEEDED')) capacity=await importCapacityAdvice(e.payload,pending,replacedIds).catch(()=>null);
+      const conc=(e.decision?.findings||[]).find(f=>f.code==='ROTATION_CONCURRENT_PRIMARY');
+      results.push({...tag, status:dryRun?'needs_attention':'not_saved', ...(codes.length?{codes}:{}), ...(capacity?{capacity}:{}),
         message: e.code==='23505' ? 'Duplicate — already saved.'
+          : capacity&&capacity.full.length ? `${capacity.unit_name} is full as per policy (max ${capacity.capacity} residents) from ${capacity.full[0].start} to ${capacity.full[capacity.full.length-1].end}.`
+          : conc ? (conc.evidence?.unitName==='(this file)' ? 'Overlaps another row of this file for the same resident.' : `Overlaps ${conc.evidence?.unitName||'another rotation'} (${conc.evidence?.start} → ${conc.evidence?.end}) — a resident can’t be in two units at once.`)
           : (/overlap/i.test(e.message||'')||e.code==='P0001') ? 'Overlaps another rotation for this resident — they can’t be in two units at once.'
           : e.status===403 ? 'Permission denied for this assignment.'
           : e.message });

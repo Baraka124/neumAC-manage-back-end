@@ -61,7 +61,7 @@
   function capacityProjection(proposal,unit,rotations,excludeId){
     const start=iso(proposal.start),end=iso(proposal.end),cap=Number(unit?.maximum_residents||0)||null;
     if(!start||!end||!cap) return {capacity:cap,peakBefore:0,peakAfter:0,periodsOver:[],periodsAt:[],overlapping:[]};
-    const relevant=clean(rotations).filter(r=>String(r.id)!==String(excludeId||'')&&String(r.training_unit_id)===String(proposal.unitId)&&activeStatus(r.rotation_status)&&overlap(start,end,effectiveRotStart(r),effectiveRotEnd(r)));
+    const relevant=clean(rotations).filter(r=>String(r.id)!==String(excludeId||'')&&String(r.training_unit_id)===String(proposal.unitId)&&occupiesResident(r.rotation_status)&&overlap(start,end,effectiveRotStart(r),effectiveRotEnd(r)));
     let peakBefore=0,peakAfter=0; const over=[],at=[];
     for(let d=start;d<=end;d=addDays(d,1)){
       const before=relevant.filter(r=>{const s=effectiveRotStart(r),e=effectiveRotEnd(r);return s&&e&&s<=d&&e>=d}).length;
