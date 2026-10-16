@@ -4257,6 +4257,94 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
   }
 });
 
+// POST /api/rotations/batch — reviewed bulk import of the MIR rotations matrix.
+// Mirrors /api/oncall/batch: dry_run=true CHECKS (per-row ready/needs_attention)
+// and dry_run=false COMMITS. Unit references are either an existing
+// training_unit_id or a create_unit {unit_code,unit_name} that is created on the
+// fly (the system absorbs new units rather than rejecting the file). Supervisor
+// is optional — defaults to the unit's default_supervisor_id, else null
+// (unassigned, filled later). Overlap/capacity go through the same rotation
+// decision engine as single creates, plus the DB overlap trigger as a backstop.
+app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotations.commit',{scopes:['all']}), apiLimiter, async (req, res) => {
+  const rotations=req.body?.rotations;
+  if(req.body?.dry_run!==undefined && typeof req.body.dry_run!=='boolean') return res.status(400).json({error:'dry_run must be boolean'});
+  const dryRun=req.body?.dry_run===true;
+  if(!Array.isArray(rotations)||!rotations.length||rotations.length>300) return res.status(400).json({error:'Provide 1 to 300 reviewed rotations.'});
+
+  const unitByCode={}; const createdCodes=new Set();
+  // Resolve a rotation's unit to an id: existing id passthrough; else find by code;
+  // else create (only on a real commit — a dry run marks it '(new)' without writing).
+  const resolveUnit=async(r)=>{
+    if(r.training_unit_id) return r.training_unit_id;
+    const code=String(r.create_unit?.unit_code||'').trim();
+    if(!code) throw Error('Each rotation needs a training_unit_id or a create_unit {unit_code,unit_name}.');
+    if(unitByCode[code]) return unitByCode[code];
+    const {data:found}=await supabase.from('training_units').select('id').eq('unit_code',code).maybeSingle();
+    if(found){ unitByCode[code]=found.id; return found.id; }
+    if(dryRun){ unitByCode[code]='(new)'; return '(new)'; }
+    const {data:created,error}=await supabase.from('training_units').insert({
+      unit_code:code.slice(0,40), unit_name:String(r.create_unit?.unit_name||code).trim().slice(0,120),
+      department_name:'Department of Pulmonology', maximum_residents:Number(r.create_unit?.maximum_residents)||2,
+      unit_type:'training_unit', unit_status:'active', unit_description:'Created from rotations import.'
+    }).select('id').single();
+    if(error) throw error;
+    unitByCode[code]=created.id; createdCodes.add(code); return created.id;
+  };
+
+  // Supervisor default for imported rotations: the resident coordinator
+  // (is_resident_manager). Unit-level supervisors stay optional — this gives every
+  // imported stay a real overseer without fabricating a per-rotation attending, and
+  // resolves dynamically (flip the flag when the coordinator changes). Null only if
+  // no coordinator is flagged.
+  let residentManagerId=null;
+  try{ const {data:rm}=await supabase.from('medical_staff').select('id').eq('is_resident_manager',true).is('deleted_at',null).limit(1).maybeSingle(); residentManagerId=rm?.id||null; }catch{}
+
+  const results=[]; let inserted=0, skipped=0, ready=0;
+  for(const r of rotations){
+    const tag={resident_id:r.resident_id||null, start_date:r.start_date||null, end_date:r.end_date||null, unit_code:r.create_unit?.unit_code||null};
+    try{
+      const start=formatDate(r.start_date), end=formatDate(r.end_date);
+      if(!start||!end||end<start) throw Error('Invalid rotation window');
+      if(!r.resident_id) throw Error('Missing resident');
+      const training_unit_id=await resolveUnit(r);
+      // Dedup: identical resident + unit + window already present -> skip (idempotent re-import).
+      if(training_unit_id!=='(new)'){
+        const {data:dupe}=await supabase.from('resident_rotations').select('id')
+          .eq('resident_id',r.resident_id).eq('training_unit_id',training_unit_id)
+          .eq('start_date',start).eq('end_date',end).is('deleted_at',null).maybeSingle();
+        if(dupe){ skipped++; results.push({...tag,status:'skipped',message:'Already imported (same resident, unit and dates).'}); continue; }
+        // Overlap/capacity via the shared decision engine (only for real units).
+        const payload={resident_id:r.resident_id, training_unit_id, supervising_attending_id:r.supervising_attending_id||null, start_date:start, end_date:end, rotation_category:r.rotation_category||'clinical_rotation'};
+        const decision=await buildRotationDecision(payload,{action:'assign'});
+        const enforcement=await enforceRotationDecision({decision, override:r.decision_override, req, action:'assign'});
+        if(!enforcement.ok) throw Error((decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.title).join('; ')||'Scheduling conflict requires review');
+      }
+      if(dryRun){ ready++; results.push({...tag,status:'ready'}); continue; }
+      // Supervisor default: explicit → unit's default supervisor → resident coordinator → null.
+      let supervisor=r.supervising_attending_id||null;
+      if(!supervisor){ const {data:u}=await supabase.from('training_units').select('default_supervisor_id').eq('id',training_unit_id).maybeSingle(); supervisor=u?.default_supervisor_id||residentManagerId||null; }
+      const today=formatDate(new Date());
+      const rotation_status = start>today ? 'scheduled' : (end<today ? 'completed' : 'active');
+      const provenance=`[Imported ${new Date().toISOString().slice(0,10)} from ${String(req.body.source_file||'rotations Excel').slice(0,120)}${r.source_sheet?` · ${String(r.source_sheet).slice(0,40)}`:''}]`;
+      const row={ resident_id:r.resident_id, training_unit_id, supervising_attending_id:supervisor,
+        start_date:start, end_date:end, rotation_category:r.rotation_category||'clinical_rotation',
+        rotation_status, rotation_id:generateId('ROT'), clinical_notes:'', supervisor_evaluation:'',
+        goals:'', notes:provenance, created_at:new Date().toISOString(), updated_at:new Date().toISOString() };
+      const {data,error}=await supabase.from('resident_rotations').insert(row).select('id').single();
+      if(error) throw error;
+      inserted++; results.push({...tag,status:'inserted',id:data.id});
+    }catch(e){
+      skipped++;
+      results.push({...tag, status:dryRun?'needs_attention':'not_saved',
+        message: e.code==='23505' ? 'Duplicate — already saved.'
+          : (/overlap/i.test(e.message||'')||e.code==='P0001') ? 'Overlaps another rotation for this resident — they can’t be in two units at once.'
+          : e.status===403 ? 'Permission denied for this assignment.'
+          : e.message });
+    }
+  }
+  res.json({ success:skipped===0, dry_run:dryRun, ready, inserted, skipped, units_created:createdCodes.size, total:inserted, results });
+});
+
 // Phase 5.0: PUT /api/rotations/:id — temporal-integrity aware partial update.
 // start_date/end_date remain the planned window. actual_* dates are separate evidence.
 app.put('/api/rotations/:id', authenticateToken, checkPermission('resident_rotations', 'update'), validate(schemas.rotationUpdate), async (req, res) => {
