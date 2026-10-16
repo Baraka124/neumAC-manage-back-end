@@ -1,7 +1,7 @@
 name: Ops Room
 on:
   pull_request:
-    paths: [index.js, ops-room.js, portfolio.js, tests/ops-room.test.cjs, tests/ops-room-or2.test.cjs, migrations/**, .github/workflows/ops-room.yml]
+    paths: [index.js, ops-room.js, portfolio.js, tests/ops-room.test.cjs, tests/ops-room-or2.test.cjs, tests/ops-room-or3.test.cjs, migrations/**, .github/workflows/ops-room.yml]
   push:
     branches: [main]
     paths: [index.js, ops-room.js, tests/ops-room.test.cjs]
@@ -16,7 +16,7 @@ jobs:
       - name: Syntax
         run: node --check index.js && node --check ops-room.js
       - name: Ops Room rules and guards
-        run: node --test tests/ops-room.test.cjs tests/ops-room-or2.test.cjs
+        run: node --test tests/ops-room.test.cjs tests/ops-room-or2.test.cjs tests/ops-room-or3.test.cjs
       - name: Install dependencies
         run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Server boots (all routes register)

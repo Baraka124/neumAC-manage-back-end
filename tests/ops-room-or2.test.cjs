@@ -80,7 +80,7 @@ test('routes: reads with Units read, writes with Units write under the unit, row
   for (const r of ["post\\('/api/ops/units/:unitId/resources'", "post\\('/api/ops/units/:unitId/resources/:resourceId/events'", "put\\('/api/ops/units/:unitId/measures'", "post\\('/api/ops/units/:unitId/incidents'", "put\\('/api/ops/units/:unitId/incidents/:incidentId'"])
     assert.match(src, new RegExp(`app\\.${r}, authenticateToken, Portfolio\\.write\\('training_units'\\)`));
   assert.match(src, /const opsOwned = async \(table, id, unitId, cols = '\*'\) => \{[^\n]*String\(data\.unit_id\) === String\(unitId\)/);
-  assert.equal((src.match(/if \(permanent && !opsAdmin\(req\)\) return res\.status\(403\)/g) || []).length, 3);   // roster, resources, incidents
+  assert.ok((src.match(/if \(permanent && !opsAdmin\(req\)\) return res\.status\(403\)/g) || []).length >= 3);   // roster, resources, incidents (+ later modules)
 });
 
 test('OR-1 keeps working before the OR-2 migration: missing tables read as empty', () => {
