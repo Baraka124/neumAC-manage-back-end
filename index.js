@@ -35,6 +35,17 @@ const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
+const { AsyncLocalStorage } = require('async_hooks');
+// Request-scoped actor: the audit trigger reads x-neum-actor (trusted only on
+// service-role requests) so audit_log.changed_by records who made each change.
+const actorContext = new AsyncLocalStorage();
+const actorFetch = (input, init = {}) => {
+  const actorId = actorContext.getStore()?.actorId;
+  if (!actorId) return fetch(input, init);
+  const headers = new Headers(init.headers || (input && typeof input === 'object' && input.headers) || undefined);
+  headers.set('x-neum-actor', actorId);
+  return fetch(input, { ...init, headers });
+};
 const Joi = require('joi');
 const multer = require('multer');
 const path = require('path');
@@ -170,7 +181,8 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 // ============ SUPABASE CLIENT ============
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
-  db: { schema: 'public' }
+  db: { schema: 'public' },
+  global: { fetch: actorFetch }
 });
 
 // ============ FILE UPLOAD CONFIGURATION ============
@@ -932,7 +944,7 @@ const authenticateToken = async (req, res, next) => {
       department_id: identity.department_id || null,
       auth_version: currentVersion
     };
-    next();
+    actorContext.run({ actorId: identity.id }, () => next());
   } catch (e) {
     console.error('Identity validation failed:', e.message);
     return res.status(500).json({ error: 'Identity validation failed' });
@@ -1302,6 +1314,63 @@ async function transitionIdentity(req, res, targetId, targetStatus, reason, even
   return res.json({ success: true, user: data });
 }
 
+// Open research for Mi espacio dashboard counts. Mirrors the governed /api/me/context filters
+// exactly (SQL NOT IN / <> semantics: a record with no status/stage is not counted), so counts
+// always equal the number of items listed.
+const CLOSED_TRIAL_STATUSES = new Set(['Completado', 'Terminado', 'Retirado', 'completed', 'terminated', 'withdrawn']);
+const isOpenTrial = t => t?.status != null && !CLOSED_TRIAL_STATUSES.has(t.status);
+const isOpenProject = p => p?.current_stage != null && p.current_stage !== 'completed';
+
+// Turns an audit_log row into a Mi espacio timeline entry (shape kept compatible
+// with the previous audit_logs feed: id/action/resource/resource_id/details/created_at).
+const AUDIT_RESOURCE = { resident_rotations: 'rotations', oncall_schedule: 'on_call', staff_absence_records: 'absence_records', medical_staff: 'medical_staff', app_users: 'app_users' };
+const AUDIT_FIELD_LABELS = {
+  public_bio: 'biografía', public_photo_url: 'foto', title: 'tratamiento', gender: 'género', specialization: 'especialidad',
+  orcid_id: 'ORCID', scholar_url: 'Google Scholar', researchgate_url: 'ResearchGate', mobile_phone: 'móvil', work_phone: 'teléfono',
+  is_public: 'visibilidad pública', staff_type: 'categoría', employment_status: 'estado laboral', department_id: 'servicio',
+  start_date: 'inicio', end_date: 'fin', training_unit_id: 'unidad', supervising_attending_id: 'supervisor', rotation_status: 'estado',
+  actual_end_date: 'fin real', primary_physician_id: 'titular', backup_physician_id: 'refuerzo', shift_type: 'turno', duty_date: 'fecha',
+  absence_reason: 'motivo', current_status: 'estado', actual_return_date: 'regreso', covering_staff_id: 'cobertura',
+  password_hash: 'contraseña', account_status: 'estado de la cuenta', user_role: 'rol', email: 'email',
+  professional_email: 'email profesional', pubmed_query: 'búsqueda PubMed', indexed_publications_count: 'publicaciones indexadas',
+  clinical_study_certificates: 'certificados de estudios', is_chief_of_department: 'jefatura de servicio', full_name: 'nombre',
+  job_title: 'puesto', academic_degree: 'titulación', affiliation_type: 'adscripción', can_be_pi: 'capacidad de IP', can_be_coi: 'capacidad de co-IP',
+  absence_notifications: 'avisos de ausencias', announcement_notifications: 'avisos de anuncios', admin_level: 'nivel de administración',
+  hod_notes: 'notas de jefatura', actual_days: 'días reales', has_conflict: 'conflicto'
+};
+const AUDIT_SHIFT = { primary_call: 'Guardia', on_call_present: 'Guardia de presencia', on_call_home: 'Guardia localizada', on_call_mixed: 'Guardia mixta' };
+const AUDIT_ABSENCE_REASON = { vacation: 'Vacaciones', conference: 'Congreso', sick_leave: 'Baja médica', training: 'Formación', personal: 'Personal', other: 'Ausencia' };
+const AUDIT_HIDDEN_FIELDS = new Set(['updated_at', 'last_updated', 'last_login_at', 'days_remaining', 'recorded_by', 'recorded_at', 'auth_version', 'temporary_password_expires_at', 'password_reset_required', 'rotation_id', 'termination_recorded_at', 'notes', 'return_recorded_at', 'reset_token', 'reset_token_expires_at', 'medical_staff_id']);
+function describeAuditRow(row) {
+  if (!row) return null;
+  const rec = row.new_data || row.old_data || {};
+  const fields = (row.changed_fields || []).filter(f => !AUDIT_HIDDEN_FIELDS.has(f));
+  let action = row.action === 'INSERT' ? 'create' : row.action === 'DELETE' ? 'delete' : 'update';
+  if (row.action === 'UPDATE' && fields.includes('deleted_at') && rec.deleted_at) action = 'delete';
+  if (row.action === 'UPDATE' && rec.rotation_status === 'cancelled' && fields.includes('rotation_status')) action = 'cancel';
+  if (row.action === 'UPDATE' && rec.current_status === 'cancelled' && fields.includes('current_status')) action = 'cancel';
+  const period = (a, b) => a ? (b && b !== a ? a + ' → ' + b : a) : '';
+  let summary = '';
+  switch (row.table_name) {
+    case 'resident_rotations': summary = period(rec.start_date, rec.actual_end_date || rec.end_date); break;
+    case 'oncall_schedule': summary = [AUDIT_SHIFT[rec.shift_type] || 'Guardia', rec.duty_date].filter(Boolean).join(' · '); break;
+    case 'staff_absence_records': summary = [AUDIT_ABSENCE_REASON[rec.absence_reason] || '', period(rec.start_date, rec.end_date)].filter(Boolean).join(' · '); break;
+    case 'app_users': summary = fields.includes('password_hash') ? 'Contraseña actualizada' : ''; break;
+    default: break;
+  }
+  if (action === 'update' && !summary && fields.length) {
+    const labels = [...new Set(fields.map(f => AUDIT_FIELD_LABELS[f]).filter(Boolean))];
+    summary = labels.length ? labels.slice(0, 4).join(', ') : 'Datos actualizados';
+  }
+  if (action === 'update' && !fields.length) return null;
+  return {
+    id: row.id, action, resource: AUDIT_RESOURCE[row.table_name] || row.table_name, resource_id: row.record_id,
+    // by is only set when the author was recorded (changes made after audit authorship went live).
+    details: { summary, fields: fields.slice(0, 8), by: row.actor_name || null, by_me: !!row.by_me },
+    created_at: row.changed_at
+  };
+}
+
 // ============ AUDIT LOGGING ============
 // req is optional — pass it when available to capture user + IP context
 const auditLog = async (action, resource, resource_id = '', details = {}, req = null) => {
@@ -1662,13 +1731,11 @@ app.get('/api/me/activity', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const userId = req.user.id;
     if (!userId) return res.json([]);
-    const { data, error } = await supabase.from('audit_logs')
-      .select('id, action, resource, resource_id, details, created_at')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: false })
-      .limit(25);
+    const { data, error } = await supabase.rpc('me_activity', {
+      p_user: userId, p_staff: req.user.medical_staff_id || null, p_days: 90, p_limit: 40
+    });
     if (error) throw error;
-    res.json(data || []);
+    res.json((data || []).map(row => describeAuditRow(row)).filter(Boolean));
   } catch (e) {
     res.status(500).json({ error: 'Failed to load your activity', message: e.message });
   }
@@ -1708,10 +1775,10 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
     // FIX: clinical_trials and innovation_projects have no deleted_at or role columns
     // FIX: absence table is staff_absence_records, not absence_records
     const [studiesRes, projectsRes, pubsRes, certsRes, absencesRes, piStudiesRes, piProjectsRes, staffRes] = await Promise.all([
-      supabase.from('clinical_trials').select('id', { count: 'exact' })
+      supabase.from('clinical_trials').select('id, status')
         .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}},sub_investigators.cs.{${sid}}`),
-      supabase.from('innovation_projects').select('id', { count: 'exact' })
-        .or(`lead_investigator_id.eq.${sid},co_investigators.cs.{${sid}}`),
+      supabase.from('innovation_projects').select('id, current_stage')
+        .or(`lead_investigator_id.eq.${sid},technical_lead_id.eq.${sid},co_investigators.cs.{${sid}}`),
       supabase.from('publication_authors').select('id', { count: 'exact' })
         .eq('staff_id', sid),
       supabase.from('staff_certificates').select('id, expiry_date')
@@ -1719,9 +1786,9 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
       supabase.from('staff_absence_records').select('id, start_date, end_date')
         .eq('staff_member_id', sid).is('deleted_at', null)
         .in('current_status', ['planned_leave', 'currently_absent']).gte('end_date', new Date().toISOString().slice(0, 10)),
-      supabase.from('clinical_trials').select('id', { count: 'exact' })
+      supabase.from('clinical_trials').select('id, status')
         .eq('principal_investigator_id', sid),
-      supabase.from('innovation_projects').select('id', { count: 'exact' })
+      supabase.from('innovation_projects').select('id, current_stage')
         .eq('lead_investigator_id', sid),
       supabase.from('medical_staff').select('h_index, indexed_publications_count')
         .eq('id', sid).maybeSingle()
@@ -1744,15 +1811,15 @@ app.get('/api/me/dashboard', authenticateToken, apiLimiter, async (req, res) => 
 
     const staffData = staffRes.data || {};
     res.json({
-      activeStudies: studiesRes.count || 0,
-      activeProjects: projectsRes.count || 0,
+      activeStudies: (studiesRes.data || []).filter(isOpenTrial).length,
+      activeProjects: (projectsRes.data || []).filter(isOpenProject).length,
       publications: pubsRes.count || 0,
       totalCertificates: certs.length,
       expiredCertificates: expiredCerts,
       expiringCertificates: expiringCerts,
       upcomingAbsenceDays,
-      piStudies: piStudiesRes.count || 0,
-      piProjects: piProjectsRes.count || 0,
+      piStudies: (piStudiesRes.data || []).filter(isOpenTrial).length,
+      piProjects: (piProjectsRes.data || []).filter(isOpenProject).length,
       hIndex: staffData.h_index || null,
       indexedPublications: staffData.indexed_publications_count || null
     });
@@ -1948,25 +2015,21 @@ app.get('/api/me/digest', authenticateToken, apiLimiter, async (req, res) => {
     const sinceISO = since.toISOString();
 
     const queries = [
-      supabase.from('audit_logs')
-        .select('id, action, resource, resource_id, details, created_at')
-        .eq('user_id', userId)
-        .gte('created_at', sinceISO)
-        .order('created_at', { ascending: false })
-        .limit(100)
+      supabase.rpc('me_activity', { p_user: userId, p_staff: sid || null, p_days: period === 'month' ? 30 : 7, p_limit: 100 })
     ];
 
     if (sid) {
       queries.push(
-        supabase.from('staff_certificates').select('id, certificate_name, issue_date')
-          .eq('staff_id', sid).gte('issue_date', sinceISO.slice(0, 10)),
-        supabase.from('publication_authors').select('id, publication:publications(title, publication_date)')
+        supabase.from('staff_certificates').select('id, certificate_name, issued_date')
+          .eq('staff_id', sid).gte('issued_date', sinceISO.slice(0, 10)),
+        supabase.from('publication_authors').select('id, news_post:news_posts(title, published_at)')
           .eq('staff_id', sid)
       );
     }
 
     const results = await Promise.all(queries);
-    const logs = results[0].data || [];
+    if (results[0].error) throw results[0].error;
+    const logs = (results[0].data || []).map(describeAuditRow).filter(Boolean);
 
     // Summarize by resource type
     const summary = {};
@@ -1982,11 +2045,11 @@ app.get('/api/me/digest', authenticateToken, apiLimiter, async (req, res) => {
       totalActions: logs.length,
       byResource: Object.values(summary).sort((a, b) => b.actions - a.actions),
       recentCerts: sid && results[1] ? (results[1].data || []).map(c => ({
-        name: c.certificate_name, date: c.issue_date
+        name: c.certificate_name, date: c.issued_date
       })) : [],
-      recentPublications: sid && results[2] ? (results[2].data || []).filter(p => p.publication).map(p => ({
-        title: p.publication.title, date: p.publication.publication_date
-      })) : []
+      recentPublications: sid && results[2] ? (results[2].data || [])
+        .filter(p => p.news_post && p.news_post.published_at && p.news_post.published_at >= sinceISO)
+        .map(p => ({ title: p.news_post.title, date: String(p.news_post.published_at).slice(0, 10) })) : []
     };
 
     res.json(digest);
@@ -2215,12 +2278,12 @@ app.get('/api/me/context', authenticateToken, apiLimiter, async (req, res) => {
         .select('id, title, protocol_id, status, principal_investigator_id, co_investigators, sub_investigators')
         .not('status', 'in', '("Completado","Terminado","Retirado","completed","terminated","withdrawn")')
         .or(`principal_investigator_id.eq.${sid},co_investigators.cs.{${sid}},sub_investigators.cs.{${sid}}`)
-        .order('updated_at', { ascending: false }).limit(20),
+        .order('updated_at', { ascending: false }).limit(100),
       supabase.from('innovation_projects')
         .select('id, title, development_stage, current_stage, category, lead_investigator_id, technical_lead_id, co_investigators')
         .neq('current_stage', 'completed')
         .or(`lead_investigator_id.eq.${sid},technical_lead_id.eq.${sid},co_investigators.cs.{${sid}}`)
-        .order('updated_at', { ascending: false }).limit(20),
+        .order('updated_at', { ascending: false }).limit(100),
       supabase.from('publication_authors')
         .select('author_order, is_corresponding, news_post:news_posts(id, title, authors_text)')
         .eq('staff_id', sid)
