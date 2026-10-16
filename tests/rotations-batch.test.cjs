@@ -22,7 +22,7 @@ test('batch import is authority-gated on sync.rotations.commit (scope all)', () 
 
 test('supports dry-run check and real commit from one endpoint', () => {
   assert.match(h, /const dryRun=req\.body\?\.dry_run===true/);
-  assert.match(h, /if\(dryRun\)\{ ready\+\+; results\.push\(\{\.\.\.tag,status:'ready'\}\); continue; \}/);
+  assert.match(h, /if\(dryRun\)\{ ready\+\+; results\.push\(\{\.\.\.tag,status:'ready'.*?\}\); continue; \}/);   // + optional replaces (Phase D)
   assert.match(h, /status:dryRun\?'needs_attention':'not_saved'/);
 });
 
@@ -44,7 +44,7 @@ test('idempotent: an identical resident+unit+window is skipped, not duplicated',
 });
 
 test('overlap/capacity go through the shared rotation decision engine + trigger backstop', () => {
-  assert.match(h, /buildRotationDecision\(payload,\{action:'assign'\}\)/);
+  assert.match(h, /buildRotationDecision\(payload,\{action:'assign'(,excludeId:replaced\?\.id\|\|null)?\}\)/);   // replaced rotation excluded (Phase D)
   assert.match(h, /enforceRotationDecision\(\{decision, override:r\.decision_override, req, action:'assign'\}\)/);
   assert.match(h, /e\.code==='P0001'/);
 });

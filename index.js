@@ -4502,6 +4502,25 @@ app.post('/api/imports/review', authenticateToken, importAuthority(req => ({ onc
   } catch (e) { res.status(500).json({ error: 'Failed to review import', message: e.message }); }
 });
 
+// POST /api/import-runs { type:'rotations'|'oncall', file_name, counts } — one log row per applied import.
+app.post('/api/import-runs', authenticateToken, importAuthority(req => IMPORT_LAYOUT_TYPES[req.body?.type]), async (req, res) => {
+  try {
+    const c = req.body?.counts && typeof req.body.counts === 'object' ? req.body.counts : {};
+    const counts = Object.fromEntries(Object.entries(c).filter(([k, v]) => /^[a-z_]{1,30}$/.test(k) && Number.isFinite(Number(v))).slice(0, 20).map(([k, v]) => [k, Number(v)]));
+    const { data, error } = await supabase.from('import_runs').insert({ import_type: req.body.type, file_name: String(req.body.file_name || '').slice(0, 200) || null, actor_id: req.user.id, counts }).select('id, created_at').single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (e) { res.status(500).json({ error: 'Failed to log import', message: e.message }); }
+});
+app.get('/api/import-runs', authenticateToken, importAuthority(req => IMPORT_LAYOUT_TYPES[req.query.type]), async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('import_runs').select('id, import_type, file_name, counts, created_at, actor:app_users!import_runs_actor_id_fkey(full_name)')
+      .eq('import_type', req.query.type).order('created_at', { ascending: false }).limit(20);
+    if (error) throw error;
+    res.json({ data: data || [] });
+  } catch (e) { res.status(500).json({ error: 'Failed to load import history', message: e.message }); }
+});
+
 // POST /api/rotations/batch — reviewed bulk import of the MIR rotations matrix.
 // Mirrors /api/oncall/batch: dry_run=true CHECKS (per-row ready/needs_attention)
 // and dry_run=false COMMITS. Unit references are either an existing
@@ -4557,6 +4576,16 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
       let supervisor=r.supervising_attending_id||null;
       if(!supervisor && training_unit_id!=='(new)'){ const {data:u}=await supabase.from('training_units').select('default_supervisor_id').eq('id',training_unit_id).maybeSingle(); supervisor=u?.default_supervisor_id||residentManagerId||null; }
       if(!supervisor) supervisor=residentManagerId||null;
+      // Phase D: a row may replace an earlier IMPORTED rotation of the same resident (the file changed).
+      let replaced=null;
+      if(r.replaces){
+        const {data:old,error:oldErr}=await supabase.from('resident_rotations').select('id,resident_id,rotation_status,sync_source,deleted_at,end_date,actual_end_date').eq('id',r.replaces).maybeSingle();
+        if(oldErr) throw oldErr;
+        if(!old||old.deleted_at) throw Error('The rotation this row replaces no longer exists. Reload the file.');
+        if(String(old.resident_id)!==String(r.resident_id)) throw Error('A rotation can only be replaced by one of the same resident.');
+        if(!old.sync_source) throw Error('Only rotations created by an earlier import can be replaced from a file.');
+        replaced=old;
+      }
       // Dedup: identical resident + unit + window already present -> skip (idempotent re-import).
       if(training_unit_id!=='(new)'){
         const {data:dupe}=await supabase.from('resident_rotations').select('id')
@@ -4565,21 +4594,32 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
         if(dupe){ skipped++; results.push({...tag,status:'skipped',message:'Already imported (same resident, unit and dates).'}); continue; }
         // Overlap/capacity via the shared decision engine (only for real units).
         const payload={resident_id:r.resident_id, training_unit_id, supervising_attending_id:supervisor, start_date:start, end_date:end, rotation_category:r.rotation_category||'clinical_rotation'};
-        const decision=await buildRotationDecision(payload,{action:'assign'});
+        const decision=await buildRotationDecision(payload,{action:'assign',excludeId:replaced?.id||null});
         const enforcement=await enforceRotationDecision({decision, override:r.decision_override, req, action:'assign'});
         if(!enforcement.ok) throw Error((decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.title).join('; ')||'Scheduling conflict requires review');
       }
-      if(dryRun){ ready++; results.push({...tag,status:'ready'}); continue; }
+      if(dryRun){ ready++; results.push({...tag,status:'ready',...(replaced?{replaces:replaced.id}:{})}); continue; }
       const today=formatDate(new Date());
       const rotation_status = start>today ? 'scheduled' : (end<today ? 'completed' : 'active');
       const provenance=`[Imported ${new Date().toISOString().slice(0,10)} from ${String(req.body.source_file||'rotations Excel').slice(0,120)}${r.source_sheet?` · ${String(r.source_sheet).slice(0,40)}`:''}]`;
       const row={ resident_id:r.resident_id, training_unit_id, supervising_attending_id:supervisor,
         start_date:start, end_date:end, rotation_category:r.rotation_category||'clinical_rotation',
         rotation_status, rotation_id:generateId('ROT'), clinical_notes:'', supervisor_evaluation:'',
-        goals:'', notes:provenance, created_at:new Date().toISOString(), updated_at:new Date().toISOString() };
+        goals:'', notes:provenance, created_at:new Date().toISOString(), updated_at:new Date().toISOString(),
+        sync_source:{file:String(req.body.source_file||'').slice(0,200)||null, sheet:r.source_sheet?String(r.source_sheet).slice(0,60):null, at:new Date().toISOString(), actor:req.user.id},
+        sync_key:r.sync_key?String(r.sync_key).slice(0,300):null };
+      // Replace: hide the old imported rotation first (the overlap trigger would otherwise reject
+      // the new one), insert, and restore the old one if the insert fails.
+      let restore=null;
+      if(replaced){
+        const nowIso=new Date().toISOString(), ended=['completed','terminated_early','cancelled'].includes(replaced.rotation_status)||String(replaced.actual_end_date||replaced.end_date).slice(0,10)<today;
+        const {error:hideErr}=await supabase.from('resident_rotations').update({deleted_at:nowIso,updated_at:nowIso,...(ended?{}:{rotation_status:'cancelled'})}).eq('id',replaced.id).is('deleted_at',null);
+        if(hideErr) throw hideErr;
+        restore={deleted_at:null,rotation_status:replaced.rotation_status,updated_at:new Date().toISOString()};
+      }
       const {data,error}=await supabase.from('resident_rotations').insert(row).select('id').single();
-      if(error) throw error;
-      inserted++; results.push({...tag,status:'inserted',id:data.id});
+      if(error){ if(restore) await supabase.from('resident_rotations').update(restore).eq('id',replaced.id); throw error; }
+      inserted++; results.push({...tag,status:replaced?'replaced':'inserted',id:data.id,...(replaced?{replaces:replaced.id}:{})});
     }catch(e){
       skipped++;
       results.push({...tag, status:dryRun?'needs_attention':'not_saved',
