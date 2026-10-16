@@ -1,4 +1,6 @@
 node_modules/
+# Secrets: never commit. Real values live in Railway variables / your local .env.
 .env
 .env.*
+!.env.example
 *.log
