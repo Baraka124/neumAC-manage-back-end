@@ -6661,11 +6661,10 @@ app.get('/api/absence-records/:id/audit-log', authenticateToken, apiLimiter, asy
 app.get('/api/announcements', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const today = formatDate(new Date());
-    const { data, error } = await supabase.from('department_announcements').select('*')
+    const q = live => { let x = supabase.from('department_announcements').select('*')
       .lte('publish_start_date', today).or(`publish_end_date.gte.${today},publish_end_date.is.null`)
-      .order('publish_start_date', { ascending: false });
-    if (error) throw error;
-    res.json(data || []);
+      .order('publish_start_date', { ascending: false }); return live ? x.is('deleted_at', null) : x; };
+    res.json(await opsCompat(() => q(true), () => q(false)));   // posts removed in Communication (CM-1) stay out
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch announcements', message: error.message });
   }
@@ -6675,7 +6674,9 @@ app.post('/api/announcements', authenticateToken, checkPermission('communication
   try {
     const dataSource = req.validatedData || req.body;
     const { data, error } = await supabase.from('department_announcements').insert([{
-      title: dataSource.title, content: dataSource.content, type: 'announcement',
+      title: dataSource.title, content: dataSource.content,
+      // The type chosen in the composer is kept (it was always stored as 'announcement' before CM-1).
+      type: ['announcement', 'broadcast', 'protocol', 'kudos', 'entrada'].includes(req.body?.type) ? req.body.type : 'announcement',
       priority_level: dataSource.priority_level || 'normal', target_audience: dataSource.target_audience || 'all_staff',
       visible_to_roles: ['system_admin', 'department_head', 'medical_resident'],
       publish_start_date: dataSource.publish_start_date ? formatDate(dataSource.publish_start_date) : formatDate(new Date()),
@@ -6714,6 +6715,295 @@ app.delete('/api/announcements/:id', authenticateToken, checkPermission('communi
     res.status(500).json({ error: 'Failed to delete announcement', message: error.message });
   }
 });
+
+// ===== COMMUNICATION (CM-1): entradas → briefing, Parte del día, agenda, follow-ups =====
+// One place for posts (department_announcements), follow-ups (comm_actions), agenda (comm_meetings + items) and the
+// daily brief (comm_daily_briefs). Communication is general: everyone with Communications read sees everything;
+// the audience says who it concerns ("Para mí"). Sharing = WhatsApp text + a link back into neumDesk (login).
+// PERMISSIONS: every guard goes through COMMS_PERMS so they can be tightened later in one place.
+const Comms = require('./comms.js');
+const COMMS_PERMS = { read: ['communications', 'read'], post: ['communications', 'create'], edit: ['communications', 'update'], remove: ['communications', 'delete'],
+  meeting: ['communications', 'create'], brief: ['communications', 'create'], action: ['communications', 'create'] };
+const commsCan = act => checkPermission(...COMMS_PERMS[act]);
+// Run a guard without ending the request (true = allowed) — for "author or editor" rules.
+const commsAllowed = (req, act) => new Promise(resolve => {
+  const fake = { status() { return this; }, json() { resolve(false); }, setHeader() {} };
+  try { Promise.resolve(commsCan(act)(req, fake, () => resolve(true))).catch(() => resolve(false)); } catch { resolve(false); }
+});
+const COMMS_APP_URL = process.env.APP_PUBLIC_URL || 'https://desk.neumact.org';
+const commsLink = (kind, id) => `${COMMS_APP_URL}/?c=${kind}:${id}`;
+const commsWrap = fn => async (req, res) => { try { await fn(req, res); } catch (e) { res.status(e.status || 500).json(e.status ? { error: e.message } : { error: 'Communication request failed', message: e.message }); } };
+const commsNow = () => new Date().toISOString();
+
+async function commsLists() {
+  const { cat, migrated } = await opsCatalog();
+  return { cat, migrated, labels: { comm_category: OpsRoom.labelsOf(cat, 'comm_category'), meeting_kind: OpsRoom.labelsOf(cat, 'meeting_kind'), ic_service: OpsRoom.labelsOf(cat, 'ic_service') } };
+}
+async function commsStaffNames(ids) {
+  const list = [...new Set((ids || []).filter(Boolean).map(String))];
+  if (!list.length) return {};
+  const { data } = await supabase.from('medical_staff').select('id, full_name').in('id', list);
+  return Object.fromEntries((data || []).map(s => [String(s.id), s.full_name]));
+}
+async function commsMe(req) {
+  const staffId = req.user.medical_staff_id || null;
+  if (!staffId) return { staff_id: null, unit_ids: [], roles: [] };
+  const today = opsToday();
+  const [{ data: st }, { data: us }] = await Promise.all([
+    supabase.from('medical_staff').select('staff_type').eq('id', staffId).maybeSingle(),
+    supabase.from('unit_staff').select('unit_id').eq('staff_id', staffId).lte('assigned_from', today).or(`assigned_until.is.null,assigned_until.gte.${today}`)
+  ]);
+  return { staff_id: staffId, unit_ids: (us || []).map(r => r.unit_id), roles: st?.staff_type ? [st.staff_type] : [] };
+}
+async function commsOncall(date) {
+  const rows = await opsSoft(supabase.from('oncall_schedule').select('duty_date, shift_type, primary_physician_id, backup_physician_id, resident_physician_id, deleted_at').eq('duty_date', date).is('deleted_at', null));
+  const names = await commsStaffNames(rows.flatMap(r => [r.primary_physician_id, r.backup_physician_id, r.resident_physician_id]));
+  const out = [];
+  for (const r of rows) for (const [k, role] of [['primary_physician_id', 'Adjunto/a'], ['backup_physician_id', 'Refuerzo'], ['resident_physician_id', 'Residente']])
+    if (r[k]) out.push({ staff_id: r[k], name: names[String(r[k])] || '—', role, shift: r.shift_type || null });
+  return out;
+}
+const commsShapePost = (p, lists, me, oncallIds) => ({ ...p,
+  type_label: (Comms.POST_TYPES[p.type] || Comms.SYSTEM_TYPES[p.type] || {}).label || 'Aviso',
+  category_label: p.category ? (lists.labels.comm_category[p.category] || p.category) : null,
+  source_label: p.source_service ? (lists.labels.ic_service[p.source_service] || p.source_service) : null,
+  for_me: !!p.audience && Comms.audienceIncludes(p.audience, me, oncallIds),
+  link: commsLink('post', p.id) });
+
+// Overview: feed, follow-ups, upcoming agenda, today's brief status, lists.
+app.get('/api/comms/overview', authenticateToken, commsCan('read'), apiLimiter, commsWrap(async (req, res) => {
+  const today = opsToday(), days = Math.min(Math.max(parseInt(req.query.days) || 30, 7), 180);
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  const pq = (live) => { let q = supabase.from('department_announcements').select('*').or(`created_at.gte.${since},publish_end_date.gte.${today},publish_end_date.is.null`).order('created_at', { ascending: false }).limit(150); return live ? q.is('deleted_at', null) : q; };
+  const [posts, lists, me, oncall] = await Promise.all([opsCompat(() => pq(true), () => pq(false)), commsLists(), commsMe(req), commsOncall(today)]);
+  const oncallIds = oncall.map(o => o.staff_id);
+  const actions = await opsSoftOrNull(supabase.from('comm_actions').select('*').is('deleted_at', null).or(`status.eq.open,done_at.gte.${new Date(Date.now() - 7 * 86400000).toISOString()}`).order('due_on', { ascending: true, nullsFirst: false }).limit(300));
+  const meetings = await opsSoftOrNull(supabase.from('comm_meetings').select('*, items:comm_meeting_items(id)').is('deleted_at', null)
+    .gte('starts_at', OpsRoom.addDays(today, -1) + 'T00:00:00Z').lte('starts_at', OpsRoom.addDays(today, 45) + 'T23:59:59Z').order('starts_at').limit(100));
+  const brief = await opsSoftOrNull(supabase.from('comm_daily_briefs').select('id, brief_date, status, sent_at, post_id').eq('brief_date', today).limit(1));
+  const names = await commsStaffNames([...(actions || []).map(a => a.owner_id), ...(meetings || []).map(m => m.organizer_id)]);
+  res.json({ today, migrated: actions !== null, me,
+    posts: posts.map(p => commsShapePost(p, lists, me, oncallIds)),
+    actions: (actions || []).map(a => ({ ...a, owner_name: a.owner_id ? names[String(a.owner_id)] || null : null, state: Comms.actionState(a, today), mine: !!me.staff_id && String(a.owner_id) === String(me.staff_id) })),
+    meetings: (meetings || []).map(m => ({ ...m, items: undefined, item_count: (m.items || []).length, kind_label: lists.labels.meeting_kind[m.kind] || m.kind, organizer_name: m.organizer_id ? names[String(m.organizer_id)] || null : null,
+      for_me: !!m.audience && Comms.audienceIncludes(m.audience, me, oncallIds), link: commsLink('meeting', m.id) })),
+    brief: brief && brief[0] ? brief[0] : null, oncall_today: oncall,
+    lists: { post_types: Comms.POST_TYPES, categories: (lists.cat.comm_category || []).map(i => ({ code: i.code, label: i.label, active: i.active })),
+      meeting_kinds: (lists.cat.meeting_kind || []).map(i => ({ code: i.code, label: i.label, active: i.active })),
+      services: (lists.cat.ic_service || []).filter(i => i.active).map(i => ({ code: i.code, label: i.label })),
+      brief_sections: Comms.BRIEF_SECTIONS, brief_default: Comms.BRIEF_DEFAULT } });
+}));
+
+// ── Posts ──
+app.post('/api/comms/posts', authenticateToken, commsCan('post'), commsWrap(async (req, res) => {
+  const today = opsToday(), lists = await commsLists();
+  const v = Comms.validatePost(req.body || {}, { today, categories: OpsRoom.activeCodes(lists.cat, 'comm_category') });
+  if (v.error) return res.status(400).json({ error: v.error });
+  const a = req.body.action ? Comms.validateAction(req.body.action) : null;
+  if (a && a.error) return res.status(400).json({ error: a.error });
+  // An interconsulta that came in is ALSO logged in the Ops Room (one record) and linked from the post.
+  let interconsultId = null;
+  if (v.value.category === 'interconsulta' && req.body.log_interconsult === true) {
+    if (!v.value.source_service || !OpsRoom.activeCodes(lists.cat, 'ic_service').includes(v.value.source_service)) return res.status(400).json({ error: 'To log the interconsulta, choose the requesting service from the list.' });
+    const icv = OpsRoom.validateInterconsult({ requesting_service: v.value.source_service, priority: req.body.ic_priority || 'ordinary', notes: v.value.title }, commsNow(), { services: OpsRoom.activeCodes(lists.cat, 'ic_service') });
+    if (icv.error) return res.status(400).json({ error: icv.error });
+    const row = { ...icv.value, created_by: req.user.id }; if (row.channel === 'formal') delete row.channel;
+    const { data: ic, error: icErr } = await supabase.from('ops_interconsults').insert(row).select('id').single();
+    if (icErr) throw icErr; interconsultId = ic.id;
+  }
+  const insert = { ...v.value, ...(interconsultId ? { interconsult_id: interconsultId } : {}), target_audience: 'all_staff',
+    visible_to_roles: ['system_admin', 'department_head', 'medical_resident'], publish_start_date: today,
+    created_by: req.user.id, created_by_name: req.user.full_name || 'Staff', created_at: commsNow(), updated_at: commsNow(), announcement_id: generateId('ANN') };
+  const { data, error } = await supabase.from('department_announcements').insert(insert).select('*').single();
+  if (error) { if (/column .* does not exist/i.test(error.message || '')) return res.status(409).json({ error: 'Communication needs the CM-1 database update first.' }); throw error; }
+  let action = null;
+  if (a) { const r = await supabase.from('comm_actions').insert({ ...a.value, post_id: data.id, created_by: req.user.id }).select('*').single(); if (r.error) throw r.error; action = r.data; }
+  const shaped = commsShapePost(data, lists, await commsMe(req), []);
+  res.status(201).json({ success: true, post: shaped, action, share: { text: Comms.postText(shaped, shaped.link), whatsapp: Comms.whatsappUrl(Comms.postText(shaped, shaped.link)) } });
+}));
+async function commsOwnedPost(req, id) {
+  const { data, error } = await supabase.from('department_announcements').select('*').eq('id', id).maybeSingle();
+  if (error) throw error; if (!data || data.deleted_at) return null; return data;
+}
+app.put('/api/comms/posts/:id', authenticateToken, commsCan('read'), commsWrap(async (req, res) => {
+  const row = await commsOwnedPost(req, req.params.id); if (!row) return res.status(404).json({ error: 'Post not found' });
+  if (String(row.created_by) !== String(req.user.id) && !(await commsAllowed(req, 'edit'))) return res.status(403).json({ error: 'Only the author or an editor can change this post.' });
+  const lists = await commsLists();
+  const v = Comms.validatePost(req.body || {}, { today: opsToday(), categories: [...OpsRoom.activeCodes(lists.cat, 'comm_category'), row.category].filter(Boolean), partial: true });
+  if (v.error) return res.status(400).json({ error: v.error });
+  const { data, error } = await supabase.from('department_announcements').update({ ...v.value, updated_at: commsNow() }).eq('id', row.id).select('*').single();
+  if (error) throw error;
+  res.json({ success: true, post: commsShapePost(data, lists, await commsMe(req), []) });
+}));
+app.delete('/api/comms/posts/:id', authenticateToken, commsCan('read'), commsWrap(async (req, res) => {
+  const row = await commsOwnedPost(req, req.params.id); if (!row) return res.status(404).json({ error: 'Post not found' });
+  if (String(row.created_by) !== String(req.user.id) && !(await commsAllowed(req, 'remove'))) return res.status(403).json({ error: 'Only the author or an editor can remove this post.' });
+  const { error } = await supabase.from('department_announcements').update({ deleted_at: commsNow(), updated_at: commsNow() }).eq('id', row.id);
+  if (error) throw error; res.json({ success: true });
+}));
+
+// ── Follow-ups ──
+app.post('/api/comms/actions', authenticateToken, commsCan('action'), commsWrap(async (req, res) => {
+  const v = Comms.validateAction(req.body || {}); if (v.error) return res.status(400).json({ error: v.error });
+  const link = {};
+  if (req.body.post_id) { if (!(await commsOwnedPost(req, req.body.post_id))) return res.status(400).json({ error: 'Unknown post.' }); link.post_id = req.body.post_id; }
+  if (req.body.meeting_id) { const { data: m } = await supabase.from('comm_meetings').select('id, deleted_at').eq('id', req.body.meeting_id).maybeSingle(); if (!m || m.deleted_at) return res.status(400).json({ error: 'Unknown meeting.' }); link.meeting_id = m.id; }
+  const { data, error } = await supabase.from('comm_actions').insert({ ...v.value, ...link, created_by: req.user.id }).select('*').single();
+  if (error) throw error; res.status(201).json({ success: true, action: data });
+}));
+app.put('/api/comms/actions/:id', authenticateToken, commsCan('read'), commsWrap(async (req, res) => {
+  const { data: row, error: rErr } = await supabase.from('comm_actions').select('*').eq('id', req.params.id).maybeSingle();
+  if (rErr) throw rErr; if (!row || row.deleted_at) return res.status(404).json({ error: 'Follow-up not found' });
+  const mine = String(row.created_by) === String(req.user.id) || (req.user.medical_staff_id && String(row.owner_id) === String(req.user.medical_staff_id));
+  if (!mine && !(await commsAllowed(req, 'edit'))) return res.status(403).json({ error: 'Only its owner, its author or an editor can change this.' });
+  const v = Comms.validateAction(req.body || {}, { partial: true }); if (v.error) return res.status(400).json({ error: v.error });
+  let patch = { ...v.value };
+  if (req.body.status !== undefined) { const t = Comms.actionTransition(row, req.body.status, { userId: req.user.id, nowIso: commsNow() }); if (t.error) return res.status(400).json({ error: t.error }); patch = { ...patch, ...t.patch }; }
+  const { data, error } = await supabase.from('comm_actions').update({ ...patch, updated_at: commsNow() }).eq('id', row.id).select('*').single();
+  if (error) throw error; res.json({ success: true, action: data });
+}));
+app.delete('/api/comms/actions/:id', authenticateToken, commsCan('read'), commsWrap(async (req, res) => {
+  const { data: row } = await supabase.from('comm_actions').select('id, created_by, deleted_at').eq('id', req.params.id).maybeSingle();
+  if (!row || row.deleted_at) return res.status(404).json({ error: 'Follow-up not found' });
+  if (String(row.created_by) !== String(req.user.id) && !(await commsAllowed(req, 'edit'))) return res.status(403).json({ error: 'Only its author or an editor can remove this.' });
+  const { error } = await supabase.from('comm_actions').update({ deleted_at: commsNow(), updated_at: commsNow() }).eq('id', row.id);
+  if (error) throw error; res.json({ success: true });
+}));
+
+// ── Agenda ──
+async function commsMeetingFull(id) {
+  const { data: m, error } = await supabase.from('comm_meetings').select('*').eq('id', id).maybeSingle();
+  if (error) throw error; if (!m || m.deleted_at) return null;
+  const [{ data: items }, { data: actions }] = await Promise.all([
+    supabase.from('comm_meeting_items').select('*').eq('meeting_id', id).order('sort'),
+    supabase.from('comm_actions').select('*').eq('meeting_id', id).is('deleted_at', null).order('created_at')
+  ]);
+  const names = await commsStaffNames([m.organizer_id, ...(items || []).map(i => i.presenter_id), ...(actions || []).map(a => a.owner_id)]);
+  const lists = await commsLists(), today = opsToday();
+  const its = (items || []).map(i => ({ ...i, presenter: i.presenter_id ? names[String(i.presenter_id)] || null : i.presenter_name }));
+  const meeting = { ...m, kind_label: lists.labels.meeting_kind[m.kind] || m.kind, organizer_name: m.organizer_id ? names[String(m.organizer_id)] || null : null, link: commsLink('meeting', m.id) };
+  const text = Comms.meetingText(meeting, its, meeting.link);
+  return { meeting, items: Comms.meetingSchedule(m.starts_at, its), actions: (actions || []).map(a => ({ ...a, owner_name: a.owner_id ? names[String(a.owner_id)] || null : null, state: Comms.actionState(a, today) })),
+    share: { text, whatsapp: Comms.whatsappUrl(text) } };
+}
+async function commsSaveItems(meetingId, items) {
+  const { error: dErr } = await supabase.from('comm_meeting_items').delete().eq('meeting_id', meetingId); if (dErr) throw dErr;
+  if (items.length) { const { error } = await supabase.from('comm_meeting_items').insert(items.map(i => ({ ...i, meeting_id: meetingId }))); if (error) throw error; }
+}
+app.get('/api/comms/meetings', authenticateToken, commsCan('read'), apiLimiter, commsWrap(async (req, res) => {
+  const isoOk = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || '')); const today = opsToday();
+  const from = isoOk(req.query.from) ? req.query.from : OpsRoom.addDays(today, -90), to = isoOk(req.query.to) ? req.query.to : OpsRoom.addDays(today, 120);
+  const rows = await opsSoftOrNull(supabase.from('comm_meetings').select('*, items:comm_meeting_items(id)').is('deleted_at', null).gte('starts_at', from + 'T00:00:00Z').lte('starts_at', to + 'T23:59:59Z').order('starts_at').limit(400));
+  const lists = await commsLists(), names = await commsStaffNames((rows || []).map(m => m.organizer_id));
+  res.json({ from, to, migrated: rows !== null, meetings: (rows || []).map(m => ({ ...m, items: undefined, item_count: (m.items || []).length, kind_label: lists.labels.meeting_kind[m.kind] || m.kind, organizer_name: m.organizer_id ? names[String(m.organizer_id)] || null : null, link: commsLink('meeting', m.id) })) });
+}));
+app.get('/api/comms/meetings/:id', authenticateToken, commsCan('read'), apiLimiter, commsWrap(async (req, res) => {
+  const full = await commsMeetingFull(req.params.id); if (!full) return res.status(404).json({ error: 'Meeting not found' }); res.json(full);
+}));
+app.post('/api/comms/meetings', authenticateToken, commsCan('meeting'), commsWrap(async (req, res) => {
+  const lists = await commsLists();
+  const v = Comms.validateMeeting(req.body || {}, { kinds: OpsRoom.activeCodes(lists.cat, 'meeting_kind') }); if (v.error) return res.status(400).json({ error: v.error });
+  const { data, error } = await supabase.from('comm_meetings').insert({ ...v.value, organizer_id: v.value.organizer_id === undefined ? (req.user.medical_staff_id || null) : v.value.organizer_id, created_by: req.user.id }).select('*').single();
+  if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return res.status(409).json({ error: 'Communication needs the CM-1 database update first.' }); throw error; }
+  if (v.items) await commsSaveItems(data.id, v.items);
+  res.status(201).json({ success: true, ...(await commsMeetingFull(data.id)) });
+}));
+app.put('/api/comms/meetings/:id', authenticateToken, commsCan('read'), commsWrap(async (req, res) => {
+  const { data: row } = await supabase.from('comm_meetings').select('id, created_by, organizer_id, deleted_at, kind').eq('id', req.params.id).maybeSingle();
+  if (!row || row.deleted_at) return res.status(404).json({ error: 'Meeting not found' });
+  const mine = String(row.created_by) === String(req.user.id) || (req.user.medical_staff_id && String(row.organizer_id) === String(req.user.medical_staff_id));
+  if (!mine && !(await commsAllowed(req, 'edit'))) return res.status(403).json({ error: 'Only its organiser, its author or an editor can change this meeting.' });
+  const lists = await commsLists();
+  const v = Comms.validateMeeting(req.body || {}, { kinds: [...OpsRoom.activeCodes(lists.cat, 'meeting_kind'), row.kind], partial: true }); if (v.error) return res.status(400).json({ error: v.error });
+  if (Object.keys(v.value).length) { const { error } = await supabase.from('comm_meetings').update({ ...v.value, updated_at: commsNow() }).eq('id', row.id); if (error) throw error; }
+  if (v.items) await commsSaveItems(row.id, v.items);
+  res.json({ success: true, ...(await commsMeetingFull(row.id)) });
+}));
+app.delete('/api/comms/meetings/:id', authenticateToken, commsCan('read'), commsWrap(async (req, res) => {
+  const { data: row } = await supabase.from('comm_meetings').select('id, created_by, organizer_id, deleted_at').eq('id', req.params.id).maybeSingle();
+  if (!row || row.deleted_at) return res.status(404).json({ error: 'Meeting not found' });
+  const mine = String(row.created_by) === String(req.user.id) || (req.user.medical_staff_id && String(row.organizer_id) === String(req.user.medical_staff_id));
+  if (!mine && !(await commsAllowed(req, 'remove'))) return res.status(403).json({ error: 'Only its organiser, its author or an editor can remove this meeting.' });
+  const { error } = await supabase.from('comm_meetings').update({ deleted_at: commsNow(), updated_at: commsNow() }).eq('id', row.id);
+  if (error) throw error; res.json({ success: true });
+}));
+// Put a meeting in the feed (its agenda as text) — shows until the day of the meeting.
+app.post('/api/comms/meetings/:id/announce', authenticateToken, commsCan('post'), commsWrap(async (req, res) => {
+  const full = await commsMeetingFull(req.params.id); if (!full) return res.status(404).json({ error: 'Meeting not found' });
+  const m = full.meeting, content = Comms.meetingText(m, full.items, null).slice(0, 4000);
+  const { data, error } = await supabase.from('department_announcements').insert({ type: 'meeting', title: (m.kind_label ? m.kind_label + ': ' : '') + m.title.slice(0, 80), content, priority_level: 'normal',
+    meeting_id: m.id, audience: m.audience || null, category: 'training', target_audience: 'all_staff', visible_to_roles: ['system_admin', 'department_head', 'medical_resident'],
+    publish_start_date: opsToday(), publish_end_date: String(m.starts_at).slice(0, 10) < opsToday() ? opsToday() : String(m.starts_at).slice(0, 10),
+    created_by: req.user.id, created_by_name: req.user.full_name || 'Staff', created_at: commsNow(), updated_at: commsNow(), announcement_id: generateId('ANN') }).select('*').single();
+  if (error) throw error; res.status(201).json({ success: true, post: data, share: full.share });
+}));
+
+// ── Parte del día ──
+async function commsBriefData(date, row) {
+  const lists = await commsLists(), nowIso = commsNow();
+  const since = OpsRoom.addDays(date, -1) + 'T00:00:00Z', until = date + 'T23:59:59Z';
+  const eq = live => { let q = supabase.from('department_announcements').select('*').eq('type', 'entrada').gte('created_at', since).lte('created_at', until).order('created_at'); return live ? q.is('deleted_at', null) : q; };
+  const [entradas, oncall, absR, unitsOut, icOpen, meetings, actions] = await Promise.all([
+    opsCompat(() => eq(true), () => eq(false)),
+    commsOncall(date),
+    opsSoft(supabase.from('staff_absence_records').select('staff_member_id, start_date, end_date, actual_start_date, actual_return_date, current_status, covering_staff_id, deleted_at').is('deleted_at', null).lte('start_date', date).gte('end_date', date)),
+    opsLoadUnits(null),
+    opsSoft(supabase.from('ops_interconsults').select('priority, status, received_at, answered_at, assigned_to, deleted_at').is('deleted_at', null).in('status', ['received', 'assigned'])),
+    opsSoftOrNull(supabase.from('comm_meetings').select('title, kind, starts_at, location, status, deleted_at').is('deleted_at', null).neq('status', 'cancelled').gte('starts_at', date + 'T00:00:00Z').lte('starts_at', date + 'T23:59:59Z').order('starts_at')),
+    opsSoftOrNull(supabase.from('comm_actions').select('text, owner_id, due_on, status, deleted_at').is('deleted_at', null).eq('status', 'open').order('due_on', { ascending: true, nullsFirst: false }).limit(50))
+  ]);
+  const abs = absR.filter(a => !['cancelled', 'rejected', 'returned'].includes(String(a.current_status || '').toLowerCase()) && !(a.actual_return_date && String(a.actual_return_date).slice(0, 10) <= date));
+  const names = await commsStaffNames([...abs.flatMap(a => [a.staff_member_id, a.covering_staff_id]), ...(actions || []).map(a => a.owner_id)]);
+  const { icTargets } = await opsCatalog();
+  const st = OpsRoom.interconsultStats(icOpen, nowIso, nowIso, icTargets);
+  const callsQ = await opsCompat(() => supabase.from('ops_interconsults').select('id').is('deleted_at', null).neq('channel', 'formal').gte('received_at', date + 'T00:00:00Z').lte('received_at', until), () => supabase.from('ops_interconsults').select('id').limit(0));
+  return Comms.buildDailyBrief({ date, notes: row?.notes || null, sections: row?.sections || null,
+    entradas: entradas.map(p => ({ ...p, source_label: p.source_service ? lists.labels.ic_service[p.source_service] || p.source_service : null, category_label: p.category ? lists.labels.comm_category[p.category] || p.category : null })),
+    oncall, absences: abs.map(a => ({ name: names[String(a.staff_member_id)] || '—', until: String(a.end_date).slice(0, 10), covered_by: a.covering_staff_id ? names[String(a.covering_staff_id)] || null : null })),
+    units: unitsOut.units.map(u => ({ name: u.unit_name, level: u.pulse ? u.pulse.level : 'ok', reasons: u.pulse ? u.pulse.reasons : [] })),
+    interconsults: { waiting: st.waiting, overdue: st.overdue, unassigned: st.unassigned, oldest_waiting_hours: st.oldest_waiting_hours }, calls_today: callsQ.length,
+    meetings: (meetings || []).map(m => ({ ...m, kind_label: lists.labels.meeting_kind[m.kind] || m.kind })),
+    actions: (actions || []).map(a => ({ text: a.text, owner: a.owner_id ? names[String(a.owner_id)] || null : null, due_on: a.due_on, state: Comms.actionState(a, date) })),
+    residents: unitsOut.units.map(u => ({ unit: u.unit_name, names: (u.residents_this_week || []).filter(r => r.start_date <= date && r.end_date >= date).map(r => r.full_name).filter(Boolean) })) });
+}
+const commsBriefDate = q => (/^\d{4}-\d{2}-\d{2}$/.test(String(q || '')) ? q : opsToday());
+app.get('/api/comms/brief', authenticateToken, commsCan('read'), apiLimiter, commsWrap(async (req, res) => {
+  const date = commsBriefDate(req.query.date);
+  const rows = await opsSoftOrNull(supabase.from('comm_daily_briefs').select('*').eq('brief_date', date).limit(1));
+  const row = rows && rows[0] ? rows[0] : null;
+  const live = await commsBriefData(date, row);
+  const shown = row && row.status === 'sent' && String(req.query.live) !== 'true' ? row.snapshot : live;
+  const link = commsLink('brief', date), text = Comms.briefText(shown, link);
+  res.json({ date, migrated: rows !== null, row, brief: shown, live, sections: Comms.BRIEF_SECTIONS, share: { text, whatsapp: Comms.whatsappUrl(text) } });
+}));
+app.put('/api/comms/brief', authenticateToken, commsCan('brief'), commsWrap(async (req, res) => {
+  const date = commsBriefDate(req.body?.date), v = Comms.validateBriefEdit(req.body || {}); if (v.error) return res.status(400).json({ error: v.error });
+  const { data, error } = await supabase.from('comm_daily_briefs').upsert({ brief_date: date, ...v.value, updated_by: req.user.id, updated_at: commsNow() }, { onConflict: 'brief_date' }).select('*').single();
+  if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return res.status(409).json({ error: 'Communication needs the CM-1 database update first.' }); throw error; }
+  res.json({ success: true, row: data });
+}));
+// Send: freeze what the brief says now, post it to the feed (or update the post if sent before).
+app.post('/api/comms/brief/send', authenticateToken, commsCan('brief'), commsWrap(async (req, res) => {
+  const date = commsBriefDate(req.body?.date);
+  const rows = await opsSoftOrNull(supabase.from('comm_daily_briefs').select('*').eq('brief_date', date).limit(1));
+  if (rows === null) return res.status(409).json({ error: 'Communication needs the CM-1 database update first.' });
+  let row = rows[0] || null;
+  const edit = Comms.validateBriefEdit(req.body || {}); if (edit.error) return res.status(400).json({ error: edit.error });
+  const merged = { ...(row || {}), ...edit.value };
+  const brief = await commsBriefData(date, merged), text = Comms.briefText(brief, null);
+  const post = { type: 'parte', title: 'Parte del día · ' + Comms.fmtDay(date), content: text.slice(0, 4000), priority_level: 'normal', brief_date: date, category: 'organisation', updated_at: commsNow() };
+  let postId = row?.post_id || null;
+  if (postId) { const { error } = await supabase.from('department_announcements').update(post).eq('id', postId); if (error) throw error; }
+  else {
+    const { data, error } = await supabase.from('department_announcements').insert({ ...post, target_audience: 'all_staff', visible_to_roles: ['system_admin', 'department_head', 'medical_resident'],
+      publish_start_date: date, publish_end_date: date, created_by: req.user.id, created_by_name: req.user.full_name || 'Staff', created_at: commsNow(), announcement_id: generateId('ANN') }).select('id').single();
+    if (error) throw error; postId = data.id;
+  }
+  const { data: saved, error } = await supabase.from('comm_daily_briefs').upsert({ brief_date: date, ...edit.value, snapshot: brief, status: 'sent', sent_at: commsNow(), sent_by: req.user.id, post_id: postId, updated_by: req.user.id, updated_at: commsNow() }, { onConflict: 'brief_date' }).select('*').single();
+  if (error) throw error;
+  const link = commsLink('brief', date), share = Comms.briefText(brief, link);
+  res.json({ success: true, row: saved, brief, share: { text: share, whatsapp: Comms.whatsappUrl(share) } });
+}));
 
 // ===== 12. LIVE STATUS =====
 app.get('/api/live-status/current', authenticateToken, apiLimiter, async (req, res) => {
@@ -7200,6 +7490,9 @@ app.get('/api/calendar/events', authenticateToken, apiLimiter, async (req, res) 
     (rotations.data || []).forEach(r => events.push({ id: r.id, title: `${r.resident?.full_name || 'Resident'} - ${r.training_unit?.unit_name || 'Unit'}`, start: r.start_date, end: r.end_date, type: 'rotation', status: r.rotation_status, color: r.rotation_status === 'active' ? 'blue' : 'gray' }));
     (oncall.data || []).forEach(s => events.push({ id: s.id, title: `On-call: ${s.primary_physician?.full_name || 'Physician'}`, start: s.duty_date, end: s.duty_date, type: 'oncall', shift_type: s.shift_type, color: s.shift_type === 'primary_call' ? 'red' : 'yellow' }));
     (absences.data || []).forEach(a => events.push({ id: a.id, title: `${a.staff_member?.full_name || 'Staff'} - ${a.absence_reason}`, start: a.start_date, end: a.end_date, type: 'absence', color: a.current_status === 'currently_absent' ? 'red' : 'green' }));
+    // CM-1: meetings and sessions from the agenda (one calendar).
+    const meetings = await opsSoft(supabase.from('comm_meetings').select('id, title, kind, starts_at, ends_at, status, deleted_at').is('deleted_at', null).neq('status', 'cancelled').gte('starts_at', start_date + 'T00:00:00Z').lte('starts_at', end_date + 'T23:59:59Z'));
+    meetings.forEach(m => events.push({ id: m.id, title: m.title, start: String(m.starts_at).slice(0, 10), end: String(m.ends_at || m.starts_at).slice(0, 10), starts_at: m.starts_at, type: 'meeting', kind: m.kind, status: m.status, color: '#7c4dbd' }));
     res.json(events);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch calendar events', message: error.message });

@@ -474,7 +474,8 @@ function computeIndicator(def, data, today, n = 6) {
 /* ── OR-C: catalogues as data ── */
 const CATALOGS = Object.freeze({ ic_service: 'Interconsulta services', ic_reason: 'Interconsulta reasons', ic_priority: 'Interconsulta priorities',
   incident_category: 'Incident categories', roster_role: 'Roles in a unit', device_type: 'Device types',
-  clinical_condition: 'Clinical conditions (breakdowns)', age_band: 'Age bands (breakdowns)', sex: 'Sex (breakdowns)' });
+  clinical_condition: 'Clinical conditions (breakdowns)', age_band: 'Age bands (breakdowns)', sex: 'Sex (breakdowns)',
+  comm_category: 'Communication categories', meeting_kind: 'Meeting kinds (agenda)' });
 const BREAKDOWNS = Object.freeze(['clinical_condition', 'age_band', 'sex']);
 const FIXED_CODES = Object.freeze({ ic_priority: ['urgent', 'preferente', 'ordinary'] });   // logic depends on these: no additions
 const slugCode = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 40);
@@ -484,7 +485,9 @@ function catalogFallback() {
   return { ic_service: IC_SERVICES.map((label, i) => ({ catalog: 'ic_service', code: slugCode(label), label, sort: i + 1, active: true, locked: label === 'Otro servicio', meta: {} })),
     ic_reason: mk('ic_reason', IC_REASONS, ['otro']), ic_priority: mk('ic_priority', IC_PRIORITY, FIXED_CODES.ic_priority),
     incident_category: mk('incident_category', INCIDENT_CATEGORIES, ['other']), roster_role: mk('roster_role', ROLES, ['coordinator']), device_type: [],
-    clinical_condition: [], age_band: [], sex: [] };
+    clinical_condition: [], age_band: [], sex: [],
+    // Communication (CM-1) lists, until the CM-1 migration has run.
+    ...Object.fromEntries(Object.entries(require('./comms.js').COMMS_FALLBACK).map(([cat, rows]) => [cat, rows.map(([code, label, locked], i) => ({ catalog: cat, code, label, sort: i + 1, active: true, locked: !!locked, meta: {} }))])) };
 }
 // rows (from ops_catalog_items) → { catalog: [items sorted] } with fallback for catalogues not in the database yet.
 function catalogFrom(rows) {
