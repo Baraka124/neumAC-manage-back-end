@@ -72,7 +72,7 @@
   function rotationBlockFinding(proposal){
     const start=iso(proposal.start),end=iso(proposal.end); if(!start||!end) return null;
     if((proposal.category||'clinical_rotation')!=='clinical_rotation') return null;
-    const duration=daysInclusive(start,end),sDay=dayOfMonth(start),endOfMonth=monthEnd(end),canonical=sameMonth(start,end)&&start===monthStart(start)&&end===monthEnd(end);
+    const duration=daysInclusive(start,end),sDay=dayOfMonth(start),endOfMonth=monthEnd(end),canonical=start===monthStart(start)&&end===monthEnd(end); // whole calendar months (1, 2, 3…) are standard blocks
     if(canonical) return null;
     const reasons=[]; let severity='advisory';
     if(sDay>=8){severity='warning';reasons.push(`starts on day ${sDay} of the month`)}
