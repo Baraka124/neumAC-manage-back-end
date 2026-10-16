@@ -4307,6 +4307,11 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
       if(!start||!end||end<start) throw Error('Invalid rotation window');
       if(!r.resident_id) throw Error('Missing resident');
       const training_unit_id=await resolveUnit(r);
+      // Supervisor default: explicit → unit's default supervisor → resident coordinator → null.
+      // Resolved BEFORE the review so the decision engine checks the supervisor the row will be saved with.
+      let supervisor=r.supervising_attending_id||null;
+      if(!supervisor && training_unit_id!=='(new)'){ const {data:u}=await supabase.from('training_units').select('default_supervisor_id').eq('id',training_unit_id).maybeSingle(); supervisor=u?.default_supervisor_id||residentManagerId||null; }
+      if(!supervisor) supervisor=residentManagerId||null;
       // Dedup: identical resident + unit + window already present -> skip (idempotent re-import).
       if(training_unit_id!=='(new)'){
         const {data:dupe}=await supabase.from('resident_rotations').select('id')
@@ -4314,15 +4319,12 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
           .eq('start_date',start).eq('end_date',end).is('deleted_at',null).maybeSingle();
         if(dupe){ skipped++; results.push({...tag,status:'skipped',message:'Already imported (same resident, unit and dates).'}); continue; }
         // Overlap/capacity via the shared decision engine (only for real units).
-        const payload={resident_id:r.resident_id, training_unit_id, supervising_attending_id:r.supervising_attending_id||null, start_date:start, end_date:end, rotation_category:r.rotation_category||'clinical_rotation'};
+        const payload={resident_id:r.resident_id, training_unit_id, supervising_attending_id:supervisor, start_date:start, end_date:end, rotation_category:r.rotation_category||'clinical_rotation'};
         const decision=await buildRotationDecision(payload,{action:'assign'});
         const enforcement=await enforceRotationDecision({decision, override:r.decision_override, req, action:'assign'});
         if(!enforcement.ok) throw Error((decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.title).join('; ')||'Scheduling conflict requires review');
       }
       if(dryRun){ ready++; results.push({...tag,status:'ready'}); continue; }
-      // Supervisor default: explicit → unit's default supervisor → resident coordinator → null.
-      let supervisor=r.supervising_attending_id||null;
-      if(!supervisor){ const {data:u}=await supabase.from('training_units').select('default_supervisor_id').eq('id',training_unit_id).maybeSingle(); supervisor=u?.default_supervisor_id||residentManagerId||null; }
       const today=formatDate(new Date());
       const rotation_status = start>today ? 'scheduled' : (end<today ? 'completed' : 'active');
       const provenance=`[Imported ${new Date().toISOString().slice(0,10)} from ${String(req.body.source_file||'rotations Excel').slice(0,120)}${r.source_sheet?` · ${String(r.source_sheet).slice(0,40)}`:''}]`;
