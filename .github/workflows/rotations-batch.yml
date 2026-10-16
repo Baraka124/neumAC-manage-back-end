@@ -1,0 +1,18 @@
+name: Rotations batch import
+on:
+  push:
+    paths: [index.js, tests/rotations-batch.test.cjs, .github/workflows/rotations-batch.yml]
+  pull_request:
+    paths: [index.js, tests/rotations-batch.test.cjs, .github/workflows/rotations-batch.yml]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Syntax check
+        run: node --check index.js
+      - name: Contract — reviewed rotations import (dry-run/commit, unit creation, dedup, supervisor)
+        run: node --test tests/rotations-batch.test.cjs
