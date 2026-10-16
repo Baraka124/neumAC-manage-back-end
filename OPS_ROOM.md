@@ -6,9 +6,14 @@ in `Baraka124/neumAC-manage-Frontend-end`. Read that first.
 Backend quick map:
 - Rules (pure, tested): `ops-room.js` — roster, resources/events, measures, incidents, interconsultas (`IC_*`,
   provisional targets `IC_TARGET_HOURS`), indicator engine (`IND_KINDS`, `periodBounds`, `computeIndicator`).
-- Routes: `index.js`, blocks `PNEUMO OPS ROOM (OR-1)`, `(OR-2)`, `(OR-2b)`, `(OR-3)`; all under `/api/ops/...`.
+- Routes: `index.js`, blocks `PNEUMO OPS ROOM (OR-1)`, `(OR-2)`, `(OR-2b)`, `(OR-3)`, `(OR-C)`, `(OR-R)`; all under `/api/ops/...`.
 - Configuration (OR-C): `ops_catalog_items` + `ops_targets`; loader `opsCatalog()` (30 s cache, `opsCatalogBust()` on writes);
   `targetAt()` = target in force on a date. Interconsulta targets are edited in the Ops Room (Configuración), not in code.
+- Reports + clinical counts (OR-R): `buildUnitReport` / `buildDepartmentReport` / `reportPeriod` (pure); measures may
+  carry ONE breakdown (`clinical_condition` | `age_band` | `sex`, catalogues) → `ops_measurements.breakdown` {code: count};
+  calls from other departments live in `ops_interconsults` with `channel` phone/in_person + `outcome`, logged closed
+  (`callRecord`), excluded from response times and counted by `callStats`. Snapshots in `ops_reports` (block `(OR-R)`,
+  lazy generation of the last complete week/month on first open). `opsCompat()` retries without OR-R columns pre-migration.
 - SQL: `migrations/2026-10-1*_ops_room_*.sql` (idempotent). Run them in Supabase → SQL Editor when the assistant
   cannot write to the database.
 - Tests: `tests/ops-room*.test.cjs` + `tests/boot-smoke.cjs`; CI `.github/workflows/ops-room.yml`.

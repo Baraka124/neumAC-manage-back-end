@@ -4188,6 +4188,13 @@ async function opsCatalog() {
 const opsCatalogBust = () => { opsCatalogCache = { at: 0, value: null }; };
 // OR-2 tables may not exist yet on a database that has not run the OR-2 migration: read them as empty.
 async function opsSoft(query) { const { data, error } = await query; if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return []; throw error; } return data || []; }
+// OR-R columns (breakdown, channel…) may not exist before that migration: retry with the older columns.
+async function opsCompat(withNew, legacy) {
+  const { data, error } = await withNew();
+  if (error && (error.code === '42703' || /column .* does not exist/i.test(error.message || ''))) return opsSoft(legacy());
+  if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return []; throw error; }
+  return data || [];
+}
 const opsUnitOf = async (unitId) => { const { data, error } = await supabase.from('training_units').select('id, ops_enabled, unit_name').eq('id', unitId).maybeSingle(); if (error) throw error; return data; };
 const opsOwned = async (table, id, unitId, cols = '*') => { const { data, error } = await supabase.from(table).select(cols).eq('id', id).maybeSingle(); if (error) throw error; return data && String(data.unit_id) === String(unitId) ? data : null; };
 
@@ -4355,10 +4362,15 @@ app.get('/api/ops/units/:unitId/measures', authenticateToken, Portfolio.read('tr
     const today = opsToday(), isoOk = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
     const to = isoOk(req.query.to) ? req.query.to : today, from = isoOk(req.query.from) ? req.query.from : OpsRoom.addDays(to, -29);
     if (from > to || OpsRoom.daysBetween(from, to) > 400) return res.status(400).json({ error: 'Choose a period of up to 400 days.' });
-    const types = await opsSoft(supabase.from('ops_measure_types').select('id, code, label, kind, sort, active').eq('unit_id', req.params.unitId).order('sort'));
-    const measurements = await opsSoft(supabase.from('ops_measurements').select('id, type_id, measured_on, value, oldest_pending_on, source').eq('unit_id', req.params.unitId)
-      .gte('measured_on', OpsRoom.addDays(from, -370)).lte('measured_on', to).order('measured_on', { ascending: false }).limit(5000));
-    res.json({ today, from, to, types, summary: OpsRoom.summarizeMeasures(types, measurements, from, to) });
+    const tq = cols => supabase.from('ops_measure_types').select(cols).eq('unit_id', req.params.unitId).order('sort');
+    const types = await opsCompat(() => tq('id, code, label, kind, sort, active, breakdown'), () => tq('id, code, label, kind, sort, active'));
+    const mq = cols => supabase.from('ops_measurements').select(cols).eq('unit_id', req.params.unitId)
+      .gte('measured_on', OpsRoom.addDays(from, -370)).lte('measured_on', to).order('measured_on', { ascending: false }).limit(5000);
+    const measurements = await opsCompat(() => mq('id, type_id, measured_on, value, oldest_pending_on, source, breakdown'), () => mq('id, type_id, measured_on, value, oldest_pending_on, source'));
+    const { cat } = await opsCatalog();
+    // Category lists for breakdown measures (counts only — never patient data).
+    const breakdowns = Object.fromEntries(OpsRoom.BREAKDOWNS.map(b => [b, { name: OpsRoom.CATALOGS[b], items: (cat[b] || []).map(i => ({ code: i.code, label: i.label, active: i.active })) }]));
+    res.json({ today, from, to, types, breakdowns, summary: OpsRoom.summarizeMeasures(types, measurements, from, to) });
   } catch (e) { res.status(500).json({ error: 'Failed to load activity', message: e.message }); }
 });
 
@@ -4367,15 +4379,17 @@ app.put('/api/ops/units/:unitId/measures', authenticateToken, Portfolio.write('t
   try {
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
     if (!items.length || items.length > 50) return res.status(400).json({ error: 'Send 1 to 50 values.' });
-    const types = await opsSoft(supabase.from('ops_measure_types').select('id, kind, active, unit_id').eq('unit_id', req.params.unitId));
+    const tq = cols => supabase.from('ops_measure_types').select(cols).eq('unit_id', req.params.unitId);
+    const types = await opsCompat(() => tq('id, kind, active, unit_id, breakdown'), () => tq('id, kind, active, unit_id'));
+    const { cat } = await opsCatalog();
     const today = opsToday(), rows = [];
     for (const it of items) {
       const type = types.find(t => String(t.id) === String(it.type_id));
-      const v = OpsRoom.validateMeasurement(type, it, today);
+      const v = OpsRoom.validateMeasurement(type, it, today, { categories: type?.breakdown ? (cat[type.breakdown] || []).map(i => i.code) : null });
       if (v.error) return res.status(400).json({ error: v.error, type_id: it.type_id || null });
       rows.push({ unit_id: req.params.unitId, type_id: type.id, ...v.value, source: 'manual', entered_by: req.user.id, updated_at: new Date().toISOString() });
     }
-    const { data, error } = await supabase.from('ops_measurements').upsert(rows, { onConflict: 'type_id,measured_on' }).select('id, type_id, measured_on, value, oldest_pending_on');
+    const { data, error } = await supabase.from('ops_measurements').upsert(rows, { onConflict: 'type_id,measured_on' }).select('id, type_id, measured_on, value, oldest_pending_on' + (rows.some(r => r.breakdown) ? ', breakdown' : ''));
     if (error) throw error;
     res.json({ success: true, saved: data.length, items: data });
   } catch (e) { res.status(500).json({ error: 'Failed to save values', message: e.message }); }
@@ -4396,8 +4410,10 @@ app.post('/api/ops/units/:unitId/measure-types', authenticateToken, Portfolio.wr
     const label = String(req.body?.label || '').trim().slice(0, 80), kind = req.body?.kind;
     if (!label) return res.status(400).json({ error: 'A name is required.' });
     if (!['flow', 'stock'].includes(kind)) return res.status(400).json({ error: 'Choose activity (counted per day) or pending (snapshot).' });
+    const breakdown = req.body?.breakdown || null;
+    if (breakdown && !OpsRoom.BREAKDOWNS.includes(breakdown)) return res.status(400).json({ error: 'Break down by condition, age band or sex — or not at all.' });
     const code = importKey(label).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || ('m_' + Date.now());
-    const { data, error } = await supabase.from('ops_measure_types').insert({ unit_id: req.params.unitId, code: code.length < 2 ? code + '_x' : code, label, kind, sort: Number(req.body?.sort) || 50 }).select('*').single();
+    const { data, error } = await supabase.from('ops_measure_types').insert({ unit_id: req.params.unitId, code: code.length < 2 ? code + '_x' : code, label, kind, sort: Number(req.body?.sort) || 50, ...(breakdown ? { breakdown } : {}) }).select('*').single();
     if (error) { if (error.code === '23505') return res.status(409).json({ error: 'This unit already has a measure with that name.' }); throw error; }
     res.status(201).json({ success: true, type: data });
   } catch (e) { res.status(500).json({ error: 'Failed to add measure', message: e.message }); }
@@ -4494,7 +4510,8 @@ app.get('/api/ops/interconsults', authenticateToken, Portfolio.read('training_un
       services: (cat.ic_service || []).map(i => ({ code: i.code, label: i.label, active: i.active })), service_labels: OpsRoom.labelsOf(cat, 'ic_service'),
       reasons: OpsRoom.labelsOf(cat, 'ic_reason'), reasons_active: OpsRoom.activeCodes(cat, 'ic_reason'),
       open: openR.map(clock), recent: recentR.filter(r => r.status === 'closed' || r.status === 'answered' || r.status === 'follow_up').slice(0, 200).map(clock),
-      stats: OpsRoom.interconsultStats(all, nowIso, fromIso, icTargets) });
+      stats: OpsRoom.interconsultStats(all, nowIso, fromIso, icTargets),
+      channels: OpsRoom.IC_CHANNEL, outcomes: OpsRoom.IC_OUTCOME, calls: OpsRoom.callStats(all.map(r => ({ ...r, answered_by: r.answerer?.full_name || r.answered_by })), fromIso, nowIso) });
   } catch (e) { res.status(500).json({ error: 'Failed to load interconsultas', message: e.message }); }
 });
 
@@ -4506,7 +4523,11 @@ app.post('/api/ops/interconsults', authenticateToken, Portfolio.read('training_u
     const v = OpsRoom.validateInterconsult(req.body || {}, nowIso, { services: migrated ? OpsRoom.activeCodes(cat, 'ic_service') : null, reasons: OpsRoom.activeCodes(cat, 'ic_reason') });
     if (v.error) return res.status(400).json({ error: v.error });
     let row = { ...v.value, created_by: req.user.id };
-    if (req.body.take === true && req.user.medical_staff_id) row = { ...row, status: 'assigned', assigned_to: req.user.medical_staff_id, assigned_at: nowIso < row.received_at ? row.received_at : nowIso };
+    if (row.channel && row.channel !== 'formal') {
+      if (!req.user.medical_staff_id && !req.body.staff_id) return res.status(400).json({ error: 'Say who took the call.' });
+      row = OpsRoom.callRecord(row, req.body.staff_id || req.user.medical_staff_id, nowIso);
+    } else delete row.channel;   // database default (works before the OR-R migration)
+    if (row.status !== 'closed' && req.body.take === true && req.user.medical_staff_id) row = { ...row, status: 'assigned', assigned_to: req.user.medical_staff_id, assigned_at: nowIso < row.received_at ? row.received_at : nowIso };
     const { data, error } = await supabase.from('ops_interconsults').insert(row).select(IC_SELECT).single();
     if (error) throw error;
     res.status(201).json({ success: true, interconsult: data });
@@ -4567,21 +4588,23 @@ async function opsIndicatorData(unitIds, indicatorIds) {
     opsSoft(byUnit(supabase.from('ops_measurements').select('type_id, unit_id, measured_on, value, oldest_pending_on')).gte('measured_on', since).limit(20000)),
     opsSoft(byUnit(supabase.from('ops_resources').select('unit_id, kind, calibration_interval_days, next_calibration_due, deleted_at')).is('deleted_at', null)),
     opsSoft(byUnit(supabase.from('ops_incidents').select('unit_id, opened_on, resolved_on, deleted_at')).is('deleted_at', null).or(`resolved_on.is.null,resolved_on.gte.${since}`)),
-    opsSoft(supabase.from('ops_interconsults').select('unit_id, priority, received_at, answered_at, deleted_at').is('deleted_at', null).or(`answered_at.is.null,answered_at.gte.${since}T00:00:00Z`).limit(20000)),
+    opsCompat(() => supabase.from('ops_interconsults').select('unit_id, priority, received_at, answered_at, deleted_at, channel, outcome').is('deleted_at', null).or(`answered_at.is.null,answered_at.gte.${since}T00:00:00Z`).limit(20000),
+      () => supabase.from('ops_interconsults').select('unit_id, priority, received_at, answered_at, deleted_at').is('deleted_at', null).or(`answered_at.is.null,answered_at.gte.${since}T00:00:00Z`).limit(20000)),
     indicatorIds.length ? opsSoft(supabase.from('ops_indicator_values').select('indicator_id, period_start, value, note').in('indicator_id', indicatorIds)) : Promise.resolve([])
   ]);
   const { icTargets } = await opsCatalog();
   const th = indicatorIds.length ? await opsSoftOrNull(supabase.from('ops_targets').select('id, ref, value, direction, valid_from, note, created_at').eq('scope', 'indicator').in('ref', indicatorIds.map(String)).order('valid_from')) : [];
   return { measurements: m, resources: r, incidents: i, interconsults: ic, manualValues: mv, icTargets, targetHistory: th };
 }
-function opsShapeIndicators(defs, data, today, unitIdFilter) {
-  return defs.map(d => {
-    const scoped = { ...data, measurements: data.measurements.filter(x => !d.unit_id || String(x.unit_id) === String(d.unit_id)),
-      resources: data.resources.filter(x => !d.unit_id || String(x.unit_id) === String(d.unit_id)), incidents: data.incidents.filter(x => !d.unit_id || String(x.unit_id) === String(d.unit_id)) };
-    // With the OR-C table, each period is judged with the target in force then; before it, the single target applies.
-    const withHistory = data.targetHistory ? { ...d, targets: data.targetHistory.filter(t => t.ref === String(d.id)) } : d;
-    return { ...withHistory, kind_label: OpsRoom.IND_KINDS[d.kind]?.label || d.kind, result: OpsRoom.computeIndicator(withHistory, scoped, today) };
-  });
+function opsScopeIndicator(d, data) {
+  const own = x => !d.unit_id || String(x.unit_id) === String(d.unit_id);
+  const scoped = { ...data, measurements: data.measurements.filter(own), resources: data.resources.filter(own), incidents: data.incidents.filter(own) };
+  // With the OR-C table, each period is judged with the target in force then; before it, the single target applies.
+  const withHistory = data.targetHistory ? { ...d, targets: data.targetHistory.filter(t => t.ref === String(d.id)) } : d;
+  return { def: withHistory, data: scoped };
+}
+function opsShapeIndicators(defs, data, today) {
+  return defs.map(d => { const s = opsScopeIndicator(d, data); return { ...s.def, kind_label: OpsRoom.IND_KINDS[d.kind]?.label || d.kind, result: OpsRoom.computeIndicator(s.def, s.data, today) }; });
 }
 const IND_SELECT = '*, owner:medical_staff!ops_indicators_owner_id_fkey(id, full_name)';
 
@@ -4743,6 +4766,129 @@ app.post('/api/ops/units/:unitId/indicators/:indId/targets', authenticateToken, 
 app.delete('/api/ops/units/:unitId/indicators/:indId/targets/:targetId', authenticateToken, Portfolio.write('training_units'), opsWrap((req, res) => opsDeleteTarget(req, res, req.params.unitId)));
 app.post('/api/ops/indicators/:indId/targets', authenticateToken, opsDeptOnlyEarly, opsWrap((req, res) => opsAddIndicatorTarget(req, res, null)));
 app.delete('/api/ops/indicators/:indId/targets/:targetId', authenticateToken, opsDeptOnlyEarly, opsWrap((req, res) => opsDeleteTarget(req, res, null)));
+
+// ===== PNEUMO OPS ROOM (OR-R): weekly / monthly reports — unit level + department roll-up =====
+// A report is a fixed snapshot of the period (counts only, never patient data). The last complete week and month
+// are generated the first time someone opens the list; anyone with Units write (unit) or the head of department
+// (department) can regenerate a period on demand. Read: Units read.
+const REPORT_LIST = 'id, scope, unit_id, period, period_start, period_end, generated_at, generated_by';
+const opsReportLabels = cat => ({ incident_category: OpsRoom.labelsOf(cat, 'incident_category'), clinical_condition: OpsRoom.labelsOf(cat, 'clinical_condition'),
+  age_band: OpsRoom.labelsOf(cat, 'age_band'), sex: OpsRoom.labelsOf(cat, 'sex'), ic_service: OpsRoom.labelsOf(cat, 'ic_service') });
+
+async function opsBuildUnitReport(unit, rp) {
+  const today = opsToday(), from = rp.previous.start, to = rp.end;
+  const tq = cols => supabase.from('ops_measure_types').select(cols).eq('unit_id', unit.id).order('sort');
+  const mq = cols => supabase.from('ops_measurements').select(cols).eq('unit_id', unit.id).gte('measured_on', from).lte('measured_on', to).limit(5000);
+  const [types, measurements, incidents, resources, roster, defs] = await Promise.all([
+    opsCompat(() => tq('id, code, label, kind, sort, active, breakdown'), () => tq('id, code, label, kind, sort, active')),
+    opsCompat(() => mq('type_id, measured_on, value, oldest_pending_on, breakdown'), () => mq('type_id, measured_on, value, oldest_pending_on')),
+    opsSoft(supabase.from('ops_incidents').select('category, opened_on, resolved_on, deleted_at').eq('unit_id', unit.id).is('deleted_at', null).lte('opened_on', to).or(`resolved_on.is.null,resolved_on.gte.${from}`)),
+    rp.end >= OpsRoom.addDays(today, -1) ? opsSoft(supabase.from('ops_resources').select('kind, status, next_calibration_due, loan_due_back, deleted_at').eq('unit_id', unit.id).is('deleted_at', null)) : Promise.resolve(null),
+    opsSoft(supabase.from('unit_staff').select('role, assigned_from, assigned_until').eq('unit_id', unit.id).lte('assigned_from', to).or(`assigned_until.is.null,assigned_until.gte.${rp.start}`)),
+    opsSoft(supabase.from('ops_indicators').select('*').eq('unit_id', unit.id).eq('active', true).order('sort'))
+  ]);
+  const data = defs.length ? await opsIndicatorData([unit.id], defs.map(d => d.id)) : null;
+  const { cat } = await opsCatalog();
+  const byRole = roster.reduce((m, r) => { m[r.role] = (m[r.role] || 0) + 1; return m; }, {}), roles = OpsRoom.labelsOf(cat, 'roster_role');
+  return OpsRoom.buildUnitReport(rp, { unit, types, measurements, incidents, resources, today, labels: opsReportLabels(cat),
+    roster: { count: roster.length, by_role: Object.entries(byRole).map(([code, count]) => ({ code, label: roles[code] || code, count })) },
+    indicators: data ? defs.map(d => opsScopeIndicator(d, data)) : [] });
+}
+async function opsBuildDeptReport(rp) {
+  const { units } = await opsLoadUnits(null);
+  const unitReports = [];
+  for (const u of units) unitReports.push(await opsBuildUnitReport({ id: u.id, unit_name: u.unit_name, unit_code: u.unit_code }, rp));
+  const fromIso = rp.previous.start + 'T00:00:00Z', toIso = rp.end + 'T23:59:59Z';
+  const icq = cols => supabase.from('ops_interconsults').select(cols).is('deleted_at', null).or(`and(received_at.gte.${fromIso},received_at.lte.${toIso}),and(answered_at.gte.${fromIso},answered_at.lte.${toIso})`).limit(20000);
+  const interconsults = await opsCompat(() => icq('priority, requesting_service, unit_id, status, received_at, answered_at, closed_at, deleted_at, channel, outcome, duration_min, answerer:medical_staff!ops_interconsults_answered_by_fkey(full_name)'),
+    () => icq('priority, requesting_service, unit_id, status, received_at, answered_at, closed_at, deleted_at'));
+  const defs = await opsSoft(supabase.from('ops_indicators').select('*').is('unit_id', null).eq('active', true).order('sort'));
+  const data = defs.length ? await opsIndicatorData(null, defs.map(d => d.id)) : null;
+  const { cat, icTargets } = await opsCatalog();
+  return OpsRoom.buildDepartmentReport(rp, { unitReports, today: opsToday(), icTargets, labels: opsReportLabels(cat),
+    interconsults: interconsults.map(r => ({ ...r, answered_by: r.answerer?.full_name || null })),
+    indicators: data ? defs.map(d => opsScopeIndicator(d, data)) : [] });
+}
+// Save (insert or replace) the snapshot of one period. Returns null before the OR-R migration.
+async function opsStoreReport(scope, unitId, rp, content, userId) {
+  let q = supabase.from('ops_reports').select('id').eq('scope', scope).eq('period', rp.period).eq('period_start', rp.start);
+  q = unitId ? q.eq('unit_id', unitId) : q.is('unit_id', null);
+  const existing = await opsSoftOrNull(q.limit(1));
+  if (existing === null) return null;
+  const row = { scope, unit_id: unitId || null, period: rp.period, period_start: rp.start, period_end: rp.end, content: { ...content, complete: rp.complete }, generated_at: new Date().toISOString(), generated_by: userId || null };
+  const { data, error } = existing.length ? await supabase.from('ops_reports').update(row).eq('id', existing[0].id).select('*').single() : await supabase.from('ops_reports').insert(row).select('*').single();
+  if (error) { if (error.code === '23505') return opsStoreReport(scope, unitId, rp, content, userId); throw error; }
+  return data;
+}
+async function opsListReports(scope, unit) {
+  const today = opsToday();
+  let q = supabase.from('ops_reports').select(REPORT_LIST).eq('scope', scope);
+  q = unit ? q.eq('unit_id', unit.id) : q.is('unit_id', null);
+  let rows = await opsSoftOrNull(q.order('period_start', { ascending: false }).limit(120));
+  if (rows === null) return { migrated: false, reports: [] };
+  for (const period of ['week', 'month']) {     // lazy: the last complete week and month
+    const rp = OpsRoom.reportPeriod(period, today);
+    if (rows.some(r => r.period === period && String(r.period_start).slice(0, 10) === rp.start)) continue;
+    const content = unit ? await opsBuildUnitReport(unit, rp) : await opsBuildDeptReport(rp);
+    const saved = await opsStoreReport(scope, unit?.id, rp, content, null);
+    if (saved) rows = [{ id: saved.id, scope, unit_id: saved.unit_id, period, period_start: saved.period_start, period_end: saved.period_end, generated_at: saved.generated_at, generated_by: null }, ...rows];
+  }
+  rows.sort((a, b) => (String(a.period_start) < String(b.period_start) ? 1 : -1));
+  return { migrated: true, reports: rows };
+}
+function opsReportPeriodFrom(body, today) {
+  const period = body?.period;
+  if (!['week', 'month'].includes(period)) return { error: 'Choose a week or a month.' };
+  const start = body.period_start ? String(body.period_start).slice(0, 10) : null;
+  if (start) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) return { error: 'Invalid start date.' };
+    const d = new Date(start + 'T12:00:00Z');
+    if (period === 'week' && d.getUTCDay() !== 1) return { error: 'A weekly report starts on a Monday.' };
+    if (period === 'month' && d.getUTCDate() !== 1) return { error: 'A monthly report starts on the 1st.' };
+    if (start > today) return { error: 'That period has not started yet.' };
+    if (start < OpsRoom.addDays(today, -800)) return { error: 'Reports go back about two years.' };
+  }
+  return { value: OpsRoom.reportPeriod(period, today, start) };
+}
+const opsReportOut = r => ({ ...r, period_start: String(r.period_start).slice(0, 10), period_end: String(r.period_end).slice(0, 10) });
+
+app.get('/api/ops/units/:unitId/reports', authenticateToken, Portfolio.read('training_units', { child: true }), apiLimiter, opsWrap(async (req, res) => {
+  const unit = await supabase.from('training_units').select('id, unit_name, unit_code, ops_enabled').eq('id', req.params.unitId).maybeSingle();
+  if (unit.error) throw unit.error;
+  if (!unit.data) return res.status(404).json({ error: 'Unit not found' });
+  const out = await opsListReports('unit', unit.data);
+  res.json({ today: opsToday(), unit: unit.data, ...out, reports: out.reports.map(opsReportOut) });
+}));
+app.get('/api/ops/units/:unitId/reports/:reportId', authenticateToken, Portfolio.read('training_units', { child: true }), apiLimiter, opsWrap(async (req, res) => {
+  const r = await opsSoftOrNull(supabase.from('ops_reports').select('*').eq('id', req.params.reportId).limit(1));
+  if (!r || !r.length || r[0].scope !== 'unit' || String(r[0].unit_id) !== String(req.params.unitId)) return res.status(404).json({ error: 'Report not found' });
+  res.json({ report: opsReportOut(r[0]) });
+}));
+app.post('/api/ops/units/:unitId/reports/generate', authenticateToken, Portfolio.write('training_units'), opsWrap(async (req, res) => {
+  const p = opsReportPeriodFrom(req.body, opsToday()); if (p.error) return res.status(400).json({ error: p.error });
+  const { data: unit, error } = await supabase.from('training_units').select('id, unit_name, unit_code').eq('id', req.params.unitId).maybeSingle();
+  if (error) throw error; if (!unit) return res.status(404).json({ error: 'Unit not found' });
+  const content = await opsBuildUnitReport(unit, p.value);
+  const saved = await opsStoreReport('unit', unit.id, p.value, content, req.user.id);
+  if (!saved) return res.status(409).json({ error: 'Reports need the OR-R database update first.', preview: { ...content, complete: p.value.complete } });
+  res.status(201).json({ success: true, report: opsReportOut(saved) });
+}));
+app.get('/api/ops/reports', authenticateToken, Portfolio.read('training_units'), apiLimiter, opsWrap(async (req, res) => {
+  const out = await opsListReports('department', null);
+  res.json({ today: opsToday(), ...out, reports: out.reports.map(opsReportOut) });
+}));
+app.get('/api/ops/reports/:reportId', authenticateToken, Portfolio.read('training_units'), apiLimiter, opsWrap(async (req, res) => {
+  const r = await opsSoftOrNull(supabase.from('ops_reports').select('*').eq('id', req.params.reportId).limit(1));
+  if (!r || !r.length || r[0].scope !== 'department') return res.status(404).json({ error: 'Report not found' });
+  res.json({ report: opsReportOut(r[0]) });
+}));
+app.post('/api/ops/reports/generate', authenticateToken, opsDeptOnlyEarly, opsWrap(async (req, res) => {
+  const p = opsReportPeriodFrom(req.body, opsToday()); if (p.error) return res.status(400).json({ error: p.error });
+  const content = await opsBuildDeptReport(p.value);
+  const saved = await opsStoreReport('department', null, p.value, content, req.user.id);
+  if (!saved) return res.status(409).json({ error: 'Reports need the OR-R database update first.', preview: { ...content, complete: p.value.complete } });
+  res.status(201).json({ success: true, report: opsReportOut(saved) });
+}));
 
 // Which units does a staff member belong to? (used in staff profile + absence impact)
 app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {
