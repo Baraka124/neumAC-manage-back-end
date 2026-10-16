@@ -1,0 +1,24 @@
+name: Import memory
+on:
+  pull_request:
+    paths:
+      - index.js
+      - tests/import-memory.test.cjs
+      - .github/workflows/import-memory.yml
+  push:
+    branches: [main]
+    paths:
+      - index.js
+      - tests/import-memory.test.cjs
+jobs:
+  memory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: JavaScript syntax
+        run: node --check index.js
+      - name: Import memory guards
+        run: node --test tests/import-memory.test.cjs
