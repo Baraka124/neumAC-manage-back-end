@@ -35,6 +35,9 @@
   const sameMonth=(a,b)=>{const x=date(a),y=date(b);return !!(x&&y&&x.getFullYear()===y.getFullYear()&&x.getMonth()===y.getMonth())};
   const clean=(arr)=>Array.isArray(arr)?arr.filter(Boolean):[];
   const activeStatus=s=>['active','scheduled','extended'].includes(String(s||'').toLowerCase());
+  // A resident physically occupied a unit on every day of any non-cancelled rotation up to its EFFECTIVE end
+  // (terminated early / completed included) — same rule as the DB trigger check_no_overlapping_rotations.
+  const occupiesResident=s=>String(s||'').toLowerCase()!=='cancelled';
   const activeAbsence=a=>!['cancelled','returned_to_duty'].includes(String(a?.current_status||'').toLowerCase());
   const effectiveAbsStart=a=>iso(a?.actual_start_date||a?.start_date);
   const effectiveAbsEnd=a=>iso(a?.actual_return_date||a?.end_date);
@@ -113,7 +116,7 @@
     if(findings.some(f=>f.code==='INVALID_DATE_WINDOW')) return finalize(normalized,findings,input);
 
     const duration=daysInclusive(start,end);
-    const overlaps=rotations.filter(r=>String(r.id)!==String(excludeId||'')&&String(r.resident_id)===String(residentId)&&activeStatus(r.rotation_status)).map(r=>({record:r,window:overlap(start,end,effectiveRotStart(r),effectiveRotEnd(r))})).filter(x=>x.window);
+    const overlaps=rotations.filter(r=>String(r.id)!==String(excludeId||'')&&String(r.resident_id)===String(residentId)&&occupiesResident(r.rotation_status)).map(r=>({record:r,window:overlap(start,end,effectiveRotStart(r),effectiveRotEnd(r))})).filter(x=>x.window);
     for(const x of overlaps){
       const r=x.record,w=x.window,unitName=r.training_unit?.unit_name||r.unit_name||r.training_unit_name||'another clinical unit';
       findings.push(finding('ROTATION_CONCURRENT_PRIMARY','block','Concurrent resident rotation',`${resident?.full_name||'This resident'} already has a ${String(r.rotation_status||'scheduled').replace('_',' ')} rotation in ${unitName} overlapping ${w.days} day${w.days===1?'':'s'}.`,{

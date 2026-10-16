@@ -3,12 +3,15 @@ on:
   pull_request:
     paths:
       - index.js
+      - decision51.js
       - tests/crud-integrity.test.cjs
+      - tests/rotation-overlap-parity.test.cjs
       - .github/workflows/crud-integrity.yml
   push:
     branches: [main]
     paths:
       - index.js
+      - decision51.js
       - tests/crud-integrity.test.cjs
 jobs:
   crud:
@@ -22,3 +25,5 @@ jobs:
         run: node --check index.js
       - name: CRUD integrity guards
         run: node --test tests/crud-integrity.test.cjs
+      - name: Rotation overlap rule matches the database
+        run: node --test tests/rotation-overlap-parity.test.cjs
