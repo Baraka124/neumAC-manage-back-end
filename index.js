@@ -3816,7 +3816,12 @@ app.get('/api/rotations', authenticateToken, apiLimiter, async (req, res) => {
       query = query.eq('resident_id', resident_id);
     }
     if (rotation_status) query = query.eq('rotation_status', rotation_status);
-    else query = query.not('rotation_status', 'in', '(terminated_early,cancelled)');
+    // Default is the OPERATIONAL list: live/upcoming only. Completed rotations are
+    // finished history and must not sit in the active table (the "table stays open"
+    // bug). History is still reachable explicitly via ?rotation_status=completed, or
+    // ?include_completed=true to show everything except cancelled/terminated.
+    else if (req.query.include_completed === 'true') query = query.not('rotation_status', 'in', '(terminated_early,cancelled)');
+    else query = query.not('rotation_status', 'in', '(terminated_early,cancelled,completed)');
     if (training_unit_id) query = query.eq('training_unit_id', training_unit_id);
     if (start_date) query = query.gte('start_date', start_date);
     if (end_date) query = query.lte('end_date', end_date);
@@ -3858,6 +3863,39 @@ app.get('/api/rotations/current', authenticateToken, apiLimiter, async (req, res
     res.json((data || []).filter(item => item.resident !== null).map(item => Projection.projectRotation(item, plan.authority.visibility)));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch current rotations', message: error.message });
+  }
+});
+
+// GET /api/rotations/needs-review
+// Reconciliation surface: rotations still in a live status (scheduled/active/extended)
+// whose planned end has already passed — ended in reality but never closed. These are the
+// records that silently keep a resident "in" a finished rotation. A coordinator confirms
+// the real outcome (complete / terminate with an actual end) rather than the system
+// fabricating a date. Read-only; scoped exactly like rotation.view.
+app.get('/api/rotations/needs-review', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const plan = await resolveCollectionAuthority(req, 'rotation.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'rotation.view', plan.authority);
+    const today = formatDate(new Date());
+    let query = supabase.from('resident_rotations')
+      .select('*, resident:medical_staff!resident_rotations_resident_id_fkey(id, full_name, professional_email, staff_type, specialization, public_photo_url, department_id), training_unit:training_units!resident_rotations_training_unit_id_fkey(id, unit_name, unit_code)')
+      .is('deleted_at', null)
+      .in('rotation_status', ['scheduled','active','extended'])
+      .lt('end_date', today);
+    if (plan.scope === 'own') query = query.eq('resident_id', req.user.medical_staff_id);
+    if (plan.scope === 'department') {
+      const ids = await loadDepartmentStaffIds(req.user.department_id);
+      if (!ids.length) { setProjectionHeaders(res, plan.authority, 'rotation'); return res.json({ data: [], count: 0 }); }
+      query = query.in('resident_id', ids);
+    }
+    const { data, error } = await query.order('end_date');
+    if (error) throw error;
+    const rows = (data || []).filter(item => item.resident !== null)
+      .map(item => ({ ...Projection.projectRotation(item, plan.authority.visibility), review_reason: 'ended_not_closed' }));
+    setProjectionHeaders(res, plan.authority, 'rotation');
+    res.json({ data: rows, count: rows.length });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch rotations needing review', message: error.message });
   }
 });
 
@@ -4831,7 +4869,7 @@ app.get('/api/absence-records/current', authenticateToken, apiLimiter, async (re
     let query = supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
-      `).eq('current_status', 'currently_absent');
+      `).eq('current_status', 'currently_absent').is('actual_return_date', null);
     const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
     if (constrained.empty) {
       setProjectionHeaders(res, plan.authority, 'leave');
@@ -4871,6 +4909,38 @@ app.get('/api/absence-records/upcoming', authenticateToken, apiLimiter, async (r
     res.json({ success: true, data: projected, count: projected.length });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch upcoming absences', message: error.message });
+  }
+});
+
+// GET /api/absence-records/needs-review
+// Reconciliation surface for leave drift, read-only. Two buckets a human must resolve:
+//  • overdue_return — still 'currently_absent' with no actual_return_date though the
+//    planned end has passed (we never assume the person returned on the planned day).
+//  • planned_not_started — still 'planned_leave' though the start date has passed, so the
+//    leave was never activated to 'currently_absent'.
+app.get('/api/absence-records/needs-review', authenticateToken, apiLimiter, async (req, res) => {
+  try {
+    const plan = await resolveCollectionAuthority(req, 'leave.view');
+    if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', plan.authority);
+    const today = formatDate(new Date());
+    let query = supabase.from('staff_absence_records').select(`
+        *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, staff_type, specialization, public_photo_url, department_id),
+        covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
+      `).is('deleted_at', null)
+      .or(`and(current_status.eq.currently_absent,actual_return_date.is.null,end_date.lt.${today}),and(current_status.eq.planned_leave,start_date.lt.${today})`);
+    const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
+    if (constrained.empty) { setProjectionHeaders(res, plan.authority, 'leave'); return res.json({ success: true, data: [], count: 0 }); }
+    query = constrained.query;
+    const { data, error } = await query.order('end_date');
+    if (error) throw error;
+    const rows = (data || []).map(item => ({
+      ...Projection.projectLeave(item, plan.authority.visibility),
+      review_reason: item.current_status === 'currently_absent' ? 'overdue_return' : 'planned_not_started'
+    }));
+    setProjectionHeaders(res, plan.authority, 'leave');
+    res.json({ success: true, data: rows, count: rows.length });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch absences needing review', message: error.message });
   }
 });
 
