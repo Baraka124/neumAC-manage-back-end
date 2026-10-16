@@ -4139,6 +4139,119 @@ app.delete('/api/training-units/:unitId/staff/:staffId', authenticateToken,
   }
 });
 
+// ===== PNEUMO OPS ROOM (OR-1): unit operational profile + roster ("¿Quién está?") =====
+// One unit identity: training_units (ops_enabled + ops_capabilities). Roster = unit_staff with role and dates.
+// Residents are linked from Rotations (this week), never copied into the roster.
+const OpsRoom = require('./ops-room.js');
+const OPS_ROSTER_SELECT = 'id, unit_id, role, assigned_from, assigned_until, staff:medical_staff!unit_staff_staff_id_fkey(id, full_name, staff_type, employment_status)';
+const OPS_UNIT_SELECT = 'id, unit_code, unit_name, unit_type, maximum_residents, location_building, location_floor, ops_capabilities, ops_enabled, unit_status';
+const opsToday = () => formatDate(new Date());
+const opsAdmin = req => ['system_admin', 'department_head'].includes(Authority.normalizeRole(req.user?.user_role || req.user?.role));
+
+async function opsLoadUnits(ids, { history = false } = {}) {
+  const today = opsToday(), weekEnd = OpsRoom.addDays(today, 6);
+  let unitsQ = supabase.from('training_units').select(OPS_UNIT_SELECT).eq('ops_enabled', true).neq('unit_status', 'inactive');
+  if (ids) unitsQ = unitsQ.in('id', ids);
+  const { data: units, error: uErr } = await unitsQ.order('unit_name');
+  if (uErr) throw uErr;
+  const unitIds = (units || []).map(u => u.id);
+  if (!unitIds.length) return { today, units: [] };
+  let rosterQ = supabase.from('unit_staff').select(OPS_ROSTER_SELECT).in('unit_id', unitIds);
+  if (!history) rosterQ = rosterQ.or(`assigned_until.is.null,assigned_until.gte.${today}`);
+  const [rosterR, rotR] = await Promise.all([
+    rosterQ.order('assigned_from', { ascending: false }).limit(history ? 500 : 1000),
+    supabase.from('resident_rotations').select('id, resident_id, training_unit_id, start_date, end_date, actual_start_date, actual_end_date, rotation_status, deleted_at, resident:medical_staff!resident_rotations_resident_id_fkey(full_name)')
+      .is('deleted_at', null).in('training_unit_id', unitIds).neq('rotation_status', 'cancelled').lte('start_date', weekEnd).gte('end_date', today)
+  ]);
+  for (const r of [rosterR, rotR]) if (r.error) throw r.error;
+  return { today, units: units.map(u => OpsRoom.shapeUnit(u, rosterR.data, rotR.data, today)) };
+}
+
+app.get('/api/ops/units', authenticateToken, Portfolio.read('training_units'), apiLimiter, async (req, res) => {
+  try { res.json(await opsLoadUnits(null)); }
+  catch (e) { res.status(500).json({ error: 'Failed to load Ops Room units', message: e.message }); }
+});
+
+app.get('/api/ops/units/:id', authenticateToken, Portfolio.read('training_units', { child: true }), apiLimiter, async (req, res) => {
+  try {
+    const out = await opsLoadUnits([req.params.id], { history: true });
+    if (!out.units.length) return res.status(404).json({ error: 'Unit not found in the Ops Room' });
+    res.json({ today: out.today, unit: out.units[0] });
+  } catch (e) { res.status(500).json({ error: 'Failed to load unit', message: e.message }); }
+});
+
+// Which units appear in the Ops Room and which capabilities they use — head of department / admin.
+app.put('/api/ops/units/:id/profile', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    if (!opsAdmin(req)) return res.status(403).json({ error: 'Forbidden', message: 'Only the head of department or a system administrator can change a unit\'s Ops Room profile.' });
+    const patch = { updated_at: new Date().toISOString() };
+    if (req.body.ops_enabled !== undefined) { if (typeof req.body.ops_enabled !== 'boolean') return res.status(400).json({ error: 'ops_enabled must be boolean' }); patch.ops_enabled = req.body.ops_enabled; }
+    if (req.body.ops_capabilities !== undefined) { const v = OpsRoom.validateCapabilities(req.body.ops_capabilities); if (v.error) return res.status(400).json({ error: v.error }); patch.ops_capabilities = v.value; }
+    const { data, error } = await supabase.from('training_units').update(patch).eq('id', req.params.id).select(OPS_UNIT_SELECT).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Unit not found' });
+    res.json({ success: true, unit: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to update unit profile', message: e.message }); }
+});
+
+// Roster routes sit under the unit (/units/:unitId/staff…) so the Units write guard checks the unit AND
+// the department scope of the person being added (Portfolio treats /staff paths as unit children).
+app.post('/api/ops/units/:unitId/staff', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const today = opsToday();
+    const [{ data: unit, error: uErr }, { data: staff, error: sErr }] = await Promise.all([
+      supabase.from('training_units').select('id, ops_enabled').eq('id', req.params.unitId).maybeSingle(),
+      req.body.staff_id ? supabase.from('medical_staff').select('id, full_name, staff_type, employment_status, deleted_at').eq('id', req.body.staff_id).maybeSingle() : Promise.resolve({ data: null })
+    ]);
+    if (uErr || sErr) throw (uErr || sErr);
+    if (!unit) return res.status(404).json({ error: 'Unit not found' });
+    const v = OpsRoom.validateRosterEntry({ staff, role: req.body.role, assigned_from: req.body.assigned_from, assigned_until: req.body.assigned_until }, today);
+    if (v.error) return res.status(400).json({ error: v.error });
+    const now = new Date().toISOString();
+    const { data, error } = await supabase.from('unit_staff').insert({ unit_id: unit.id, staff_id: staff.id, ...v.value, created_at: now, updated_at: now }).select(OPS_ROSTER_SELECT).single();
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: `${staff.full_name} is already in this unit — change their role or dates instead.` });
+      throw error;
+    }
+    res.status(201).json({ success: true, entry: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to add to unit', message: e.message }); }
+});
+
+app.put('/api/ops/units/:unitId/staff/:entryId', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const { data: row, error: rErr } = await supabase.from('unit_staff').select('id, unit_id, staff_id, role, assigned_from, assigned_until').eq('id', req.params.entryId).maybeSingle();
+    if (rErr) throw rErr;
+    if (!row || String(row.unit_id) !== String(req.params.unitId)) return res.status(404).json({ error: 'Roster entry not found' });
+    const { data: staff, error: sErr } = await supabase.from('medical_staff').select('id, staff_type, employment_status, deleted_at').eq('id', row.staff_id).maybeSingle();
+    if (sErr) throw sErr;
+    const merged = { role: req.body.role ?? row.role, assigned_from: req.body.assigned_from ?? row.assigned_from, assigned_until: req.body.assigned_until === undefined ? row.assigned_until : req.body.assigned_until };
+    // Editing an existing membership must not fail just because the person has since become inactive.
+    const v = OpsRoom.validateRosterEntry({ staff: staff ? { ...staff, employment_status: 'active' } : null, ...merged }, opsToday());
+    if (v.error) return res.status(400).json({ error: v.error });
+    const { data, error } = await supabase.from('unit_staff').update({ ...v.value, updated_at: new Date().toISOString() }).eq('id', row.id).select(OPS_ROSTER_SELECT).single();
+    if (error) { if (error.code === '23505') return res.status(409).json({ error: 'This person already has an active membership in this unit.' }); throw error; }
+    res.json({ success: true, entry: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to update roster entry', message: e.message }); }
+});
+
+// Remove: not started yet → deleted; started → ended today (history kept). ?permanent=true → deleted
+// (head of department / admin only; the row stays in audit_log and can be restored from there).
+app.delete('/api/ops/units/:unitId/staff/:entryId', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const permanent = String(req.query.permanent) === 'true';
+    if (permanent && !opsAdmin(req)) return res.status(403).json({ error: 'Forbidden', message: 'Only the head of department or a system administrator can delete a roster entry permanently.' });
+    const { data: row, error: rErr } = await supabase.from('unit_staff').select('id, unit_id, assigned_from, assigned_until').eq('id', req.params.entryId).maybeSingle();
+    if (rErr) throw rErr;
+    if (!row || String(row.unit_id) !== String(req.params.unitId)) return res.status(404).json({ error: 'Roster entry not found' });
+    const plan = OpsRoom.removalPlan(row, opsToday(), permanent);
+    if (plan.action === 'none') return res.status(409).json({ error: plan.message });
+    if (plan.action === 'delete') { const { error } = await supabase.from('unit_staff').delete().eq('id', row.id); if (error) throw error; return res.json({ success: true, removed: 'deleted' }); }
+    const { error } = await supabase.from('unit_staff').update({ assigned_until: plan.assigned_until, updated_at: new Date().toISOString() }).eq('id', row.id);
+    if (error) throw error;
+    res.json({ success: true, removed: 'ended', assigned_until: plan.assigned_until });
+  } catch (e) { res.status(500).json({ error: 'Failed to remove roster entry', message: e.message }); }
+});
+
 // Which units does a staff member belong to? (used in staff profile + absence impact)
 app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {
   try {
