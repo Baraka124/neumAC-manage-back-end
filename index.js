@@ -4169,8 +4169,24 @@ async function opsLoadUnits(ids, { history = false } = {}) {
     opsSoft(supabase.from('ops_incidents').select('unit_id, status, opened_on, owner_id, deleted_at').in('unit_id', unitIds).is('deleted_at', null).neq('status', 'resolved'))
   ]);
   const { cat } = await opsCatalog();
-  return { today, units: units.map(u => ({ ...OpsRoom.shapeUnit(u, rosterR.data, rotR.data, today, OpsRoom.labelsOf(cat, 'roster_role')),
-    alerts: { resources: OpsRoom.resourceAlerts(resR.filter(r => r.unit_id === u.id), today), incidents: OpsRoom.incidentSummary(incR.filter(i => i.unit_id === u.id), today) } })) };
+  // Interface pass: a status per unit from records it already has. Never blocks the list if it fails.
+  let pulseData = null;
+  try {
+    const [types, meas, defs] = await Promise.all([
+      opsSoft(supabase.from('ops_measure_types').select('id, unit_id, kind, label, active, sort').in('unit_id', unitIds).order('sort')),
+      opsSoft(supabase.from('ops_measurements').select('type_id, unit_id, measured_on, value, oldest_pending_on').in('unit_id', unitIds).gte('measured_on', OpsRoom.addDays(today, -60)).lte('measured_on', today).limit(20000)),
+      opsSoft(supabase.from('ops_indicators').select('*').in('unit_id', unitIds).eq('active', true))
+    ]);
+    const data = defs.length ? await opsIndicatorData(unitIds, defs.map(d => d.id)) : null;
+    pulseData = { types, meas, ind: data ? opsShapeIndicators(defs, data, today) : [] };
+  } catch (e) { console.warn('Ops pulse skipped:', e.message); }
+  return { today, units: units.map(u => {
+    const shaped = OpsRoom.shapeUnit(u, rosterR.data, rotR.data, today, OpsRoom.labelsOf(cat, 'roster_role'));
+    const alerts = { resources: OpsRoom.resourceAlerts(resR.filter(r => r.unit_id === u.id), today), incidents: OpsRoom.incidentSummary(incR.filter(i => i.unit_id === u.id), today) };
+    const pulse = pulseData ? OpsRoom.unitPulse({ unit: shaped, alerts, today, types: pulseData.types.filter(t => t.unit_id === u.id),
+      measurements: pulseData.meas.filter(m => m.unit_id === u.id), indicators: pulseData.ind.filter(i => i.unit_id === u.id) }) : null;
+    return { ...shaped, alerts, pulse };
+  }) };
 }
 // OR-C: catalogues and target history. Read through a short cache; any write clears it.
 // Before the OR-C migration the built-in lists apply (catalogFallback) and the provisional IC targets.

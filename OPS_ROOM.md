@@ -14,6 +14,8 @@ Backend quick map:
   calls from other departments live in `ops_interconsults` with `channel` phone/in_person + `outcome`, logged closed
   (`callRecord`), excluded from response times and counted by `callStats`. Snapshots in `ops_reports` (block `(OR-R)`,
   lazy generation of the last complete week/month on first open). `opsCompat()` retries without OR-R columns pre-migration.
+- Interface pass: `unitPulse()` (pure) gives each unit `level` + `reasons` + activity freshness / pending / objectives;
+  served as `pulse` by `opsLoadUnits` (never blocks the list).
 - SQL: `migrations/2026-10-1*_ops_room_*.sql` (idempotent). Run them in Supabase → SQL Editor when the assistant
   cannot write to the database.
 - Tests: `tests/ops-room*.test.cjs` + `tests/boot-smoke.cjs`; CI `.github/workflows/ops-room.yml`.
