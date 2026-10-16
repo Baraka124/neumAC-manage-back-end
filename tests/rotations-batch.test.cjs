@@ -49,10 +49,12 @@ test('overlap/capacity go through the shared rotation decision engine + trigger 
   assert.match(h, /e\.code==='P0001'/);
 });
 
-test('supervisor is optional: explicit, else unit default, else null (never fabricated)', () => {
+test('supervisor default: explicit → unit default → resident coordinator → null (never fabricated)', () => {
   assert.match(h, /let supervisor=r\.supervising_attending_id\|\|null/);
   assert.match(h, /select\('default_supervisor_id'\)/);
-  assert.match(h, /supervisor=u\?\.default_supervisor_id\|\|null/);
+  assert.match(h, /supervisor=u\?\.default_supervisor_id\|\|residentManagerId\|\|null/);
+  // the coordinator is resolved dynamically from is_resident_manager, not hardcoded
+  assert.match(h, /\.eq\('is_resident_manager',true\)/);
 });
 
 test('status is derived from dates, not trusted from the file', () => {

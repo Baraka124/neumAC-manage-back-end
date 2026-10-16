@@ -4253,6 +4253,14 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
     unitByCode[code]=created.id; createdCodes.add(code); return created.id;
   };
 
+  // Supervisor default for imported rotations: the resident coordinator
+  // (is_resident_manager). Unit-level supervisors stay optional — this gives every
+  // imported stay a real overseer without fabricating a per-rotation attending, and
+  // resolves dynamically (flip the flag when the coordinator changes). Null only if
+  // no coordinator is flagged.
+  let residentManagerId=null;
+  try{ const {data:rm}=await supabase.from('medical_staff').select('id').eq('is_resident_manager',true).is('deleted_at',null).limit(1).maybeSingle(); residentManagerId=rm?.id||null; }catch{}
+
   const results=[]; let inserted=0, skipped=0, ready=0;
   for(const r of rotations){
     const tag={resident_id:r.resident_id||null, start_date:r.start_date||null, end_date:r.end_date||null, unit_code:r.create_unit?.unit_code||null};
@@ -4274,9 +4282,9 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
         if(!enforcement.ok) throw Error((decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.title).join('; ')||'Scheduling conflict requires review');
       }
       if(dryRun){ ready++; results.push({...tag,status:'ready'}); continue; }
-      // Supervisor default: explicit, else the unit's default supervisor, else null (unassigned).
+      // Supervisor default: explicit → unit's default supervisor → resident coordinator → null.
       let supervisor=r.supervising_attending_id||null;
-      if(!supervisor){ const {data:u}=await supabase.from('training_units').select('default_supervisor_id').eq('id',training_unit_id).maybeSingle(); supervisor=u?.default_supervisor_id||null; }
+      if(!supervisor){ const {data:u}=await supabase.from('training_units').select('default_supervisor_id').eq('id',training_unit_id).maybeSingle(); supervisor=u?.default_supervisor_id||residentManagerId||null; }
       const today=formatDate(new Date());
       const rotation_status = start>today ? 'scheduled' : (end<today ? 'completed' : 'active');
       const provenance=`[Imported ${new Date().toISOString().slice(0,10)} from ${String(req.body.source_file||'rotations Excel').slice(0,120)}${r.source_sheet?` · ${String(r.source_sheet).slice(0,40)}`:''}]`;
