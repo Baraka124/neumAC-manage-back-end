@@ -4441,6 +4441,185 @@ app.delete('/api/ops/units/:unitId/incidents/:incidentId', authenticateToken, Po
   } catch (e) { res.status(500).json({ error: 'Failed to remove incident', message: e.message }); }
 });
 
+// ===== PNEUMO OPS ROOM (OR-2b): Interconsultas — department-wide, one record per request, no patient data =====
+// Read: Units read. Log / assign / answer: any signed-in staff member with Units read (it is the clinicians' own
+// operational log). Edit fields / remove: Units write. Permanent delete: head of department / admin.
+const IC_SELECT = '*, assignee:medical_staff!ops_interconsults_assigned_to_fkey(id, full_name), answerer:medical_staff!ops_interconsults_answered_by_fkey(id, full_name)';
+// Run the Units write guard without ending the request (true = allowed).
+const opsUnitsWrite = req => new Promise(resolve => {
+  const fake = { status() { return this; }, json() { resolve(false); }, setHeader() {} };
+  try { Promise.resolve(Portfolio.write('training_units')(req, fake, () => resolve(true))).catch(() => resolve(false)); } catch { resolve(false); }
+});
+
+app.get('/api/ops/interconsults', authenticateToken, Portfolio.read('training_units'), apiLimiter, async (req, res) => {
+  try {
+    const nowIso = new Date().toISOString(), days = Math.min(Math.max(parseInt(req.query.days) || 30, 7), 365);
+    const fromIso = new Date(Date.now() - days * 86400000).toISOString();
+    const [openR, recentR] = await Promise.all([
+      opsSoft(supabase.from('ops_interconsults').select(IC_SELECT).is('deleted_at', null).neq('status', 'closed').order('received_at').limit(500)),
+      opsSoft(supabase.from('ops_interconsults').select(IC_SELECT).is('deleted_at', null).or(`received_at.gte.${fromIso},answered_at.gte.${fromIso}`).order('received_at', { ascending: false }).limit(2000))
+    ]);
+    const all = [...new Map([...openR, ...recentR].map(r => [r.id, r])).values()];
+    const clock = r => ({ ...r, clock: OpsRoom.interconsultClock(r, nowIso) });
+    res.json({ now: nowIso, days, targets: OpsRoom.IC_TARGET_HOURS, priorities: OpsRoom.IC_PRIORITY, statuses: OpsRoom.IC_STATUS, services: OpsRoom.IC_SERVICES, reasons: OpsRoom.IC_REASONS,
+      open: openR.map(clock), recent: recentR.filter(r => r.status === 'closed' || r.status === 'answered' || r.status === 'follow_up').slice(0, 200).map(clock),
+      stats: OpsRoom.interconsultStats(all, nowIso, fromIso) });
+  } catch (e) { res.status(500).json({ error: 'Failed to load interconsultas', message: e.message }); }
+});
+
+app.post('/api/ops/interconsults', authenticateToken, Portfolio.read('training_units'), async (req, res) => {
+  try {
+    if (!req.user.medical_staff_id && !(await opsUnitsWrite(req))) return res.status(403).json({ error: 'Only staff members can log interconsultas.' });
+    const nowIso = new Date().toISOString();
+    const v = OpsRoom.validateInterconsult(req.body || {}, nowIso);
+    if (v.error) return res.status(400).json({ error: v.error });
+    let row = { ...v.value, created_by: req.user.id };
+    if (req.body.take === true && req.user.medical_staff_id) row = { ...row, status: 'assigned', assigned_to: req.user.medical_staff_id, assigned_at: nowIso < row.received_at ? row.received_at : nowIso };
+    const { data, error } = await supabase.from('ops_interconsults').insert(row).select(IC_SELECT).single();
+    if (error) throw error;
+    res.status(201).json({ success: true, interconsult: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to log interconsulta', message: e.message }); }
+});
+
+// assign | answer | follow_up | close | reopen
+app.post('/api/ops/interconsults/:icId/action', authenticateToken, Portfolio.read('training_units'), async (req, res) => {
+  try {
+    const { data: row, error: rErr } = await supabase.from('ops_interconsults').select('*').eq('id', req.params.icId).maybeSingle();
+    if (rErr) throw rErr;
+    if (!row || row.deleted_at) return res.status(404).json({ error: 'Interconsulta not found' });
+    const me = req.user.medical_staff_id || null, action = req.body?.action;
+    const manager = await opsUnitsWrite(req);
+    // Without Units write you can take an unassigned one, and act on the ones assigned to you.
+    const mine = me && (String(row.assigned_to || '') === String(me) || (action === 'assign' && (!req.body.staff_id || String(req.body.staff_id) === String(me)) && !row.assigned_to));
+    if (!manager && !mine) return res.status(403).json({ error: 'Only the assigned clinician or a unit manager can do this.' });
+    const r = OpsRoom.interconsultAction(row, action, { staffId: action === 'assign' ? (req.body.staff_id || me) : me, at: req.body.at, nowIso: new Date().toISOString() });
+    if (r.error) return res.status(400).json({ error: r.error });
+    const { data, error } = await supabase.from('ops_interconsults').update({ ...r.patch, updated_at: new Date().toISOString() }).eq('id', row.id).select(IC_SELECT).single();
+    if (error) throw error;
+    res.json({ success: true, interconsult: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to update interconsulta', message: e.message }); }
+});
+
+app.put('/api/ops/interconsults/:icId', authenticateToken, Portfolio.read('training_units'), async (req, res) => {
+  try {
+    if (!(await opsUnitsWrite(req))) return res.status(403).json({ error: 'Only unit managers can edit an interconsulta.' });
+    const { data: row, error: rErr } = await supabase.from('ops_interconsults').select('id, deleted_at, answered_at').eq('id', req.params.icId).maybeSingle();
+    if (rErr) throw rErr;
+    if (!row || row.deleted_at) return res.status(404).json({ error: 'Interconsulta not found' });
+    const v = OpsRoom.validateInterconsult(req.body || {}, new Date().toISOString(), { partial: true });
+    if (v.error) return res.status(400).json({ error: v.error });
+    if (v.value.received_at && row.answered_at && v.value.received_at > row.answered_at) return res.status(400).json({ error: 'Reception cannot be after the answer.' });
+    const { data, error } = await supabase.from('ops_interconsults').update({ ...v.value, updated_at: new Date().toISOString() }).eq('id', row.id).select(IC_SELECT).single();
+    if (error) throw error;
+    res.json({ success: true, interconsult: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to edit interconsulta', message: e.message }); }
+});
+
+app.delete('/api/ops/interconsults/:icId', authenticateToken, Portfolio.read('training_units'), async (req, res) => {
+  try {
+    const permanent = String(req.query.permanent) === 'true';
+    if (permanent ? !opsAdmin(req) : !(await opsUnitsWrite(req))) return res.status(403).json({ error: 'Forbidden', message: permanent ? 'Only the head of department or a system administrator can delete permanently.' : 'Only unit managers can remove an interconsulta.' });
+    const q = permanent ? supabase.from('ops_interconsults').delete().eq('id', req.params.icId) : supabase.from('ops_interconsults').update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', req.params.icId);
+    const { error } = await q; if (error) throw error;
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to remove interconsulta', message: e.message }); }
+});
+
+// ===== PNEUMO OPS ROOM (OR-3): ¿Cumplimos? — indicators computed from Ops Room records =====
+// Unit indicators: Units read / write on that unit. Department indicators (unit_id null): head of department / admin.
+async function opsIndicatorData(unitIds, indicatorIds) {
+  const since = OpsRoom.addDays(opsToday(), -560);   // covers 6 quarters
+  const byUnit = q => unitIds ? q.in('unit_id', unitIds) : q;
+  const [m, r, i, ic, mv] = await Promise.all([
+    opsSoft(byUnit(supabase.from('ops_measurements').select('type_id, unit_id, measured_on, value, oldest_pending_on')).gte('measured_on', since).limit(20000)),
+    opsSoft(byUnit(supabase.from('ops_resources').select('unit_id, kind, calibration_interval_days, next_calibration_due, deleted_at')).is('deleted_at', null)),
+    opsSoft(byUnit(supabase.from('ops_incidents').select('unit_id, opened_on, resolved_on, deleted_at')).is('deleted_at', null).or(`resolved_on.is.null,resolved_on.gte.${since}`)),
+    opsSoft(supabase.from('ops_interconsults').select('unit_id, priority, received_at, answered_at, deleted_at').is('deleted_at', null).or(`answered_at.is.null,answered_at.gte.${since}T00:00:00Z`).limit(20000)),
+    indicatorIds.length ? opsSoft(supabase.from('ops_indicator_values').select('indicator_id, period_start, value, note').in('indicator_id', indicatorIds)) : Promise.resolve([])
+  ]);
+  return { measurements: m, resources: r, incidents: i, interconsults: ic, manualValues: mv };
+}
+function opsShapeIndicators(defs, data, today, unitIdFilter) {
+  return defs.map(d => {
+    const scoped = { ...data, measurements: data.measurements.filter(x => !d.unit_id || String(x.unit_id) === String(d.unit_id)),
+      resources: data.resources.filter(x => !d.unit_id || String(x.unit_id) === String(d.unit_id)), incidents: data.incidents.filter(x => !d.unit_id || String(x.unit_id) === String(d.unit_id)) };
+    return { ...d, kind_label: OpsRoom.IND_KINDS[d.kind]?.label || d.kind, result: OpsRoom.computeIndicator(d, scoped, today) };
+  });
+}
+const IND_SELECT = '*, owner:medical_staff!ops_indicators_owner_id_fkey(id, full_name)';
+
+app.get('/api/ops/units/:unitId/indicators', authenticateToken, Portfolio.read('training_units', { child: true }), apiLimiter, async (req, res) => {
+  try {
+    const today = opsToday();
+    const defs = await opsSoft(supabase.from('ops_indicators').select(IND_SELECT).eq('unit_id', req.params.unitId).eq('active', true).order('sort').order('created_at'));
+    const types = await opsSoft(supabase.from('ops_measure_types').select('id, code, label, kind, active').eq('unit_id', req.params.unitId).order('sort'));
+    const data = await opsIndicatorData([req.params.unitId], defs.map(d => d.id));
+    res.json({ today, kinds: OpsRoom.IND_KINDS, priorities: OpsRoom.IC_PRIORITY, types, indicators: opsShapeIndicators(defs, data, today) });
+  } catch (e) { res.status(500).json({ error: 'Failed to load indicators', message: e.message }); }
+});
+
+// Department overview: every active indicator (units + department-wide) with its current status.
+app.get('/api/ops/indicators', authenticateToken, Portfolio.read('training_units'), apiLimiter, async (req, res) => {
+  try {
+    const today = opsToday();
+    const defs = await opsSoft(supabase.from('ops_indicators').select(IND_SELECT + ', unit:training_units!ops_indicators_unit_id_fkey(id, unit_name, unit_code)').eq('active', true).order('sort').order('created_at'));
+    const unitIds = [...new Set(defs.map(d => d.unit_id).filter(Boolean))];
+    const data = await opsIndicatorData(unitIds.length ? unitIds : null, defs.map(d => d.id));
+    res.json({ today, kinds: OpsRoom.IND_KINDS, priorities: OpsRoom.IC_PRIORITY, indicators: opsShapeIndicators(defs, data, today) });
+  } catch (e) { res.status(500).json({ error: 'Failed to load indicators', message: e.message }); }
+});
+
+async function opsSaveIndicator(req, res, unitId) {
+  const isNew = !req.params.indId;
+  const v = OpsRoom.validateIndicator(req.body || {}, { unitScoped: !!unitId, partial: !isNew });
+  if (v.error) return res.status(400).json({ error: v.error });
+  if (v.value.params?.type_id) {
+    const { data: t } = await supabase.from('ops_measure_types').select('id, unit_id, kind').eq('id', v.value.params.type_id).maybeSingle();
+    const kind = v.value.kind || req.body.kind;
+    if (!t || String(t.unit_id) !== String(unitId)) return res.status(400).json({ error: 'That measure is not in this unit.' });
+    if (kind === 'measure_total' && t.kind !== 'flow') return res.status(400).json({ error: 'Activity totals need an activity measure.' });
+    if (['stock_latest', 'oldest_pending_days'].includes(kind) && t.kind !== 'stock') return res.status(400).json({ error: 'This indicator needs a pending-work measure.' });
+  }
+  if (isNew) {
+    const { data, error } = await supabase.from('ops_indicators').insert({ ...v.value, unit_id: unitId || null, created_by: req.user.id }).select(IND_SELECT).single();
+    if (error) throw error; return res.status(201).json({ success: true, indicator: data });
+  }
+  const { data: row } = await supabase.from('ops_indicators').select('id, unit_id').eq('id', req.params.indId).maybeSingle();
+  if (!row || String(row.unit_id || '') !== String(unitId || '')) return res.status(404).json({ error: 'Indicator not found' });
+  const { data, error } = await supabase.from('ops_indicators').update({ ...v.value, updated_at: new Date().toISOString() }).eq('id', row.id).select(IND_SELECT).single();
+  if (error) throw error; return res.json({ success: true, indicator: data });
+}
+async function opsSaveIndicatorValue(req, res, unitId) {
+  const { data: row } = await supabase.from('ops_indicators').select('id, unit_id, kind, period').eq('id', req.params.indId).maybeSingle();
+  if (!row || String(row.unit_id || '') !== String(unitId || '')) return res.status(404).json({ error: 'Indicator not found' });
+  if (row.kind !== 'manual') return res.status(400).json({ error: 'This indicator is computed from the records — it has no manual values.' });
+  const ps = String(req.body?.period_start || '').slice(0, 10), v = Number(req.body?.value);
+  const valid = OpsRoom.periodBounds(row.period, opsToday(), 24).some(p => p.start === ps);
+  if (!valid) return res.status(400).json({ error: 'Choose one of the indicator\'s periods.' });
+  if (!Number.isFinite(v) || v < 0) return res.status(400).json({ error: 'The value must be a number from 0.' });
+  const { data, error } = await supabase.from('ops_indicator_values').upsert({ indicator_id: row.id, period_start: ps, value: v, note: req.body?.note ? String(req.body.note).slice(0, 300) : null, entered_by: req.user.id, updated_at: new Date().toISOString() }, { onConflict: 'indicator_id,period_start' }).select('*').single();
+  if (error) throw error; res.json({ success: true, value: data });
+}
+async function opsRemoveIndicator(req, res, unitId) {
+  const permanent = String(req.query.permanent) === 'true';
+  if (permanent && !opsAdmin(req)) return res.status(403).json({ error: 'Forbidden', message: 'Only the head of department or a system administrator can delete permanently.' });
+  const { data: row } = await supabase.from('ops_indicators').select('id, unit_id').eq('id', req.params.indId).maybeSingle();
+  if (!row || String(row.unit_id || '') !== String(unitId || '')) return res.status(404).json({ error: 'Indicator not found' });
+  const q = permanent ? supabase.from('ops_indicators').delete().eq('id', row.id) : supabase.from('ops_indicators').update({ active: false, updated_at: new Date().toISOString() }).eq('id', row.id);
+  const { error } = await q; if (error) throw error; res.json({ success: true });
+}
+const opsWrap = fn => async (req, res) => { try { await fn(req, res); } catch (e) { res.status(500).json({ error: 'Indicator request failed', message: e.message }); } };
+const opsDeptOnly = (req, res, next) => opsAdmin(req) ? next() : res.status(403).json({ error: 'Forbidden', message: 'Department indicators are managed by the head of department or a system administrator.' });
+
+app.post('/api/ops/units/:unitId/indicators', authenticateToken, Portfolio.write('training_units'), opsWrap((req, res) => opsSaveIndicator(req, res, req.params.unitId)));
+app.put('/api/ops/units/:unitId/indicators/:indId', authenticateToken, Portfolio.write('training_units'), opsWrap((req, res) => opsSaveIndicator(req, res, req.params.unitId)));
+app.delete('/api/ops/units/:unitId/indicators/:indId', authenticateToken, Portfolio.write('training_units'), opsWrap((req, res) => opsRemoveIndicator(req, res, req.params.unitId)));
+app.post('/api/ops/units/:unitId/indicators/:indId/values', authenticateToken, Portfolio.write('training_units'), opsWrap((req, res) => opsSaveIndicatorValue(req, res, req.params.unitId)));
+app.post('/api/ops/indicators', authenticateToken, opsDeptOnly, opsWrap((req, res) => opsSaveIndicator(req, res, null)));
+app.put('/api/ops/indicators/:indId', authenticateToken, opsDeptOnly, opsWrap((req, res) => opsSaveIndicator(req, res, null)));
+app.delete('/api/ops/indicators/:indId', authenticateToken, opsDeptOnly, opsWrap((req, res) => opsRemoveIndicator(req, res, null)));
+app.post('/api/ops/indicators/:indId/values', authenticateToken, opsDeptOnly, opsWrap((req, res) => opsSaveIndicatorValue(req, res, null)));
+
 // Which units does a staff member belong to? (used in staff profile + absence impact)
 app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {
   try {
