@@ -3,8 +3,8 @@ on:
   pull_request:
     paths:
       - index.js
-      - import-sync.js
       - tests/import-sync.test.cjs
+      - tests/rotations-batch.test.cjs
       - tests/boot-smoke.cjs
       - package.json
       - package-lock.json
@@ -13,7 +13,6 @@ on:
     branches: [main]
     paths:
       - index.js
-      - import-sync.js
 jobs:
   review:
     runs-on: ubuntu-latest
@@ -23,9 +22,9 @@ jobs:
         with:
           node-version: '22'   # supabase-js 2.117 needs Node 22's native WebSocket (package.json engines)
       - name: JavaScript syntax
-        run: node --check index.js && node --check import-sync.js
-      - name: Import cross-check rules
-        run: node --test tests/import-sync.test.cjs
+        run: node --check index.js
+      - name: Import sync guards
+        run: node --test tests/import-sync.test.cjs tests/rotations-batch.test.cjs
       - name: Install dependencies
         run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Server boots (all routes register)
