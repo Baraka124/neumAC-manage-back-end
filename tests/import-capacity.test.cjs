@@ -50,7 +50,7 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
 const batch = (() => { const a = src.indexOf("app.post('/api/rotations/batch'"); return src.slice(a, src.indexOf('\napp.', a + 10)); })();
 
 test('batch check counts earlier rows of the same file and what they replace', () => {
-  assert.match(batch, /buildRotationDecision\(payload,\{action:'assign',excludeId:replaced\?\.id\|\|null,extra:pending,ignore:\[\.\.\.replacedIds\]\}\)/);
+  assert.match(batch, /buildRotationDecision\(payload,\{action:'assign',excludeId:replaced\?\.id\|\|null,extra:pending,ignore:\[\.\.\.replacedIds\](,context:'import')?\}\)/);
   assert.match(batch, /pending\.push\(\{id:'pending-'/);
   assert.match(src, /state\.rotations=\[\.\.\.\(state\.rotations\|\|\[\]\)\.filter\(r=>!skip\.has\(String\(r\.id\)\)\),\.\.\.extra/);
 });

@@ -126,7 +126,11 @@
       }));
     }
 
-    const blockPattern=rotationBlockFinding({...normalized,start,end,category}); if(blockPattern) findings.push(blockPattern);
+    const blockPattern=rotationBlockFinding({...normalized,start,end,category});
+    // Imports: the file is the department's own plan (split months, a start moved after a recorded
+    // rotation or a full unit). A non-monthly block is reported as context, not an exception to approve.
+    if(blockPattern&&input.context==='import'&&blockPattern.severity==='warning'){blockPattern.severity='advisory';blockPattern.title='Rotation dates differ from the usual monthly block';blockPattern.policy={...blockPattern.policy,overridable:false,reason:'Imported from the department plan; kept as reviewed.'};}
+    if(blockPattern) findings.push(blockPattern);
 
     if(unit){
       const cp=capacityProjection(normalized,unit,rotations,excludeId);
