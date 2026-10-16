@@ -1371,6 +1371,43 @@ function describeAuditRow(row) {
   };
 }
 
+// Research-line links: sync by difference so a failed write never wipes the existing links,
+// and errors surface instead of returning a silent success.
+async function syncResearchLineLinks(table, ownerCol, ownerId, primaryLineId, desired) {
+  const want = [...new Set((desired || []).filter(lid => lid && lid !== primaryLineId).map(String))];
+  const { data: cur, error: curErr } = await supabase.from(table).select('id, research_line_id').eq(ownerCol, ownerId);
+  if (curErr) throw curErr;
+  const have = new Map((cur || []).map(r => [String(r.research_line_id), r.id]));
+  const toAdd = want.filter(l => !have.has(l)).map(l => ({ [ownerCol]: ownerId, research_line_id: l }));
+  const toDrop = [...have.entries()].filter(([l]) => !want.includes(l)).map(([, id]) => id);
+  if (toAdd.length) { const { error } = await supabase.from(table).insert(toAdd); if (error) throw error; }
+  if (toDrop.length) { const { error } = await supabase.from(table).delete().in('id', toDrop); if (error) throw error; }
+}
+// Execution clearance (protocol + ethics): only real columns are written; errors are reported.
+const PROTOCOL_FIELDS = ['protocol_code', 'title', 'version', 'version_date', 'status', 'document_url', 'is_current'];
+const ETHICS_FIELDS = ['required', 'committee_name', 'reference', 'status', 'submission_date', 'decision_date', 'expiry_date', 'document_url', 'notes'];
+const pickFields = (obj, fields) => Object.fromEntries(fields.filter(f => obj && obj[f] !== undefined).map(f => [f, obj[f] === '' ? null : obj[f]]));
+async function saveExecutionClearance(ownerCol, id, protocol, ethics) {
+  let pR = null, eR = null; const now = new Date().toISOString();
+  if (protocol) {
+    const fields = pickFields(protocol, PROTOCOL_FIELDS);
+    const { data: ex, error: exErr } = await supabase.from('research_protocols').select('id').eq(ownerCol, id).eq('is_current', true).maybeSingle();
+    if (exErr) throw exErr;
+    const q = ex ? supabase.from('research_protocols').update({ ...fields, updated_at: now }).eq('id', ex.id)
+                 : supabase.from('research_protocols').insert({ is_current: true, ...fields, [ownerCol]: id });
+    const { data, error } = await q.select().single(); if (error) throw error; pR = data;
+  }
+  if (ethics) {
+    const fields = pickFields(ethics, ETHICS_FIELDS);
+    const { data: ex, error: exErr } = await supabase.from('research_ethics_clearances').select('id').eq(ownerCol, id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+    if (exErr) throw exErr;
+    const q = ex ? supabase.from('research_ethics_clearances').update({ ...fields, updated_at: now }).eq('id', ex.id)
+                 : supabase.from('research_ethics_clearances').insert({ ...fields, [ownerCol]: id });
+    const { data, error } = await q.select().single(); if (error) throw error; eR = data;
+  }
+  return { protocol: pR, ethics: eR };
+}
+
 // ============ AUDIT LOGGING ============
 // req is optional — pass it when available to capture user + IP context
 const auditLog = async (action, resource, resource_id = '', details = {}, req = null) => {
@@ -3600,8 +3637,8 @@ app.get('/api/departments/:id/impact', authenticateToken, checkPermission('depar
         .eq('department_id', deptId).eq('employment_status', 'active'),
       supabase.from('training_units').select('id, unit_name, unit_status')
         .eq('department_id', deptId).eq('unit_status', 'active'),
-      supabase.from('resident_rotations').select('id, rotation_status, training_unit_id, supervisor_id')
-        .eq('rotation_status', 'active')
+      supabase.from('resident_rotations').select('id, rotation_status, training_unit_id, supervising_attending_id')
+        .is('deleted_at', null).in('rotation_status', ['active', 'scheduled', 'extended'])
         .in('training_unit_id',
           (await supabase.from('training_units').select('id').eq('department_id', deptId)).data?.map(u => u.id) || []
         )
@@ -3982,7 +4019,7 @@ app.get('/api/rotations/availability', authenticateToken, apiLimiter, async (req
     // Fetch the unit to get its capacity and enforce department scope.
     const { data: unit, error: unitErr } = await supabase
       .from('training_units')
-      .select('id, unit_name, maximum_residents, current_resident_count, department_id')
+      .select('id, unit_name, maximum_residents, department_id')
       .eq('id', training_unit_id)
       .single()
     if (unitErr) throw unitErr
@@ -4551,6 +4588,30 @@ app.delete('/api/rotations/:id', authenticateToken, checkPermission('resident_ro
     const plannedEnd = formatDate(currentRecord.end_date);
     const existingStatus = currentRecord.rotation_status;
 
+    // Permanent delete (any stage, past included): system admin / head of department only.
+    // The full row stays in audit_log, so it can still be restored from there.
+    if (String(req.query.permanent) === 'true') {
+      if (!['system_admin', 'department_head'].includes(req.user.role)) {
+        return res.status(403).json({ error: 'Forbidden', message: 'Only system administrators and the head of department can permanently delete a rotation.' });
+      }
+      const { error } = await supabase.from('resident_rotations').delete().eq('id', req.params.id);
+      if (error) throw error;
+      return res.json({ message: 'Rotation permanently deleted', rotation_id: currentRecord.rotation_id, permanent: true });
+    }
+
+    // Remove (any stage, past included): hides the record everywhere — including history —
+    // without rewriting its dates. A rotation removed before it ended is marked cancelled so
+    // it never counts in overlap/capacity checks. Restorable via /api/restore.
+    if (req.query.mode === 'remove') {
+      const patch = { deleted_at: recordedAt, updated_at: recordedAt };
+      const ended = ['completed', 'terminated_early', 'cancelled'].includes(existingStatus) || (plannedEnd && plannedEnd < today);
+      if (!ended) patch.rotation_status = 'cancelled';
+      const { data, error } = await supabase.from('resident_rotations').update(patch).eq('id', req.params.id)
+        .select('rotation_id, rotation_status, deleted_at').single();
+      if (error) throw error;
+      return res.json({ message: 'Rotation removed', removed: true, ...data });
+    }
+
     // Not started yet: cancellation is not an early termination and must not
     // manufacture an actual_end_date before the resident ever started.
     if (existingStatus === 'scheduled' || (plannedStart && plannedStart > today)) {
@@ -4979,7 +5040,7 @@ app.get('/api/absence-records', authenticateToken, apiLimiter, async (req, res) 
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, mobile_phone, staff_type, specialization, public_photo_url, department_id),
         recorded_by_user:app_users!staff_absence_records_recorded_by_fkey(id, full_name, email)
-      `, { count: 'exact' });
+      `, { count: 'exact' }).is('deleted_at', null);
     const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
     if (constrained.empty) {
       setProjectionHeaders(res, plan.authority, 'leave');
@@ -5022,7 +5083,7 @@ app.get('/api/absence-records/current', authenticateToken, apiLimiter, async (re
     let query = supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
-      `).eq('current_status', 'currently_absent').is('actual_return_date', null);
+      `).is('deleted_at', null).eq('current_status', 'currently_absent').is('actual_return_date', null);
     const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
     if (constrained.empty) {
       setProjectionHeaders(res, plan.authority, 'leave');
@@ -5048,7 +5109,7 @@ app.get('/api/absence-records/upcoming', authenticateToken, apiLimiter, async (r
     let query = supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
-      `).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek);
+      `).is('deleted_at', null).eq('current_status', 'planned_leave').gte('start_date', today).lte('start_date', nextWeek);
     const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
     if (constrained.empty) {
       setProjectionHeaders(res, plan.authority, 'leave');
@@ -5110,7 +5171,7 @@ app.get('/api/absence-records/staff/:staffId', authenticateToken, apiLimiter, as
     const { data, error, count } = await supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
-      `, { count: 'exact' })
+      `, { count: 'exact' }).is('deleted_at', null)
       .eq('staff_member_id', req.params.staffId).order('start_date', { ascending: false }).range(offset, offset + limit - 1);
     if (error) throw error;
     const projected = (data || []).map(item => Projection.projectLeave(item, authority.visibility));
@@ -5128,7 +5189,7 @@ app.get('/api/absence-records/dashboard/stats', authenticateToken, apiLimiter, a
     const today = formatDate(new Date());
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     let query = supabase.from('staff_absence_records')
-      .select('staff_member_id,current_status,coverage_arranged,absence_type,absence_reason,start_date');
+      .select('staff_member_id,current_status,coverage_arranged,absence_type,absence_reason,start_date').is('deleted_at', null);
     const constrained = await constrainQueryByStaffScope(query, req, plan, 'staff_member_id');
     let rows = [];
     if (!constrained.empty) {
@@ -5269,9 +5330,10 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
 
     await recordOperationalDecisionEvent({decision,req,domain:'staff_absence',action:'record',subjectId:dataSource.staff_member_id,recordId:data.id,status:'committed',override:enforcement.override});
 
-    // Generate recurring instances in background
+    // Generate recurring instances before responding, so a failure reaches the user.
+    let recurringCreated = 0, recurringWarning = null;
     if (absenceData.is_recurring && absenceData.recurrence_pattern && absenceData.recurrence_end_date) {
-      setImmediate(async () => {
+      await (async () => {
         try {
           const instances = [];
           let cursor = new Date(startDateStr);
@@ -5306,11 +5368,12 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
             cursor = advance(cursor);
           }
           if (instances.length > 0) {
-            await supabase.from('staff_absence_records').insert(instances);
-            console.log(`✅ Generated ${instances.length} recurring instances for absence ${data.id}`);
+            const { error: recErr } = await supabase.from('staff_absence_records').insert(instances);
+            if (recErr) throw recErr;
+            recurringCreated = instances.length;
           }
-        } catch (e) { console.warn('Recurring absence generation failed (non-fatal):', e.message); }
-      });
+        } catch (e) { console.warn('Recurring absence generation failed:', e.message); recurringWarning = 'The first absence was saved, but its repeats could not be created: ' + e.message; }
+      })();
     }
 
     console.log('✅ Absence record created:', data.id);
@@ -5329,7 +5392,7 @@ app.post('/api/absence-records', authenticateToken, checkPermission('staff_absen
         );
       });
     }
-    res.status(201).json({ success: true, data, message: 'Absence record created successfully' });
+    res.status(201).json({ success: true, data, message: recurringWarning || 'Absence record created successfully', recurring_created: recurringCreated, ...(recurringWarning ? { warning: recurringWarning } : {}) });
 
     // Flag has_conflict on any oncall shifts that overlap this absence
     setImmediate(async () => {
@@ -5492,6 +5555,15 @@ app.delete('/api/absence-records/:id', authenticateToken, checkPermission('staff
       if (fetchError.code === 'PGRST116') return res.status(404).json({ error: 'Absence record not found' });
       throw fetchError;
     }
+    // Remove (any stage, past included): hide the record everywhere without rewriting its
+    // status — a returned absence stays 'returned_to_duty' in the audit trail. Restorable.
+    if (req.query.mode === 'remove') {
+      const nowIso = new Date().toISOString();
+      const { data, error } = await supabase.from('staff_absence_records')
+        .update({ deleted_at: nowIso, last_updated: nowIso }).eq('id', req.params.id).select('id, current_status, deleted_at').single();
+      if (error) throw error;
+      return res.json({ success: true, removed: true, data, message: 'Absence record removed' });
+    }
     const cancelNote = `[CANCELLED: ${new Date().toISOString()}] Cancelled by ${req.user.full_name || req.user.email || 'system'}`;
     const { data, error } = await supabase.from('staff_absence_records').update({
       current_status: 'cancelled',
@@ -5644,6 +5716,10 @@ app.post('/api/live-status', authenticateToken, apiLimiter, async (req, res) => 
     const { status_text, author_id, expires_in_hours = 8 } = req.body;
     if (!status_text?.trim()) return res.status(400).json({ error: 'Validation failed', message: 'Status text is required' });
     if (!author_id) return res.status(400).json({ error: 'Validation failed', message: 'Author ID is required' });
+    const statusManager = ['system_admin', 'department_head', 'coordinator'].includes(Authority.normalizeRole(req.user.role));
+    if (!statusManager && String(author_id) !== String(req.user.medical_staff_id || '')) {
+      return res.status(403).json({ error: 'Forbidden', message: 'You can only post a clinical status in your own name.' });
+    }
     const { data: author, error: authorError } = await supabase.from('medical_staff').select('id, full_name, department_id').eq('id', author_id).single();
     if (authorError || !author) return res.status(400).json({ error: 'Invalid author', message: 'Selected author not found in medical staff' });
     const expiresAt = new Date(Date.now() + expires_in_hours * 60 * 60 * 1000);
@@ -5689,6 +5765,12 @@ app.put('/api/live-status/:id', authenticateToken, checkPermission('communicatio
 
 app.delete('/api/live-status/:id', authenticateToken, apiLimiter, async (req, res) => {
   try {
+    const statusManager = ['system_admin', 'department_head', 'coordinator'].includes(Authority.normalizeRole(req.user.role));
+    if (!statusManager) {
+      const { data: st } = await supabase.from('clinical_status_updates').select('author_id').eq('id', req.params.id).maybeSingle();
+      if (!st) return res.status(404).json({ error: 'Clinical status not found' });
+      if (String(st.author_id) !== String(req.user.medical_staff_id || '')) return res.status(403).json({ error: 'Forbidden', message: 'You can only clear your own clinical status.' });
+    }
     const { error } = await supabase.from('clinical_status_updates').update({ is_active: false }).eq('id', req.params.id);
     if (error) throw error;
     res.json({ success: true, message: 'Clinical status cleared' });
@@ -5886,14 +5968,37 @@ app.post('/api/upload/staff-photo', authenticateToken, checkPermission('medical_
   }
 });
 
-app.post('/api/attachments/upload', authenticateToken, checkPermission('attachments', 'create'), upload.single('file'), async (req, res) => {
+// Attachments live in the private 'attachments' storage bucket (survives redeploys; the
+// server's local disk does not). Rows store the bucket path in file_url; reads return
+// short-lived signed links.
+const ATTACHMENT_BUCKET = 'attachments';
+const attachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // matches the bucket limit
+  fileFilter: (req, file, cb) => {
+    const ok = /\.(pdf|png|jpe?g|webp|gif|docx?|xlsx?|pptx?|csv|txt)$/i.test(file.originalname || '');
+    cb(ok ? null : new Error('File type not allowed'), ok);
+  }
+});
+const signAttachment = async (row) => {
+  if (!row?.file_url) return row;
+  const { data } = await supabase.storage.from(ATTACHMENT_BUCKET).createSignedUrl(row.file_url, 3600);
+  return { ...row, url: data?.signedUrl || null };
+};
+app.post('/api/attachments/upload', authenticateToken, checkPermission('attachments', 'create'), attachmentUpload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const { entity_type, entity_id, description } = req.body;
-    const attachmentData = { filename: req.file.filename, original_filename: req.file.originalname, file_path: `/uploads/${req.file.filename}`, file_size: req.file.size, mime_type: req.file.mimetype, entity_type, entity_id, description: description || '', uploaded_by: req.user.id, uploaded_at: new Date().toISOString() };
-    const { data, error } = await supabase.from('attachments').insert([attachmentData]).select().single();
-    if (error) throw error;
-    res.status(201).json({ message: 'File uploaded successfully', attachment: data });
+    const { entity_type, entity_id } = req.body;
+    if (!entity_type || !/^[0-9a-f-]{36}$/i.test(String(entity_id || ''))) return res.status(400).json({ error: 'entity_type and a valid entity_id are required' });
+    const ext = path.extname(req.file.originalname || '').toLowerCase().slice(0, 10);
+    const objectPath = `${String(entity_type).replace(/[^a-z0-9_-]/gi, '')}/${entity_id}/${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`;
+    const { error: upErr } = await supabase.storage.from(ATTACHMENT_BUCKET).upload(objectPath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
+    if (upErr) throw upErr;
+    const row = { entity_type, entity_id, file_name: String(req.file.originalname || 'archivo').slice(0, 255), file_url: objectPath,
+      file_size: req.file.size, mime_type: req.file.mimetype, uploaded_by: req.user.id, uploaded_at: new Date().toISOString() };
+    const { data, error } = await supabase.from('attachments').insert([row]).select().single();
+    if (error) { await supabase.storage.from(ATTACHMENT_BUCKET).remove([objectPath]); throw error; }
+    res.status(201).json({ message: 'File uploaded successfully', attachment: await signAttachment(data) });
   } catch (error) {
     res.status(500).json({ error: 'Failed to upload file', message: error.message });
   }
@@ -5903,7 +6008,7 @@ app.get('/api/attachments/entity/:entityType/:entityId', authenticateToken, apiL
   try {
     const { data, error } = await supabase.from('attachments').select('*').eq('entity_type', req.params.entityType).eq('entity_id', req.params.entityId).order('uploaded_at', { ascending: false });
     if (error) throw error;
-    res.json(data || []);
+    res.json(await Promise.all((data || []).map(signAttachment)));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch attachments', message: error.message });
   }
@@ -5911,14 +6016,12 @@ app.get('/api/attachments/entity/:entityType/:entityId', authenticateToken, apiL
 
 app.delete('/api/attachments/:id', authenticateToken, checkPermission('attachments', 'delete'), apiLimiter, async (req, res) => {
   try {
-    const { data: attachment, error: fetchError } = await supabase.from('attachments').select('file_path').eq('id', req.params.id).single();
+    const { data: attachment, error: fetchError } = await supabase.from('attachments').select('id, file_url').eq('id', req.params.id).maybeSingle();
     if (fetchError) throw fetchError;
-    if (attachment.file_path) {
-      const filePath = path.join(__dirname, attachment.file_path);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    }
+    if (!attachment) return res.status(404).json({ error: 'Attachment not found' });
     const { error } = await supabase.from('attachments').delete().eq('id', req.params.id);
     if (error) throw error;
+    if (attachment.file_url) await supabase.storage.from(ATTACHMENT_BUCKET).remove([attachment.file_url]);
     res.json({ message: 'Attachment deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete attachment', message: error.message });
@@ -6582,10 +6685,7 @@ app.post('/api/clinical-trials', authenticateToken, Portfolio.write('clinical_tr
     if (error) throw error;
 
     if (Array.isArray(additional_line_ids) && additional_line_ids.length) {
-      const rows = additional_line_ids
-        .filter(lid => lid && lid !== data.research_line_id)
-        .map(lid => ({ clinical_trial_id: data.id, research_line_id: lid }));
-      if (rows.length) await supabase.from('clinical_trial_lines').insert(rows);
+      await syncResearchLineLinks('clinical_trial_lines', 'clinical_trial_id', data.id, data.research_line_id, additional_line_ids);
     }
 
     res.status(201).json({ success: true, data, message: 'Clinical study created successfully' });
@@ -6668,11 +6768,7 @@ app.put('/api/clinical-trials/:id', authenticateToken, Portfolio.write('clinical
     // Additional lines this trial spans, beyond its primary research_line_id.
     // Frontend sends the full desired set each save; sync by replacing.
     if (Array.isArray(b.additional_line_ids)) {
-      await supabase.from('clinical_trial_lines').delete().eq('clinical_trial_id', req.params.id);
-      const rows = b.additional_line_ids
-        .filter(lid => lid && lid !== data.research_line_id)
-        .map(lid => ({ clinical_trial_id: req.params.id, research_line_id: lid }));
-      if (rows.length) await supabase.from('clinical_trial_lines').insert(rows);
+      await syncResearchLineLinks('clinical_trial_lines', 'clinical_trial_id', req.params.id, data.research_line_id, b.additional_line_ids);
     }
     const { data: additionalLines } = await supabase
       .from('clinical_trial_lines')
@@ -6786,10 +6882,7 @@ app.post('/api/innovation-projects', authenticateToken, Portfolio.write('innovat
     if (error) throw error;
 
     if (Array.isArray(additional_line_ids) && additional_line_ids.length) {
-      const rows = additional_line_ids
-        .filter(lid => lid && lid !== data.research_line_id)
-        .map(lid => ({ innovation_project_id: data.id, research_line_id: lid }));
-      if (rows.length) await supabase.from('innovation_project_lines').insert(rows);
+      await syncResearchLineLinks('innovation_project_lines', 'innovation_project_id', data.id, data.research_line_id, additional_line_ids);
     }
 
     res.status(201).json({ data, message: 'Innovation project created successfully' });
@@ -6865,11 +6958,7 @@ app.put('/api/innovation-projects/:id', authenticateToken, Portfolio.write('inno
     }
 
     if (Array.isArray(b.additional_line_ids)) {
-      await supabase.from('innovation_project_lines').delete().eq('innovation_project_id', req.params.id);
-      const rows = b.additional_line_ids
-        .filter(lid => lid && lid !== data.research_line_id)
-        .map(lid => ({ innovation_project_id: req.params.id, research_line_id: lid }));
-      if (rows.length) await supabase.from('innovation_project_lines').insert(rows);
+      await syncResearchLineLinks('innovation_project_lines', 'innovation_project_id', req.params.id, data.research_line_id, b.additional_line_ids);
     }
     const { data: additionalLines } = await supabase
       .from('innovation_project_lines')
@@ -7075,7 +7164,7 @@ app.get('/api/hospitals/:id', authenticateToken, apiLimiter, async (req, res) =>
 });
 
 // Any authenticated user can register a new hospital (inline from staff form)
-app.post('/api/hospitals', authenticateToken, apiLimiter, async (req, res) => {
+app.post('/api/hospitals', authenticateToken, checkPermission('departments', 'create'), apiLimiter, async (req, res) => {
   try {
     const { name, code, city, region = 'Galicia', address, type, network_type, parent_complex } = req.body;
     if (!name) return res.status(400).json({ error: 'Hospital name is required' });
@@ -7571,8 +7660,9 @@ app.get('/api/notifications', authenticateToken, apiLimiter, async (req, res) =>
 // PUT /api/notifications/:id/read — mark one as read
 app.put('/api/notifications/:id/read', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    await supabase.from('notifications').update({ read: true })
+    const { error } = await supabase.from('notifications').update({ read: true })
       .eq('id', req.params.id).eq('user_id', req.user.id)
+    if (error) throw error
     res.json({ success: true })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
@@ -7580,8 +7670,9 @@ app.put('/api/notifications/:id/read', authenticateToken, apiLimiter, async (req
 // PUT /api/notifications/read-all — mark all as read
 app.put('/api/notifications/read-all', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    await supabase.from('notifications').update({ read: true })
+    const { error } = await supabase.from('notifications').update({ read: true })
       .eq('user_id', req.user.id).eq('read', false)
+    if (error) throw error
     res.json({ success: true })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
@@ -7589,10 +7680,11 @@ app.put('/api/notifications/read-all', authenticateToken, apiLimiter, async (req
 // Internal helper — create a notification for a user (called from other routes)
 const createNotification = async (userId, title, message, type = 'info', link = null, actionView = null) => {
   try {
-    await supabase.from('notifications').insert({
+    const { error } = await supabase.from('notifications').insert({
       user_id: userId, title, message, type, read: false,
       link, action_view: actionView, created_at: new Date().toISOString()
     })
+    if (error) throw error
   } catch (e) { console.error('createNotification failed:', e.message) }
 }
 
@@ -7698,9 +7790,23 @@ app.put('/api/restore/:table/:id', authenticateToken, isAdmin, apiLimiter, async
     const { table, id } = req.params
     if (!ALLOWED.includes(table)) return res.status(400).json({ error: 'Table not restorable' })
     if(table==='news_posts')await Portfolio.authorize({...req,body:{},params:{id},path:'/api/news/'+id},'news_posts')
-    const { error } = await supabase.from(table).update({ deleted_at: null }).eq('id', id)
-    if (error) throw error
-    res.json({ success: true, table, id })
+    const { data: live, error: liveErr } = await supabase.from(table).select('id').eq('id', id).maybeSingle()
+    if (liveErr) throw liveErr
+    if (live) {
+      const { error } = await supabase.from(table).update({ deleted_at: null }).eq('id', id)
+      if (error) throw error
+      return res.json({ success: true, table, id })
+    }
+    // Hard-deleted (guardias, permanently deleted rotations): rebuild from the last audit snapshot.
+    const { data: snap, error: snapErr } = await supabase.from('audit_log').select('old_data')
+      .eq('table_name', table).eq('record_id', id).eq('action', 'DELETE')
+      .order('changed_at', { ascending: false }).limit(1).maybeSingle()
+    if (snapErr) throw snapErr
+    if (!snap?.old_data) return res.status(404).json({ error: 'Nothing to restore', message: 'No deleted copy of this record was found in the audit trail.' })
+    const row = { ...snap.old_data, deleted_at: null }
+    const { error: insErr } = await supabase.from(table).insert(row)
+    if (insErr) return res.status(409).json({ error: 'Restore conflict', message: insErr.message })
+    res.json({ success: true, table, id, restored_from: 'audit_log' })
   } catch (e) { res.status(e.status||500).json({error:e.status?e.message:'Restore failed'}) }
 })
 
@@ -8496,6 +8602,9 @@ app.post('/api/brain', authenticateToken, apiLimiter, async (req, res) => {
   try {
     const b = req.body || {};
     const allowed = ['pattern', 'synonym', 'phrasing', 'failed_query'];
+    if (b.kind !== 'failed_query' && !['system_admin', 'department_head'].includes(Authority.normalizeRole(req.user.role))) {
+      return res.status(403).json({ error: 'Admin access required', message: 'Only administrators can curate the Grounded knowledge base.' });
+    }
     if (!allowed.includes(b.kind)) {
       return res.status(400).json({ error: 'Invalid kind', message: 'kind must be one of ' + allowed.join(', ') });
     }
@@ -8535,7 +8644,7 @@ app.post('/api/brain', authenticateToken, apiLimiter, async (req, res) => {
 
 // PUT /api/brain/:id — edit a row (toggle enabled, fix content/intent, promote a
 // failed_query into a taught pattern, etc.).
-app.put('/api/brain/:id', authenticateToken, apiLimiter, async (req, res) => {
+app.put('/api/brain/:id', authenticateToken, isAdmin, apiLimiter, async (req, res) => {
   try {
     const patch = { updated_at: new Date().toISOString() };
     ['kind', 'intent', 'content', 'meta', 'enabled'].forEach(k => {
@@ -8558,7 +8667,7 @@ app.put('/api/brain/:id', authenticateToken, apiLimiter, async (req, res) => {
 });
 
 // DELETE /api/brain/:id
-app.delete('/api/brain/:id', authenticateToken, apiLimiter, async (req, res) => {
+app.delete('/api/brain/:id', authenticateToken, isAdmin, apiLimiter, async (req, res) => {
   try {
     const { error } = await supabase.from('neumdesk_brain').delete().eq('id', req.params.id);
     if (error) throw error;
@@ -8579,12 +8688,9 @@ app.get('/api/clinical-trials/:id/execution-clearance', authenticateToken, Portf
 })
 app.put('/api/clinical-trials/:id/execution-clearance', authenticateToken, Portfolio.write('clinical_trials'), async (req, res) => {
   try {
-    const { id } = req.params; const { protocol, ethics } = req.body
-    let pR = null, eR = null
-    if (protocol) { for(const key of ['id','clinical_trial_id','innovation_project_id','created_at']) delete protocol[key]; const { data: ex } = await supabase.from('research_protocols').select('id').eq('clinical_trial_id', id).eq('is_current', true).maybeSingle(); if (ex) { const { data } = await supabase.from('research_protocols').update({ ...protocol, updated_at: new Date().toISOString() }).eq('id', ex.id).select().single(); pR = data } else { const { data } = await supabase.from('research_protocols').insert({ ...protocol, clinical_trial_id: id }).select().single(); pR = data } }
-    if (ethics) { for(const key of ['id','clinical_trial_id','innovation_project_id','created_at']) delete ethics[key]; const { data: ex } = await supabase.from('research_ethics_clearances').select('id').eq('clinical_trial_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle(); if (ex) { const { data } = await supabase.from('research_ethics_clearances').update({ ...ethics, updated_at: new Date().toISOString() }).eq('id', ex.id).select().single(); eR = data } else { const { data } = await supabase.from('research_ethics_clearances').insert({ ...ethics, clinical_trial_id: id }).select().single(); eR = data } }
-    res.json({ protocol: pR, ethics: eR })
-  } catch (e) { res.status(500).json({ error: e.message }) }
+    const { protocol, ethics } = req.body || {}
+    res.json(await saveExecutionClearance('clinical_trial_id', req.params.id, protocol, ethics))
+  } catch (e) { res.status(500).json({ error: 'Failed to save execution clearance', message: e.message }) }
 })
 app.get('/api/innovation-projects/:id/execution-clearance', authenticateToken, Portfolio.read('innovation_projects',{child:true}), async (req, res) => {
   try {
@@ -8596,12 +8702,9 @@ app.get('/api/innovation-projects/:id/execution-clearance', authenticateToken, P
 })
 app.put('/api/innovation-projects/:id/execution-clearance', authenticateToken, Portfolio.write('innovation_projects'), async (req, res) => {
   try {
-    const { id } = req.params; const { protocol, ethics } = req.body
-    let pR = null, eR = null
-    if (protocol) { for(const key of ['id','clinical_trial_id','innovation_project_id','created_at']) delete protocol[key]; const { data: ex } = await supabase.from('research_protocols').select('id').eq('innovation_project_id', id).eq('is_current', true).maybeSingle(); if (ex) { const { data } = await supabase.from('research_protocols').update({ ...protocol, updated_at: new Date().toISOString() }).eq('id', ex.id).select().single(); pR = data } else { const { data } = await supabase.from('research_protocols').insert({ ...protocol, innovation_project_id: id }).select().single(); pR = data } }
-    if (ethics) { for(const key of ['id','clinical_trial_id','innovation_project_id','created_at']) delete ethics[key]; const { data: ex } = await supabase.from('research_ethics_clearances').select('id').eq('innovation_project_id', id).order('created_at', { ascending: false }).limit(1).maybeSingle(); if (ex) { const { data } = await supabase.from('research_ethics_clearances').update({ ...ethics, updated_at: new Date().toISOString() }).eq('id', ex.id).select().single(); eR = data } else { const { data } = await supabase.from('research_ethics_clearances').insert({ ...ethics, innovation_project_id: id }).select().single(); eR = data } }
-    res.json({ protocol: pR, ethics: eR })
-  } catch (e) { res.status(500).json({ error: e.message }) }
+    const { protocol, ethics } = req.body || {}
+    res.json(await saveExecutionClearance('innovation_project_id', req.params.id, protocol, ethics))
+  } catch (e) { res.status(500).json({ error: 'Failed to save execution clearance', message: e.message }) }
 })
 
 // ═══════════════════ GROUNDED PERSISTENCE ═══════════════════
@@ -8781,7 +8884,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 // The agent reads this on login and folds it over its embedded defaults.
 
 // ── Test notification endpoint ───────────────────────────────────────────
-app.post('/api/notify/test', authenticateToken, async (req, res) => {
+app.post('/api/notify/test', authenticateToken, isAdmin, async (req, res) => {
   try {
     await sendNotification(
       'neumDesk notification test',
