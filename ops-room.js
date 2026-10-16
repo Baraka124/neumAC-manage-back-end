@@ -602,3 +602,32 @@ function buildDepartmentReport(rp, data) {
 Object.assign(module.exports, { IC_CHANNEL, IC_OUTCOME, callRecord, callStats, BREAKDOWNS, sumBreakdowns, reportPeriod, buildUnitReport, buildDepartmentReport, targetAt, CATALOGS, FIXED_CODES, slugCode, catalogFallback, catalogFrom, activeCodes, labelsOf, validateCatalogItem, validateTargetEntry, icTargetFn,
   IC_PRIORITY, IC_TARGET_HOURS, IC_STATUS, IC_SERVICES, IC_REASONS, validateInterconsult, interconsultAction, interconsultStats, interconsultClock,
   IND_KINDS, validateIndicator, periodBounds, indicatorValue, computeIndicator, median, hoursBetween });
+
+/* ── Interface pass: one status per unit, from records it already has (no new data) ── */
+// level: 'alert' (act now) | 'watch' (look today) | 'ok'; reasons are short, countable, in order of urgency.
+function unitPulse({ unit, alerts, types = [], measurements = [], indicators = [], today, staleDays = 7 }) {
+  const caps = unit?.capabilities || [], has = c => caps.includes(c), reasons = [];
+  const live = (types || []).filter(t => t.active !== false), ids = t => String(t.id);
+  const ofType = t => (measurements || []).filter(m => String(m.type_id) === ids(t)).sort((a, b) => (iso(a.measured_on) < iso(b.measured_on) ? 1 : -1));
+  const flows = live.filter(t => t.kind === 'flow'), stocks = live.filter(t => t.kind === 'stock');
+  const flowDates = flows.flatMap(t => ofType(t).map(m => iso(m.measured_on))).sort();
+  const last = flowDates.length ? flowDates[flowDates.length - 1] : null;
+  const activity = { measures: flows.length, last_recorded_on: last, days_since: last ? daysBetween(last, today) : null };
+  const pending = stocks.map(t => { const l = ofType(t)[0]; return { label: t.label, value: l ? l.value : null, date: l ? iso(l.measured_on) : null, oldest_days: l && l.oldest_pending_on ? daysBetween(l.oldest_pending_on, l.measured_on) : null }; });
+  const st = s => (indicators || []).filter(i => i.result?.status === s).length;
+  const ind = { total: (indicators || []).length, met: st('met'), not_met: st('not_met'), no_data: st('no_data'), no_target: st('no_target') };
+  const r = alerts?.resources || {}, inc = alerts?.incidents || {};
+  const push = (level, text) => reasons.push({ level, text });
+  if (r.out_of_service) push('alert', `${r.out_of_service} out of service`);
+  if (r.calibration_overdue) push('alert', `${r.calibration_overdue} calibration overdue`);
+  if (r.loans_overdue) push('alert', `${r.loans_overdue} loan overdue`);
+  if (ind.not_met) push('alert', `${ind.not_met} objective${ind.not_met === 1 ? '' : 's'} not met`);
+  if (inc.open) push(inc.oldest_open_days > staleDays ? 'alert' : 'watch', `${inc.open} open incident${inc.open === 1 ? '' : 's'}${inc.oldest_open_days > staleDays ? ` (oldest ${inc.oldest_open_days} d)` : ''}`);
+  if (inc.unowned) push('watch', `${inc.unowned} incident${inc.unowned === 1 ? '' : 's'} without owner`);
+  if (r.calibration_soon) push('watch', `${r.calibration_soon} calibration due soon`);
+  if (has('activity') && flows.length && (activity.days_since === null || activity.days_since > staleDays)) push('watch', activity.days_since === null ? 'No activity recorded yet' : `Activity not recorded for ${activity.days_since} d`);
+  if (has('roster') && unit && unit.roster && !unit.roster.current.length) push('watch', 'Nobody in the team');
+  const level = reasons.some(x => x.level === 'alert') ? 'alert' : reasons.length ? 'watch' : 'ok';
+  return { level, reasons, activity, pending, indicators: ind };
+}
+Object.assign(module.exports, { unitPulse });
