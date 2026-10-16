@@ -4195,13 +4195,13 @@ const loadRotationDecisionState = async ({residentId,unitId,supervisorId,start,e
 
 // extra / ignore (imports): rows of the same file already accepted in this check count as if saved,
 // and rotations those rows replace no longer count — so the check mirrors the sequential commit.
-const buildRotationDecision = async (payload, {excludeId=null,action='assign',extra=[],ignore=[]}={}) => {
+const buildRotationDecision = async (payload, {excludeId=null,action='assign',extra=[],ignore=[],context=null}={}) => {
   const start=formatDate(payload.start_date), end=formatDate(payload.end_date);
   const state=await loadRotationDecisionState({residentId:payload.resident_id,unitId:payload.training_unit_id,supervisorId:payload.supervising_attending_id,start,end,excludeId});
   if(extra.length||ignore.length){ const skip=new Set(ignore.map(String)); state.rotations=[...(state.rotations||[]).filter(r=>!skip.has(String(r.id))),...extra.filter(r=>r.start_date<=end&&r.end_date>=start)]; }
   return Decision51.reviewRotation({
     proposal:{residentId:payload.resident_id,unitId:payload.training_unit_id,supervisorId:payload.supervising_attending_id,start,end,excludeId,category:payload.rotation_category||'clinical_rotation'},
-    ...state, action,
+    ...state, action, context,
     sourceState:{staff:'authoritative',units:'authoritative',rotations:'authoritative',leave:'authoritative',oncall:'authoritative'}
   });
 };
@@ -4622,6 +4622,7 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
   const pending=[], replacedIds=new Set();     // dry run: rows of this file already accepted, and what they replace
   for(const r of rotations){
     const tag={resident_id:r.resident_id||null, start_date:r.start_date||null, end_date:r.end_date||null, unit_code:r.create_unit?.unit_code||null};
+    let rowNotes=[];
     try{
       const start=formatDate(r.start_date), end=formatDate(r.end_date);
       if(!start||!end||end<start) throw Error('Invalid rotation window');
@@ -4651,11 +4652,12 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
         if(dupe){ skipped++; results.push({...tag,status:'skipped',message:'Already imported (same resident, unit and dates).'}); continue; }
         // Overlap/capacity via the shared decision engine (only for real units).
         const payload={resident_id:r.resident_id, training_unit_id, supervising_attending_id:supervisor, start_date:start, end_date:end, rotation_category:r.rotation_category||'clinical_rotation'};
-        const decision=await buildRotationDecision(payload,{action:'assign',excludeId:replaced?.id||null,extra:pending,ignore:[...replacedIds]});
+        const decision=await buildRotationDecision(payload,{action:'assign',excludeId:replaced?.id||null,extra:pending,ignore:[...replacedIds],context:'import'});
+        rowNotes=(decision.findings||[]).filter(f=>f.severity==='advisory').map(f=>f.summary||f.title).slice(0,3);
         const enforcement=await enforceRotationDecision({decision, override:r.decision_override, req, action:'assign'});
         if(!enforcement.ok){ const err=Error((decision.findings||[]).filter(f=>f.severity==='warning'||f.severity==='block').map(f=>f.title).join('; ')||'Scheduling conflict requires review'); err.decision=decision; err.payload=payload; throw err; }
       }
-      if(dryRun){ ready++; results.push({...tag,status:'ready',...(replaced?{replaces:replaced.id}:{})});
+      if(dryRun){ ready++; results.push({...tag,status:'ready',...(replaced?{replaces:replaced.id}:{}),...(rowNotes.length?{notes:rowNotes}:{})});
         if(training_unit_id!=='(new)') pending.push({id:'pending-'+pending.length,resident_id:r.resident_id,training_unit_id,start_date:start,end_date:end,rotation_status:'scheduled',training_unit:{unit_name:'(this file)'}});
         if(replaced) replacedIds.add(replaced.id);
         continue; }

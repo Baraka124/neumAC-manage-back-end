@@ -40,3 +40,18 @@ test('the decision loader no longer drops terminated/completed rotations', () =>
   const a = src.indexOf('const loadRotationDecisionState'), b = src.indexOf('};', a);
   assert.match(src.slice(a, b), /\.is\('deleted_at', null\)\.neq\('rotation_status','cancelled'\)/);
 });
+
+test('imports: a non-monthly block (moved start, split month) is advisory, not an exception to approve', () => {
+  const d0 = D.reviewRotation({ ...base, rotations: [], proposal: { residentId: 'res', unitId: 'uci2', supervisorId: 'sup', start: '2026-10-15', end: '2026-10-31', category: 'clinical_rotation' } });
+  const f0 = d0.findings.find(f => f.code === 'ROTATION_NON_STANDARD_BLOCK');
+  assert.equal(f0.severity, 'warning'); assert.equal(d0.requiresOverride, true);             // hand-entered: still needs review
+  const d1 = D.reviewRotation({ ...base, context: 'import', rotations: [], proposal: { residentId: 'res', unitId: 'uci2', supervisorId: 'sup', start: '2026-10-15', end: '2026-10-31', category: 'clinical_rotation' } });
+  const f1 = d1.findings.find(f => f.code === 'ROTATION_NON_STANDARD_BLOCK');
+  assert.equal(f1.severity, 'advisory'); assert.equal(d1.requiresOverride, false); assert.equal(d1.canCommit, true);
+});
+
+test('the import batch reviews with context import and returns advisory notes', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  assert.match(src, /extra:pending,ignore:\[\.\.\.replacedIds\],context:'import'\}\)/);
+  assert.match(src, /\.\.\.\(rowNotes\.length\?\{notes:rowNotes\}:\{\}\)/);
+});

@@ -44,7 +44,7 @@ test('idempotent: an identical resident+unit+window is skipped, not duplicated',
 });
 
 test('overlap/capacity go through the shared rotation decision engine + trigger backstop', () => {
-  assert.match(h, /buildRotationDecision\(payload,\{action:'assign'(,excludeId:replaced\?\.id\|\|null)?(,extra:pending,ignore:\[\.\.\.replacedIds\])?\}\)/);   // replaced row excluded; earlier rows of the file count
+  assert.match(h, /buildRotationDecision\(payload,\{action:'assign'(,excludeId:replaced\?\.id\|\|null)?(,extra:pending,ignore:\[\.\.\.replacedIds\](,context:'import')?)?\}\)/);   // replaced row excluded; earlier rows of the file count
   assert.match(h, /enforceRotationDecision\(\{decision, override:r\.decision_override, req, action:'assign'\}\)/);
   assert.match(h, /e\.code==='P0001'/);
 });
