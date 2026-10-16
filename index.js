@@ -54,6 +54,7 @@ const crypto = require('crypto');
 const Decision51 = require('./decision51.js');
 const Authority = require('./authority.js');
 const Projection = require('./projection.js');
+const ImportReview = require('./import-review.js');
 require('dotenv').config();
 
 // ── Notification system (Resend API — free, no extra npm install) ────────
@@ -4455,6 +4456,50 @@ app.put('/api/import-layouts/:type', authenticateToken, importAuthority(req => I
     if (error) throw error;
     res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Failed to save import layout', message: e.message }); }
+});
+
+// ===== IMPORT CROSS-CHECKS (Phase C) =====
+// POST /api/imports/review { kind:'oncall'|'rotations', rows:[...] } — read-only. Reviews the whole
+// selected import against what neumDesk holds (rest, workload, coverage, external rotations, in-file
+// overlaps, training gaps) and returns per-row findings plus an impact summary. Never writes.
+app.post('/api/imports/review', authenticateToken, importAuthority(req => ({ oncall: 'sync.oncall.commit', rotations: 'sync.rotations.commit' })[req.body?.kind]), apiLimiter, async (req, res) => {
+  try {
+    const kind = req.body.kind, rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+    if (!rows.length || rows.length > 1000) return res.status(400).json({ error: 'Provide 1 to 1000 rows.' });
+    const today = formatDate(new Date());
+    const isoOk = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
+    if (kind === 'oncall') {
+      const proposed = rows.filter(r => isoOk(r.duty_date)).map((r, i) => ({ key: String(r.key ?? i), duty_date: r.duty_date,
+        primary_physician_id: r.primary_physician_id || null, resident_physician_id: r.resident_physician_id || null, shift_type: r.shift_type || null }));
+      if (!proposed.length) return res.status(400).json({ error: 'No valid dates.' });
+      const dates = proposed.map(r => r.duty_date).sort(), from = dates[0], to = dates[dates.length - 1];
+      const day = (d, n) => { const x = new Date(d + 'T12:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
+      const mirs = [...new Set(proposed.map(r => r.resident_physician_id).filter(Boolean))];
+      const [oncallR, rotR, staffR] = await Promise.all([
+        supabase.from('oncall_schedule').select('duty_date, primary_physician_id, resident_physician_id, deleted_at').is('deleted_at', null)
+          .gte('duty_date', day(from.slice(0, 8) + '01', -1)).lte('duty_date', day(to, 31)),
+        mirs.length ? supabase.from('resident_rotations').select('resident_id, start_date, end_date, actual_end_date, rotation_status, unit:training_units!resident_rotations_training_unit_id_fkey(unit_code, unit_name)')
+          .is('deleted_at', null).in('resident_id', mirs).lte('start_date', to).gte('end_date', from) : Promise.resolve({ data: [] }),
+        supabase.from('medical_staff').select('id, full_name').is('deleted_at', null)
+      ]);
+      for (const r of [oncallR, rotR, staffR]) if (r.error) throw r.error;
+      return res.json(ImportReview.reviewImport({ kind, today, proposed, staff: staffR.data, existing: { oncall: oncallR.data, rotations: rotR.data } }));
+    }
+    if (kind === 'rotations') {
+      const proposed = rows.filter(r => r.resident_id && isoOk(r.start_date) && isoOk(r.end_date)).map((r, i) => ({ key: String(r.key ?? i),
+        resident_id: r.resident_id, training_unit_id: r.training_unit_id || null, start_date: r.start_date, end_date: r.end_date }));
+      if (!proposed.length) return res.status(400).json({ error: 'No valid rotations.' });
+      const ids = [...new Set(proposed.map(r => r.resident_id))];
+      const [rotR, staffR, unitR] = await Promise.all([
+        supabase.from('resident_rotations').select('resident_id, start_date, end_date, actual_end_date, rotation_status').is('deleted_at', null).in('resident_id', ids),
+        supabase.from('medical_staff').select('id, full_name').in('id', ids),
+        supabase.from('training_units').select('id, unit_name, unit_code')
+      ]);
+      for (const r of [rotR, staffR, unitR]) if (r.error) throw r.error;
+      return res.json(ImportReview.reviewImport({ kind, today, proposed, staff: staffR.data, units: unitR.data, existing: { rotations: rotR.data } }));
+    }
+    res.status(400).json({ error: 'Unknown import kind' });
+  } catch (e) { res.status(500).json({ error: 'Failed to review import', message: e.message }); }
 });
 
 // POST /api/rotations/batch — reviewed bulk import of the MIR rotations matrix.
