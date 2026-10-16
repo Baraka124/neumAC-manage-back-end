@@ -79,3 +79,144 @@ function shapeUnit(unit, roster, rotations, today) {
 }
 
 module.exports = { CAPABILITIES, ROLES, validateCapabilities, validateRosterEntry, rosterState, removalPlan, residentsThisWeek, shapeUnit, addDays };
+
+/* ── OR-2: resources (+ history), measures (activity flows / pending stocks), incidents ── */
+const RESOURCE_KINDS = Object.freeze({ room: 'Room', bed: 'Bed', device: 'Device' });
+const RESOURCE_STATUS = Object.freeze({ available: 'Available', in_use: 'In use', out_of_service: 'Out of service', maintenance: 'Maintenance', lent: 'Lent out' });
+const INCIDENT_CATEGORIES = Object.freeze({ equipment: 'Equipment', room: 'Room / space', cancellation: 'Cancellation', staffing: 'Staffing', supplies: 'Supplies', other: 'Other' });
+const INCIDENT_STATUS = Object.freeze({ open: 'Open', in_progress: 'In progress', resolved: 'Resolved' });
+const str = (v, max) => { if (v === undefined || v === null) return null; const s = String(v).trim(); return s ? s.slice(0, max) : null; };
+const daysBetween = (a, b) => Math.round((Date.parse(iso(b) + 'T12:00:00Z') - Date.parse(iso(a) + 'T12:00:00Z')) / 86400000);
+
+// Create / edit a resource. Calibration interval drives next_calibration_due when a calibration is recorded.
+function validateResource(body, { partial = false } = {}) {
+  const out = {};
+  if (!partial || body.kind !== undefined) { if (!RESOURCE_KINDS[body.kind]) return { error: 'Kind must be room, bed or device.' }; out.kind = body.kind; }
+  if (!partial || body.name !== undefined) { const n = str(body.name, 120); if (!n) return { error: 'A name is required.' }; out.name = n; }
+  for (const [k, max] of [['identifier', 80], ['location', 120], ['notes', 500]]) if (body[k] !== undefined) out[k] = str(body[k], max);
+  if (body.calibration_interval_days !== undefined) {
+    const d = body.calibration_interval_days === null || body.calibration_interval_days === '' ? null : Number(body.calibration_interval_days);
+    if (d !== null && (!Number.isInteger(d) || d < 1 || d > 3650)) return { error: 'Calibration interval must be 1–3650 days.' };
+    out.calibration_interval_days = d;
+  }
+  if (body.next_calibration_due !== undefined) { if (body.next_calibration_due && !isIso(body.next_calibration_due)) return { error: 'Invalid calibration date.' }; out.next_calibration_due = body.next_calibration_due || null; }
+  return { value: out };
+}
+
+// Apply an event to a resource → { patch (resource columns), event (history row) } or { error }.
+function applyResourceEvent(resource, ev, today) {
+  const type = ev.event_type, on = ev.event_on ? iso(ev.event_on) : today, note = str(ev.note, 500);
+  if (!isIso(on)) return { error: 'Invalid date.' };
+  if (on > today) return { error: 'Events are recorded on or before today.' };
+  const base = { event_type: type, event_on: on, note, from_status: resource.status, to_status: resource.status };
+  switch (type) {
+    case 'status': {
+      if (!RESOURCE_STATUS[ev.to_status] || ev.to_status === 'lent') return { error: 'Choose available, in use, out of service or maintenance (use "Lend" for loans).' };
+      if (resource.status === 'lent') return { error: 'This device is lent out — record its return first.' };
+      return { patch: { status: ev.to_status }, event: { ...base, to_status: ev.to_status } };
+    }
+    case 'calibration': {
+      const next = ev.next_due ? iso(ev.next_due) : (resource.calibration_interval_days ? addDays(on, resource.calibration_interval_days) : null);
+      if (next && (!isIso(next) || next <= on)) return { error: 'The next calibration must be after the calibration date.' };
+      return { patch: { last_calibrated_on: on, next_calibration_due: next }, event: { ...base, due_on: next } };
+    }
+    case 'maintenance': return { patch: {}, event: base };
+    case 'loan_out': {
+      if (resource.kind !== 'device') return { error: 'Only devices can be lent.' };
+      if (resource.status === 'lent') return { error: 'This device is already lent out.' };
+      if (['out_of_service', 'maintenance'].includes(resource.status)) return { error: 'This device is not available to lend.' };
+      const due = ev.due_on ? iso(ev.due_on) : null;
+      if (!due || !isIso(due) || due < on) return { error: 'Set the date it is due back (on or after today).' };
+      return { patch: { status: 'lent', loan_due_back: due }, event: { ...base, to_status: 'lent', due_on: due } };
+    }
+    case 'loan_return': {
+      if (resource.status !== 'lent') return { error: 'This device is not lent out.' };
+      return { patch: { status: 'available', loan_due_back: null }, event: { ...base, to_status: 'available' } };
+    }
+    case 'note': if (!note) return { error: 'Write the note.' }; return { patch: {}, event: base };
+    default: return { error: 'Unknown event.' };
+  }
+}
+
+// Alerts a unit card / resource list needs (computed, never stored).
+function resourceAlerts(resources, today, soonDays = 14) {
+  const soon = addDays(today, soonDays), live = (resources || []).filter(r => !r.deleted_at);
+  return {
+    total: live.length,
+    out_of_service: live.filter(r => ['out_of_service', 'maintenance'].includes(r.status)).length,
+    calibration_overdue: live.filter(r => r.next_calibration_due && iso(r.next_calibration_due) < today).length,
+    calibration_soon: live.filter(r => r.next_calibration_due && iso(r.next_calibration_due) >= today && iso(r.next_calibration_due) <= soon).length,
+    loans_out: live.filter(r => r.status === 'lent').length,
+    loans_overdue: live.filter(r => r.status === 'lent' && r.loan_due_back && iso(r.loan_due_back) < today).length,
+    beds: live.filter(r => r.kind === 'bed').length,
+    beds_available: live.filter(r => r.kind === 'bed' && r.status === 'available').length,
+  };
+}
+
+// One measurement: flows count what happened on a day (≤ today); stocks are a snapshot (oldest pending date optional).
+function validateMeasurement(type, body, today) {
+  if (!type || !type.active) return { error: 'Unknown or inactive measure.' };
+  const on = body.measured_on ? iso(body.measured_on) : today;
+  if (!isIso(on)) return { error: 'Invalid date.' };
+  if (on > today) return { error: 'You can only record today or past days.' };
+  const v = Number(body.value);
+  if (!Number.isInteger(v) || v < 0 || v > 100000) return { error: 'The value must be a whole number from 0.' };
+  let oldest = null;
+  if (type.kind === 'stock' && body.oldest_pending_on) {
+    oldest = iso(body.oldest_pending_on);
+    if (!isIso(oldest) || oldest > on) return { error: 'The oldest pending date must be on or before the snapshot date.' };
+    if (v === 0) oldest = null;
+  }
+  return { value: { measured_on: on, value: v, oldest_pending_on: oldest } };
+}
+
+// Period summary: flows → total per type over [from, to]; stocks → latest snapshot + previous for trend.
+function summarizeMeasures(types, measurements, from, to) {
+  const out = [];
+  for (const t of (types || []).filter(x => x.active).sort((a, b) => a.sort - b.sort || String(a.label).localeCompare(String(b.label), 'es'))) {
+    const rows = (measurements || []).filter(m => String(m.type_id) === String(t.id)).sort((a, b) => (iso(a.measured_on) < iso(b.measured_on) ? 1 : -1));
+    if (t.kind === 'flow') {
+      const inRange = rows.filter(m => iso(m.measured_on) >= from && iso(m.measured_on) <= to);
+      out.push({ type_id: t.id, code: t.code, label: t.label, kind: 'flow', total: inRange.reduce((s, m) => s + m.value, 0), days_recorded: inRange.length,
+        by_day: inRange.map(m => ({ date: iso(m.measured_on), value: m.value, id: m.id })) });
+    } else {
+      const [latest, prev] = rows;
+      out.push({ type_id: t.id, code: t.code, label: t.label, kind: 'stock',
+        latest: latest ? { date: iso(latest.measured_on), value: latest.value, oldest_pending_on: iso(latest.oldest_pending_on) || null, id: latest.id } : null,
+        previous: prev ? { date: iso(prev.measured_on), value: prev.value } : null,
+        history: rows.slice(0, 12).map(m => ({ date: iso(m.measured_on), value: m.value })) });
+    }
+  }
+  return out;
+}
+
+function validateIncident(body, { partial = false } = {}) {
+  const out = {};
+  if (!partial || body.category !== undefined) { if (!INCIDENT_CATEGORIES[body.category]) return { error: 'Choose a category.' }; out.category = body.category; }
+  if (!partial || body.title !== undefined) { const t = str(body.title, 140); if (!t || t.length < 3) return { error: 'Describe the incident in a few words.' }; out.title = t; }
+  if (body.details !== undefined) out.details = str(body.details, 500);
+  if (body.resource_id !== undefined) out.resource_id = body.resource_id || null;
+  if (body.owner_id !== undefined) out.owner_id = body.owner_id || null;
+  if (body.opened_on !== undefined) { if (!isIso(body.opened_on)) return { error: 'Invalid date.' }; out.opened_on = iso(body.opened_on); }
+  return { value: out };
+}
+
+// Status transitions: resolving needs a resolution note and stamps the date; reopening clears it.
+function incidentTransition(incident, to, { resolution, today }) {
+  if (!INCIDENT_STATUS[to]) return { error: 'Unknown status.' };
+  if (to === incident.status) return { patch: {} };
+  if (to === 'resolved') {
+    const r = str(resolution, 500); if (!r) return { error: 'Say how it was resolved.' };
+    const on = today < iso(incident.opened_on) ? iso(incident.opened_on) : today;
+    return { patch: { status: 'resolved', resolved_on: on, resolution: r } };
+  }
+  return { patch: { status: to, resolved_on: null, resolution: null } };
+}
+
+function incidentSummary(incidents, today) {
+  const open = (incidents || []).filter(i => !i.deleted_at && i.status !== 'resolved');
+  return { open: open.length, oldest_open_days: open.length ? Math.max(...open.map(i => daysBetween(i.opened_on, today))) : null, unowned: open.filter(i => !i.owner_id).length };
+}
+
+Object.assign(module.exports, { RESOURCE_KINDS, RESOURCE_STATUS, INCIDENT_CATEGORIES, INCIDENT_STATUS, validateResource, applyResourceEvent, resourceAlerts,
+  validateMeasurement, summarizeMeasures, validateIncident, incidentTransition, incidentSummary, daysBetween });

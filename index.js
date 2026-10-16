@@ -4164,8 +4164,17 @@ async function opsLoadUnits(ids, { history = false } = {}) {
       .is('deleted_at', null).in('training_unit_id', unitIds).neq('rotation_status', 'cancelled').lte('start_date', weekEnd).gte('end_date', today)
   ]);
   for (const r of [rosterR, rotR]) if (r.error) throw r.error;
-  return { today, units: units.map(u => OpsRoom.shapeUnit(u, rosterR.data, rotR.data, today)) };
+  const [resR, incR] = await Promise.all([
+    opsSoft(supabase.from('ops_resources').select('unit_id, kind, status, next_calibration_due, loan_due_back, deleted_at').in('unit_id', unitIds).is('deleted_at', null)),
+    opsSoft(supabase.from('ops_incidents').select('unit_id, status, opened_on, owner_id, deleted_at').in('unit_id', unitIds).is('deleted_at', null).neq('status', 'resolved'))
+  ]);
+  return { today, units: units.map(u => ({ ...OpsRoom.shapeUnit(u, rosterR.data, rotR.data, today),
+    alerts: { resources: OpsRoom.resourceAlerts(resR.filter(r => r.unit_id === u.id), today), incidents: OpsRoom.incidentSummary(incR.filter(i => i.unit_id === u.id), today) } })) };
 }
+// OR-2 tables may not exist yet on a database that has not run the OR-2 migration: read them as empty.
+async function opsSoft(query) { const { data, error } = await query; if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return []; throw error; } return data || []; }
+const opsUnitOf = async (unitId) => { const { data, error } = await supabase.from('training_units').select('id, ops_enabled, unit_name').eq('id', unitId).maybeSingle(); if (error) throw error; return data; };
+const opsOwned = async (table, id, unitId, cols = '*') => { const { data, error } = await supabase.from(table).select(cols).eq('id', id).maybeSingle(); if (error) throw error; return data && String(data.unit_id) === String(unitId) ? data : null; };
 
 app.get('/api/ops/units', authenticateToken, Portfolio.read('training_units'), apiLimiter, async (req, res) => {
   try { res.json(await opsLoadUnits(null)); }
@@ -4250,6 +4259,186 @@ app.delete('/api/ops/units/:unitId/staff/:entryId', authenticateToken, Portfolio
     if (error) throw error;
     res.json({ success: true, removed: 'ended', assigned_until: plan.assigned_until });
   } catch (e) { res.status(500).json({ error: 'Failed to remove roster entry', message: e.message }); }
+});
+
+// ===== PNEUMO OPS ROOM (OR-2): ¿Con qué contamos? · ¿Qué hemos hecho? · ¿Qué está pendiente? · ¿Qué ha fallado? =====
+// Reads: Units read. Writes: Units write (guard checks the unit in the URL). Permanent deletes: head of department / admin.
+// No patient data anywhere: resources, counts and operational facts only.
+
+// ── Resources (rooms, beds, devices) + history ──
+app.get('/api/ops/units/:unitId/resources', authenticateToken, Portfolio.read('training_units', { child: true }), apiLimiter, async (req, res) => {
+  try {
+    const today = opsToday();
+    const resources = await opsSoft(supabase.from('ops_resources').select('*').eq('unit_id', req.params.unitId).is('deleted_at', null).order('kind').order('name'));
+    const events = await opsSoft(supabase.from('ops_resource_events').select('id, resource_id, event_type, from_status, to_status, event_on, due_on, note, actor_id, created_at').eq('unit_id', req.params.unitId).order('created_at', { ascending: false }).limit(60));
+    res.json({ today, resources, events, alerts: OpsRoom.resourceAlerts(resources, today) });
+  } catch (e) { res.status(500).json({ error: 'Failed to load resources', message: e.message }); }
+});
+
+app.post('/api/ops/units/:unitId/resources', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    if (!(await opsUnitOf(req.params.unitId))) return res.status(404).json({ error: 'Unit not found' });
+    const v = OpsRoom.validateResource(req.body || {});
+    if (v.error) return res.status(400).json({ error: v.error });
+    const { data, error } = await supabase.from('ops_resources').insert({ ...v.value, unit_id: req.params.unitId, created_by: req.user.id }).select('*').single();
+    if (error) throw error;
+    await supabase.from('ops_resource_events').insert({ resource_id: data.id, unit_id: data.unit_id, event_type: 'created', to_status: data.status, event_on: opsToday(), actor_id: req.user.id });
+    res.status(201).json({ success: true, resource: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to add resource', message: e.message }); }
+});
+
+app.put('/api/ops/units/:unitId/resources/:resourceId', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const row = await opsOwned('ops_resources', req.params.resourceId, req.params.unitId);
+    if (!row || row.deleted_at) return res.status(404).json({ error: 'Resource not found' });
+    const v = OpsRoom.validateResource(req.body || {}, { partial: true });
+    if (v.error) return res.status(400).json({ error: v.error });
+    const { data, error } = await supabase.from('ops_resources').update({ ...v.value, updated_at: new Date().toISOString() }).eq('id', row.id).select('*').single();
+    if (error) throw error;
+    res.json({ success: true, resource: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to update resource', message: e.message }); }
+});
+
+// Status change, calibration, maintenance, loan out / return, note — the resource state follows the event.
+app.post('/api/ops/units/:unitId/resources/:resourceId/events', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const row = await opsOwned('ops_resources', req.params.resourceId, req.params.unitId);
+    if (!row || row.deleted_at) return res.status(404).json({ error: 'Resource not found' });
+    const r = OpsRoom.applyResourceEvent(row, req.body || {}, opsToday());
+    if (r.error) return res.status(400).json({ error: r.error });
+    if (Object.keys(r.patch).length) { const { error } = await supabase.from('ops_resources').update({ ...r.patch, updated_at: new Date().toISOString() }).eq('id', row.id); if (error) throw error; }
+    const { data: ev, error: eErr } = await supabase.from('ops_resource_events').insert({ ...r.event, resource_id: row.id, unit_id: row.unit_id, actor_id: req.user.id }).select('*').single();
+    if (eErr) throw eErr;
+    res.status(201).json({ success: true, event: ev });
+  } catch (e) { res.status(500).json({ error: 'Failed to record event', message: e.message }); }
+});
+
+app.delete('/api/ops/units/:unitId/resources/:resourceId', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const permanent = String(req.query.permanent) === 'true';
+    if (permanent && !opsAdmin(req)) return res.status(403).json({ error: 'Forbidden', message: 'Only the head of department or a system administrator can delete permanently.' });
+    const row = await opsOwned('ops_resources', req.params.resourceId, req.params.unitId, 'id, unit_id');
+    if (!row) return res.status(404).json({ error: 'Resource not found' });
+    const q = permanent ? supabase.from('ops_resources').delete().eq('id', row.id) : supabase.from('ops_resources').update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', row.id);
+    const { error } = await q; if (error) throw error;
+    res.json({ success: true, removed: permanent ? 'deleted' : 'removed' });
+  } catch (e) { res.status(500).json({ error: 'Failed to remove resource', message: e.message }); }
+});
+
+// ── Measures: activity (flow, per day) and pending (stock, snapshot) ──
+app.get('/api/ops/units/:unitId/measures', authenticateToken, Portfolio.read('training_units', { child: true }), apiLimiter, async (req, res) => {
+  try {
+    const today = opsToday(), isoOk = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
+    const to = isoOk(req.query.to) ? req.query.to : today, from = isoOk(req.query.from) ? req.query.from : OpsRoom.addDays(to, -29);
+    if (from > to || OpsRoom.daysBetween(from, to) > 400) return res.status(400).json({ error: 'Choose a period of up to 400 days.' });
+    const types = await opsSoft(supabase.from('ops_measure_types').select('id, code, label, kind, sort, active').eq('unit_id', req.params.unitId).order('sort'));
+    const measurements = await opsSoft(supabase.from('ops_measurements').select('id, type_id, measured_on, value, oldest_pending_on, source').eq('unit_id', req.params.unitId)
+      .gte('measured_on', OpsRoom.addDays(from, -370)).lte('measured_on', to).order('measured_on', { ascending: false }).limit(5000));
+    res.json({ today, from, to, types, summary: OpsRoom.summarizeMeasures(types, measurements, from, to) });
+  } catch (e) { res.status(500).json({ error: 'Failed to load activity', message: e.message }); }
+});
+
+// Upsert up to 50 values at once (a day's activity, or today's pending snapshots). One value per measure and date.
+app.put('/api/ops/units/:unitId/measures', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length || items.length > 50) return res.status(400).json({ error: 'Send 1 to 50 values.' });
+    const types = await opsSoft(supabase.from('ops_measure_types').select('id, kind, active, unit_id').eq('unit_id', req.params.unitId));
+    const today = opsToday(), rows = [];
+    for (const it of items) {
+      const type = types.find(t => String(t.id) === String(it.type_id));
+      const v = OpsRoom.validateMeasurement(type, it, today);
+      if (v.error) return res.status(400).json({ error: v.error, type_id: it.type_id || null });
+      rows.push({ unit_id: req.params.unitId, type_id: type.id, ...v.value, source: 'manual', entered_by: req.user.id, updated_at: new Date().toISOString() });
+    }
+    const { data, error } = await supabase.from('ops_measurements').upsert(rows, { onConflict: 'type_id,measured_on' }).select('id, type_id, measured_on, value, oldest_pending_on');
+    if (error) throw error;
+    res.json({ success: true, saved: data.length, items: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to save values', message: e.message }); }
+});
+
+app.delete('/api/ops/units/:unitId/measures/:measureId', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const row = await opsOwned('ops_measurements', req.params.measureId, req.params.unitId, 'id, unit_id');
+    if (!row) return res.status(404).json({ error: 'Value not found' });
+    const { error } = await supabase.from('ops_measurements').delete().eq('id', row.id); if (error) throw error;
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to delete value', message: e.message }); }
+});
+
+// A unit's own catalogue: add a measure, rename it, reorder, or switch it off (history kept).
+app.post('/api/ops/units/:unitId/measure-types', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const label = String(req.body?.label || '').trim().slice(0, 80), kind = req.body?.kind;
+    if (!label) return res.status(400).json({ error: 'A name is required.' });
+    if (!['flow', 'stock'].includes(kind)) return res.status(400).json({ error: 'Choose activity (counted per day) or pending (snapshot).' });
+    const code = importKey(label).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 40) || ('m_' + Date.now());
+    const { data, error } = await supabase.from('ops_measure_types').insert({ unit_id: req.params.unitId, code: code.length < 2 ? code + '_x' : code, label, kind, sort: Number(req.body?.sort) || 50 }).select('*').single();
+    if (error) { if (error.code === '23505') return res.status(409).json({ error: 'This unit already has a measure with that name.' }); throw error; }
+    res.status(201).json({ success: true, type: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to add measure', message: e.message }); }
+});
+
+app.put('/api/ops/units/:unitId/measure-types/:typeId', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const row = await opsOwned('ops_measure_types', req.params.typeId, req.params.unitId, 'id, unit_id');
+    if (!row) return res.status(404).json({ error: 'Measure not found' });
+    const patch = { updated_at: new Date().toISOString() };
+    if (req.body.label !== undefined) { const l = String(req.body.label || '').trim().slice(0, 80); if (!l) return res.status(400).json({ error: 'A name is required.' }); patch.label = l; }
+    if (req.body.active !== undefined) patch.active = req.body.active === true;
+    if (req.body.sort !== undefined) patch.sort = Number(req.body.sort) || 0;
+    const { data, error } = await supabase.from('ops_measure_types').update(patch).eq('id', row.id).select('*').single();
+    if (error) throw error;
+    res.json({ success: true, type: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to update measure', message: e.message }); }
+});
+
+// ── Incidents ──
+app.get('/api/ops/units/:unitId/incidents', authenticateToken, Portfolio.read('training_units', { child: true }), apiLimiter, async (req, res) => {
+  try {
+    const today = opsToday(), since = OpsRoom.addDays(today, -90);
+    const rows = await opsSoft(supabase.from('ops_incidents').select('*, owner:medical_staff!ops_incidents_owner_id_fkey(id, full_name)').eq('unit_id', req.params.unitId).is('deleted_at', null)
+      .or(`status.neq.resolved,resolved_on.gte.${since}`).order('opened_on', { ascending: false }).limit(200));
+    res.json({ today, incidents: rows, summary: OpsRoom.incidentSummary(rows, today) });
+  } catch (e) { res.status(500).json({ error: 'Failed to load incidents', message: e.message }); }
+});
+
+app.post('/api/ops/units/:unitId/incidents', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const v = OpsRoom.validateIncident(req.body || {});
+    if (v.error) return res.status(400).json({ error: v.error });
+    if (v.value.resource_id && !(await opsOwned('ops_resources', v.value.resource_id, req.params.unitId, 'id, unit_id'))) return res.status(400).json({ error: 'That resource is not in this unit.' });
+    if (v.value.opened_on && v.value.opened_on > opsToday()) return res.status(400).json({ error: 'An incident cannot open in the future.' });
+    const { data, error } = await supabase.from('ops_incidents').insert({ ...v.value, unit_id: req.params.unitId, created_by: req.user.id }).select('*').single();
+    if (error) throw error;
+    res.status(201).json({ success: true, incident: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to record incident', message: e.message }); }
+});
+
+app.put('/api/ops/units/:unitId/incidents/:incidentId', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const row = await opsOwned('ops_incidents', req.params.incidentId, req.params.unitId);
+    if (!row || row.deleted_at) return res.status(404).json({ error: 'Incident not found' });
+    const v = OpsRoom.validateIncident(req.body || {}, { partial: true });
+    if (v.error) return res.status(400).json({ error: v.error });
+    let patch = { ...v.value };
+    if (req.body.status !== undefined) { const t = OpsRoom.incidentTransition(row, req.body.status, { resolution: req.body.resolution, today: opsToday() }); if (t.error) return res.status(400).json({ error: t.error }); patch = { ...patch, ...t.patch }; }
+    const { data, error } = await supabase.from('ops_incidents').update({ ...patch, updated_at: new Date().toISOString() }).eq('id', row.id).select('*').single();
+    if (error) throw error;
+    res.json({ success: true, incident: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to update incident', message: e.message }); }
+});
+
+app.delete('/api/ops/units/:unitId/incidents/:incidentId', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
+  try {
+    const permanent = String(req.query.permanent) === 'true';
+    if (permanent && !opsAdmin(req)) return res.status(403).json({ error: 'Forbidden', message: 'Only the head of department or a system administrator can delete permanently.' });
+    const row = await opsOwned('ops_incidents', req.params.incidentId, req.params.unitId, 'id, unit_id');
+    if (!row) return res.status(404).json({ error: 'Incident not found' });
+    const q = permanent ? supabase.from('ops_incidents').delete().eq('id', row.id) : supabase.from('ops_incidents').update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', row.id);
+    const { error } = await q; if (error) throw error;
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: 'Failed to remove incident', message: e.message }); }
 });
 
 // Which units does a staff member belong to? (used in staff profile + absence impact)
