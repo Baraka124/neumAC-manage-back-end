@@ -19,12 +19,12 @@ function validateCapabilities(list) {
 }
 
 // staff: {id, staff_type, employment_status, deleted_at}
-function validateRosterEntry({ staff, role, assigned_from, assigned_until }, today) {
+function validateRosterEntry({ staff, role, assigned_from, assigned_until }, today, roles = Object.keys(ROLES)) {
   if (!staff || staff.deleted_at) return { error: 'Staff member not found.' };
   if (RESIDENT.test(String(staff.staff_type || ''))) return { error: 'Residents come from Rotations — assign them a rotation in this unit instead.' };
   if ((staff.employment_status || 'active') !== 'active') return { error: 'Only active staff can be added to a unit.' };
   const r = role || 'primary';
-  if (!ROLES[r]) return { error: 'Role must be one of: ' + Object.keys(ROLES).join(', ') };
+  if (!roles.includes(r)) return { error: 'Choose one of the roles defined for units.' };
   const from = assigned_from ? iso(assigned_from) : today;
   if (!isIso(from)) return { error: 'Invalid start date.' };
   const until = assigned_until ? iso(assigned_until) : null;
@@ -62,9 +62,9 @@ function residentsThisWeek(rotations, unitId, today) {
 }
 
 const ROLE_ORDER = { coordinator: 0, primary: 1, secondary: 2 };
-function shapeUnit(unit, roster, rotations, today) {
+function shapeUnit(unit, roster, rotations, today, roleLabels = ROLES) {
   const rows = (roster || []).filter(r => String(r.unit_id) === String(unit.id)).map(r => ({
-    id: r.id, role: r.role, role_label: ROLES[r.role] || r.role, assigned_from: iso(r.assigned_from) || null, assigned_until: iso(r.assigned_until) || null,
+    id: r.id, role: r.role, role_label: roleLabels[r.role] || r.role, assigned_from: iso(r.assigned_from) || null, assigned_until: iso(r.assigned_until) || null,
     state: rosterState(r, today), staff: r.staff ? { id: r.staff.id, full_name: r.staff.full_name, staff_type: r.staff.staff_type } : null,
   })).sort((a, b) => (ROLE_ORDER[a.role] ?? 9) - (ROLE_ORDER[b.role] ?? 9) || String(a.staff?.full_name).localeCompare(String(b.staff?.full_name), 'es'));
   const current = rows.filter(r => r.state === 'current');
@@ -190,9 +190,9 @@ function summarizeMeasures(types, measurements, from, to) {
   return out;
 }
 
-function validateIncident(body, { partial = false } = {}) {
+function validateIncident(body, { partial = false, categories = Object.keys(INCIDENT_CATEGORIES) } = {}) {
   const out = {};
-  if (!partial || body.category !== undefined) { if (!INCIDENT_CATEGORIES[body.category]) return { error: 'Choose a category.' }; out.category = body.category; }
+  if (!partial || body.category !== undefined) { if (!categories.includes(body.category)) return { error: 'Choose a category.' }; out.category = body.category; }
   if (!partial || body.title !== undefined) { const t = str(body.title, 140); if (!t || t.length < 3) return { error: 'Describe the incident in a few words.' }; out.title = t; }
   if (body.details !== undefined) out.details = str(body.details, 500);
   if (body.resource_id !== undefined) out.resource_id = body.resource_id || null;
@@ -237,11 +237,15 @@ const hoursBetween = (a, b) => (Date.parse(b) - Date.parse(a)) / 3600000;
 const median = xs => { const s = xs.filter(x => Number.isFinite(x)).sort((a, b) => a - b); if (!s.length) return null; const m = Math.floor(s.length / 2); return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
 const round1 = x => x === null || x === undefined ? null : Math.round(x * 10) / 10;
 
-function validateInterconsult(body, nowIso, { partial = false } = {}) {
+function validateInterconsult(body, nowIso, { partial = false, services = null, reasons = Object.keys(IC_REASONS) } = {}) {
   const out = {};
-  if (!partial || body.requesting_service !== undefined) { const s = str(body.requesting_service, 80); if (!s || s.length < 2) return { error: 'Choose the requesting service.' }; out.requesting_service = s; }
+  if (!partial || body.requesting_service !== undefined) {
+    const s = str(body.requesting_service, 80); if (!s || s.length < 2) return { error: 'Choose the requesting service.' };
+    if (services && !services.includes(s)) return { error: 'Choose a service from the list (it can be added in Configuración).' };
+    out.requesting_service = s;
+  }
   if (!partial || body.priority !== undefined) { const p = body.priority || 'ordinary'; if (!IC_PRIORITY[p]) return { error: 'Priority must be urgent, preferente or ordinary.' }; out.priority = p; }
-  if (body.reason_category !== undefined) { if (body.reason_category && !IC_REASONS[body.reason_category]) return { error: 'Unknown reason.' }; out.reason_category = body.reason_category || null; }
+  if (body.reason_category !== undefined) { if (body.reason_category && !reasons.includes(body.reason_category)) return { error: 'Unknown reason.' }; out.reason_category = body.reason_category || null; }
   if (!partial || body.received_at !== undefined) {
     const r = body.received_at ? isoTs(body.received_at) : nowIso;
     if (!r) return { error: 'Invalid reception time.' };
@@ -282,17 +286,20 @@ function interconsultAction(row, action, { staffId = null, at = null, nowIso }) 
 }
 
 // Board + stats. `fromIso` bounds the "recent" window (received/answered inside it).
+// `targets`: { priority: hours } or a function (priority, isoDate) → hours (the target in force that day).
+const icTargetFn = targets => typeof targets === 'function' ? targets : (p => (targets || IC_TARGET_HOURS)[p]);
 function interconsultStats(rows, nowIso, fromIso, targets = IC_TARGET_HOURS) {
+  const tf = icTargetFn(targets), tRow = r => tf(r.priority, String(r.received_at).slice(0, 10));
   const live = (rows || []).filter(r => !r.deleted_at);
   const waiting = live.filter(r => ['received', 'assigned'].includes(r.status));
   const ageH = r => hoursBetween(r.received_at, nowIso);
-  const overdue = waiting.filter(r => ageH(r) > (targets[r.priority] || Infinity));
+  const overdue = waiting.filter(r => ageH(r) > (tRow(r) || Infinity));
   const answered = live.filter(r => r.answered_at && Date.parse(r.answered_at) >= Date.parse(fromIso) && Date.parse(r.answered_at) <= Date.parse(nowIso));
   const resp = r => hoursBetween(r.received_at, r.answered_at);
   const byPriority = {};
   for (const p of Object.keys(IC_PRIORITY)) {
     const a = answered.filter(r => r.priority === p);
-    byPriority[p] = { answered: a.length, median_hours: round1(median(a.map(resp))), within_target_pct: a.length ? round1(100 * a.filter(r => resp(r) <= targets[p]).length / a.length) : null, target_hours: targets[p] };
+    byPriority[p] = { answered: a.length, median_hours: round1(median(a.map(resp))), within_target_pct: a.length ? round1(100 * a.filter(r => resp(r) <= (tRow(r) || Infinity)).length / a.length) : null, target_hours: tf(p, nowIso.slice(0, 10)) };
   }
   const received = live.filter(r => Date.parse(r.received_at) >= Date.parse(fromIso));
   const count = (list, key) => Object.entries(list.reduce((m, r) => { const k = r[key] || '—'; m[k] = (m[k] || 0) + 1; return m; }, {})).map(([k, n]) => ({ key: k, count: n })).sort((a, b) => b.count - a.count);
@@ -302,12 +309,12 @@ function interconsultStats(rows, nowIso, fromIso, targets = IC_TARGET_HOURS) {
     oldest_waiting_hours: waiting.length ? round1(Math.max(...waiting.map(ageH))) : null,
     received: received.length, answered: answered.length,
     median_hours: round1(median(answered.map(resp))),
-    within_target_pct: answered.length ? round1(100 * answered.filter(r => resp(r) <= (targets[r.priority] || Infinity)).length / answered.length) : null,
+    within_target_pct: answered.length ? round1(100 * answered.filter(r => resp(r) <= (tRow(r) || Infinity)).length / answered.length) : null,
     by_priority: byPriority, by_service: count(received, 'requesting_service').slice(0, 8), by_clinician: count(answered.filter(r => r.answered_by), 'answered_by'),
   };
 }
 function interconsultClock(row, nowIso, targets = IC_TARGET_HOURS) {
-  const end = row.answered_at || nowIso, h = hoursBetween(row.received_at, end), t = targets[row.priority];
+  const end = row.answered_at || nowIso, h = hoursBetween(row.received_at, end), t = icTargetFn(targets)(row.priority, String(row.received_at).slice(0, 10));
   return { hours: round1(h), target_hours: t, over: h > t, answered: !!row.answered_at };
 }
 
@@ -391,7 +398,8 @@ function indicatorValue(def, p, data, today) {
       const pr = def.params?.priority, rows = (data.interconsults || []).filter(r => !r.deleted_at && r.answered_at && inP(r.answered_at.slice(0, 10)) && (!pr || r.priority === pr) && (!def.unit_id || String(r.unit_id) === String(def.unit_id)));
       if (!rows.length) return null;
       const h = r => hoursBetween(r.received_at, r.answered_at);
-      return def.kind === 'interconsult_median_hours' ? round1(median(rows.map(h))) : round1(100 * rows.filter(r => h(r) <= IC_TARGET_HOURS[r.priority]).length / rows.length);
+      const tf = icTargetFn(data.icTargets || IC_TARGET_HOURS);
+      return def.kind === 'interconsult_median_hours' ? round1(median(rows.map(h))) : round1(100 * rows.filter(r => h(r) <= (tf(r.priority, String(r.received_at).slice(0, 10)) || Infinity)).length / rows.length);
     }
     case 'interconsult_pending': {
       const endTs = Date.parse(p.end + 'T23:59:59Z'), pr = def.params?.priority;
@@ -403,14 +411,80 @@ function indicatorValue(def, p, data, today) {
   }
 }
 
-// Series for the last n periods + current status against the target.
+// Target in force on a date: the history entry with the latest valid_from on or before it (null if none).
+function targetAt(history, date) {
+  let best = null;
+  for (const h of history || []) if (iso(h.valid_from) <= iso(date) && (!best || iso(h.valid_from) > iso(best.valid_from))) best = h;
+  return best;
+}
+// Series for the last n periods + status. With `def.targets` (history), each period is judged with the target in
+// force on its last day; without it, the single `def.target` applies to every period (pre-OR-C behaviour).
 function computeIndicator(def, data, today, n = 6) {
   const periods = periodBounds(def.period || 'month', today, n);
-  const series = periods.map(p => { const v = indicatorValue(def, p, data, today); return { ...p, value: v === undefined ? null : v,
-    met: v === null || v === undefined || def.target === null || def.target === undefined ? null : (def.direction === 'min' ? v >= Number(def.target) : v <= Number(def.target)) }; });
-  const current = series[series.length - 1], last = [...series].reverse().find(s => s.value !== null) || null;
-  return { series, current, last_value: last, status: def.target === null || def.target === undefined ? 'no_target' : (last ? (last.met ? 'met' : 'not_met') : 'no_data') };
+  const tgt = p => { if (Array.isArray(def.targets)) { const h = targetAt(def.targets, p.end); return h && h.value !== null && h.value !== undefined ? { value: Number(h.value), direction: h.direction || def.direction } : null; }
+    return def.target === null || def.target === undefined ? null : { value: Number(def.target), direction: def.direction }; };
+  const series = periods.map(p => { const v = indicatorValue(def, p, data, today), t = tgt(p); return { ...p, value: v === undefined ? null : v, target: t ? t.value : null,
+    met: v === null || v === undefined || !t ? null : (t.direction === 'min' ? v >= t.value : v <= t.value) }; });
+  const current = series[series.length - 1], last = [...series].reverse().find(s => s.value !== null) || null, now = tgt({ end: iso(today) });
+  return { series, current, last_value: last, target_now: now, status: !now && !(last && last.target !== null) ? 'no_target' : (last ? (last.met === null ? 'no_target' : (last.met ? 'met' : 'not_met')) : 'no_data') };
 }
 
-Object.assign(module.exports, { IC_PRIORITY, IC_TARGET_HOURS, IC_STATUS, IC_SERVICES, IC_REASONS, validateInterconsult, interconsultAction, interconsultStats, interconsultClock,
+/* ── OR-C: catalogues as data ── */
+const CATALOGS = Object.freeze({ ic_service: 'Interconsulta services', ic_reason: 'Interconsulta reasons', ic_priority: 'Interconsulta priorities',
+  incident_category: 'Incident categories', roster_role: 'Roles in a unit', device_type: 'Device types' });
+const FIXED_CODES = Object.freeze({ ic_priority: ['urgent', 'preferente', 'ordinary'] });   // logic depends on these: no additions
+const slugCode = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 40);
+// Built-in lists, used until the OR-C migration has run (and as the seed it mirrors).
+function catalogFallback() {
+  const mk = (catalog, obj, locked = []) => Object.entries(obj).map(([code, label], i) => ({ catalog, code, label, sort: i + 1, active: true, locked: locked.includes(code), meta: {} }));
+  return { ic_service: IC_SERVICES.map((label, i) => ({ catalog: 'ic_service', code: slugCode(label), label, sort: i + 1, active: true, locked: label === 'Otro servicio', meta: {} })),
+    ic_reason: mk('ic_reason', IC_REASONS, ['otro']), ic_priority: mk('ic_priority', IC_PRIORITY, FIXED_CODES.ic_priority),
+    incident_category: mk('incident_category', INCIDENT_CATEGORIES, ['other']), roster_role: mk('roster_role', ROLES, ['coordinator']), device_type: [] };
+}
+// rows (from ops_catalog_items) → { catalog: [items sorted] } with fallback for catalogues not in the database yet.
+function catalogFrom(rows) {
+  const out = catalogFallback(), seen = new Set();
+  for (const r of rows || []) { if (!CATALOGS[r.catalog]) continue; if (!seen.has(r.catalog)) { out[r.catalog] = []; seen.add(r.catalog); } out[r.catalog].push(r); }
+  for (const k of Object.keys(out)) out[k].sort((a, b) => a.sort - b.sort || String(a.label).localeCompare(String(b.label), 'es'));
+  return out;
+}
+const activeCodes = (cat, name) => (cat[name] || []).filter(i => i.active).map(i => i.code);
+const labelsOf = (cat, name) => Object.fromEntries((cat[name] || []).map(i => [i.code, i.label]));
+
+function validateCatalogItem(catalog, body, { existing = null } = {}) {
+  if (!CATALOGS[catalog]) return { error: 'Unknown list.' };
+  const out = {};
+  if (!existing) {
+    if (FIXED_CODES[catalog]) return { error: 'This list is fixed: rename its items or change their targets instead.' };
+    const label = str(body.label, 80); if (!label) return { error: 'A name is required.' };
+    const code = slugCode(body.code || label); if (code.length < 2) return { error: 'The name needs at least two letters or digits.' };
+    Object.assign(out, { code, label, sort: Number.isFinite(Number(body.sort)) ? Number(body.sort) : 100 });
+  } else {
+    if (body.label !== undefined) { const l = str(body.label, 80); if (!l) return { error: 'A name is required.' }; out.label = l; }
+    if (body.sort !== undefined) { const n = Number(body.sort); if (!Number.isFinite(n)) return { error: 'Order must be a number.' }; out.sort = n; }
+    if (body.active !== undefined) { if (existing.locked && body.active === false) return { error: 'This item is used by the system and cannot be switched off.' }; out.active = body.active === true; }
+  }
+  if (body.meta !== undefined) {
+    const m = body.meta && typeof body.meta === 'object' ? body.meta : {}, meta = {};
+    if (catalog === 'device_type' && m.calibration_days !== undefined && m.calibration_days !== null && m.calibration_days !== '') {
+      const d = Number(m.calibration_days); if (!Number.isInteger(d) || d < 1 || d > 3650) return { error: 'Calibration interval must be 1–3650 days.' }; meta.calibration_days = d;
+    }
+    out.meta = meta;
+  }
+  return { value: out };
+}
+
+// A new target entry (indicator or interconsulta priority). valid_from defaults to today.
+function validateTargetEntry(body, today) {
+  const from = body.valid_from ? iso(body.valid_from) : iso(today);
+  if (!isIso(from)) return { error: 'Invalid “valid from” date.' };
+  if (from > addDays(today, 366)) return { error: '“Valid from” can be at most a year ahead.' };
+  let value = null;
+  if (body.value !== null && body.value !== undefined && body.value !== '') { value = Number(body.value); if (!Number.isFinite(value) || value < 0) return { error: 'The target must be a number from 0.' }; }
+  if (body.direction !== undefined && body.direction !== null && !['min', 'max'].includes(body.direction)) return { error: 'Direction must be min or max.' };
+  return { value: { value, direction: body.direction || null, valid_from: from, note: str(body.note, 300) } };
+}
+
+Object.assign(module.exports, { targetAt, CATALOGS, FIXED_CODES, slugCode, catalogFallback, catalogFrom, activeCodes, labelsOf, validateCatalogItem, validateTargetEntry, icTargetFn,
+  IC_PRIORITY, IC_TARGET_HOURS, IC_STATUS, IC_SERVICES, IC_REASONS, validateInterconsult, interconsultAction, interconsultStats, interconsultClock,
   IND_KINDS, validateIndicator, periodBounds, indicatorValue, computeIndicator, median, hoursBetween });

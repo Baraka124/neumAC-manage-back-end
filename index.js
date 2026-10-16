@@ -4168,9 +4168,24 @@ async function opsLoadUnits(ids, { history = false } = {}) {
     opsSoft(supabase.from('ops_resources').select('unit_id, kind, status, next_calibration_due, loan_due_back, deleted_at').in('unit_id', unitIds).is('deleted_at', null)),
     opsSoft(supabase.from('ops_incidents').select('unit_id, status, opened_on, owner_id, deleted_at').in('unit_id', unitIds).is('deleted_at', null).neq('status', 'resolved'))
   ]);
-  return { today, units: units.map(u => ({ ...OpsRoom.shapeUnit(u, rosterR.data, rotR.data, today),
+  const { cat } = await opsCatalog();
+  return { today, units: units.map(u => ({ ...OpsRoom.shapeUnit(u, rosterR.data, rotR.data, today, OpsRoom.labelsOf(cat, 'roster_role')),
     alerts: { resources: OpsRoom.resourceAlerts(resR.filter(r => r.unit_id === u.id), today), incidents: OpsRoom.incidentSummary(incR.filter(i => i.unit_id === u.id), today) } })) };
 }
+// OR-C: catalogues and target history. Read through a short cache; any write clears it.
+// Before the OR-C migration the built-in lists apply (catalogFallback) and the provisional IC targets.
+async function opsSoftOrNull(query) { const { data, error } = await query; if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return null; throw error; } return data || []; }
+let opsCatalogCache = { at: 0, value: null };
+async function opsCatalog() {
+  if (opsCatalogCache.value && Date.now() - opsCatalogCache.at < 30000) return opsCatalogCache.value;
+  const rows = await opsSoftOrNull(supabase.from('ops_catalog_items').select('catalog, code, label, sort, active, locked, meta'));
+  const icRows = await opsSoftOrNull(supabase.from('ops_targets').select('id, ref, value, valid_from, note, set_by, created_at').eq('scope', 'ic_priority').order('valid_from'));
+  const ic = icRows || [];
+  const icTargets = (priority, date) => { const h = OpsRoom.targetAt(ic.filter(t => t.ref === priority), date || opsToday()); return h && h.value !== null ? Number(h.value) : (icRows ? null : OpsRoom.IC_TARGET_HOURS[priority]); };
+  opsCatalogCache = { at: Date.now(), value: { cat: OpsRoom.catalogFrom(rows), migrated: !!rows, icHistory: ic, icTargets } };
+  return opsCatalogCache.value;
+}
+const opsCatalogBust = () => { opsCatalogCache = { at: 0, value: null }; };
 // OR-2 tables may not exist yet on a database that has not run the OR-2 migration: read them as empty.
 async function opsSoft(query) { const { data, error } = await query; if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return []; throw error; } return data || []; }
 const opsUnitOf = async (unitId) => { const { data, error } = await supabase.from('training_units').select('id, ops_enabled, unit_name').eq('id', unitId).maybeSingle(); if (error) throw error; return data; };
@@ -4214,7 +4229,8 @@ app.post('/api/ops/units/:unitId/staff', authenticateToken, Portfolio.write('tra
     ]);
     if (uErr || sErr) throw (uErr || sErr);
     if (!unit) return res.status(404).json({ error: 'Unit not found' });
-    const v = OpsRoom.validateRosterEntry({ staff, role: req.body.role, assigned_from: req.body.assigned_from, assigned_until: req.body.assigned_until }, today);
+    const { cat } = await opsCatalog();
+    const v = OpsRoom.validateRosterEntry({ staff, role: req.body.role, assigned_from: req.body.assigned_from, assigned_until: req.body.assigned_until }, today, OpsRoom.activeCodes(cat, 'roster_role'));
     if (v.error) return res.status(400).json({ error: v.error });
     const now = new Date().toISOString();
     const { data, error } = await supabase.from('unit_staff').insert({ unit_id: unit.id, staff_id: staff.id, ...v.value, created_at: now, updated_at: now }).select(OPS_ROSTER_SELECT).single();
@@ -4235,7 +4251,8 @@ app.put('/api/ops/units/:unitId/staff/:entryId', authenticateToken, Portfolio.wr
     if (sErr) throw sErr;
     const merged = { role: req.body.role ?? row.role, assigned_from: req.body.assigned_from ?? row.assigned_from, assigned_until: req.body.assigned_until === undefined ? row.assigned_until : req.body.assigned_until };
     // Editing an existing membership must not fail just because the person has since become inactive.
-    const v = OpsRoom.validateRosterEntry({ staff: staff ? { ...staff, employment_status: 'active' } : null, ...merged }, opsToday());
+    const { cat } = await opsCatalog();   // a role switched off later stays valid for the people who already have it
+    const v = OpsRoom.validateRosterEntry({ staff: staff ? { ...staff, employment_status: 'active' } : null, ...merged }, opsToday(), [...new Set([...OpsRoom.activeCodes(cat, 'roster_role'), row.role])]);
     if (v.error) return res.status(400).json({ error: v.error });
     const { data, error } = await supabase.from('unit_staff').update({ ...v.value, updated_at: new Date().toISOString() }).eq('id', row.id).select(OPS_ROSTER_SELECT).single();
     if (error) { if (error.code === '23505') return res.status(409).json({ error: 'This person already has an active membership in this unit.' }); throw error; }
@@ -4280,6 +4297,13 @@ app.post('/api/ops/units/:unitId/resources', authenticateToken, Portfolio.write(
     if (!(await opsUnitOf(req.params.unitId))) return res.status(404).json({ error: 'Unit not found' });
     const v = OpsRoom.validateResource(req.body || {});
     if (v.error) return res.status(400).json({ error: v.error });
+    const { cat, migrated } = await opsCatalog();
+    if (req.body.device_type) {
+      const t = (cat.device_type || []).find(x => x.code === req.body.device_type && x.active);
+      if (!t || v.value.kind !== 'device') return res.status(400).json({ error: 'Choose a device type from the list.' });
+      if (migrated) v.value.device_type = t.code;
+      if (v.value.calibration_interval_days === undefined && t.meta?.calibration_days) v.value.calibration_interval_days = t.meta.calibration_days;
+    }
     const { data, error } = await supabase.from('ops_resources').insert({ ...v.value, unit_id: req.params.unitId, created_by: req.user.id }).select('*').single();
     if (error) throw error;
     await supabase.from('ops_resource_events').insert({ resource_id: data.id, unit_id: data.unit_id, event_type: 'created', to_status: data.status, event_on: opsToday(), actor_id: req.user.id });
@@ -4405,7 +4429,8 @@ app.get('/api/ops/units/:unitId/incidents', authenticateToken, Portfolio.read('t
 
 app.post('/api/ops/units/:unitId/incidents', authenticateToken, Portfolio.write('training_units'), async (req, res) => {
   try {
-    const v = OpsRoom.validateIncident(req.body || {});
+    const { cat } = await opsCatalog();
+    const v = OpsRoom.validateIncident(req.body || {}, { categories: OpsRoom.activeCodes(cat, 'incident_category') });
     if (v.error) return res.status(400).json({ error: v.error });
     if (v.value.resource_id && !(await opsOwned('ops_resources', v.value.resource_id, req.params.unitId, 'id, unit_id'))) return res.status(400).json({ error: 'That resource is not in this unit.' });
     if (v.value.opened_on && v.value.opened_on > opsToday()) return res.status(400).json({ error: 'An incident cannot open in the future.' });
@@ -4419,7 +4444,8 @@ app.put('/api/ops/units/:unitId/incidents/:incidentId', authenticateToken, Portf
   try {
     const row = await opsOwned('ops_incidents', req.params.incidentId, req.params.unitId);
     if (!row || row.deleted_at) return res.status(404).json({ error: 'Incident not found' });
-    const v = OpsRoom.validateIncident(req.body || {}, { partial: true });
+    const { cat } = await opsCatalog();
+    const v = OpsRoom.validateIncident(req.body || {}, { partial: true, categories: [...new Set([...OpsRoom.activeCodes(cat, 'incident_category'), row.category])] });
     if (v.error) return res.status(400).json({ error: v.error });
     let patch = { ...v.value };
     if (req.body.status !== undefined) { const t = OpsRoom.incidentTransition(row, req.body.status, { resolution: req.body.resolution, today: opsToday() }); if (t.error) return res.status(400).json({ error: t.error }); patch = { ...patch, ...t.patch }; }
@@ -4460,10 +4486,15 @@ app.get('/api/ops/interconsults', authenticateToken, Portfolio.read('training_un
       opsSoft(supabase.from('ops_interconsults').select(IC_SELECT).is('deleted_at', null).or(`received_at.gte.${fromIso},answered_at.gte.${fromIso}`).order('received_at', { ascending: false }).limit(2000))
     ]);
     const all = [...new Map([...openR, ...recentR].map(r => [r.id, r])).values()];
-    const clock = r => ({ ...r, clock: OpsRoom.interconsultClock(r, nowIso) });
-    res.json({ now: nowIso, days, targets: OpsRoom.IC_TARGET_HOURS, priorities: OpsRoom.IC_PRIORITY, statuses: OpsRoom.IC_STATUS, services: OpsRoom.IC_SERVICES, reasons: OpsRoom.IC_REASONS,
+    const { cat, icTargets, icHistory } = await opsCatalog();
+    const clock = r => ({ ...r, clock: OpsRoom.interconsultClock(r, nowIso, icTargets) });
+    const today = nowIso.slice(0, 10);
+    res.json({ now: nowIso, days, targets: Object.fromEntries(Object.keys(OpsRoom.IC_PRIORITY).map(p => [p, icTargets(p, today)])), target_history: icHistory,
+      priorities: OpsRoom.labelsOf(cat, 'ic_priority'), statuses: OpsRoom.IC_STATUS,
+      services: (cat.ic_service || []).map(i => ({ code: i.code, label: i.label, active: i.active })), service_labels: OpsRoom.labelsOf(cat, 'ic_service'),
+      reasons: OpsRoom.labelsOf(cat, 'ic_reason'), reasons_active: OpsRoom.activeCodes(cat, 'ic_reason'),
       open: openR.map(clock), recent: recentR.filter(r => r.status === 'closed' || r.status === 'answered' || r.status === 'follow_up').slice(0, 200).map(clock),
-      stats: OpsRoom.interconsultStats(all, nowIso, fromIso) });
+      stats: OpsRoom.interconsultStats(all, nowIso, fromIso, icTargets) });
   } catch (e) { res.status(500).json({ error: 'Failed to load interconsultas', message: e.message }); }
 });
 
@@ -4471,7 +4502,8 @@ app.post('/api/ops/interconsults', authenticateToken, Portfolio.read('training_u
   try {
     if (!req.user.medical_staff_id && !(await opsUnitsWrite(req))) return res.status(403).json({ error: 'Only staff members can log interconsultas.' });
     const nowIso = new Date().toISOString();
-    const v = OpsRoom.validateInterconsult(req.body || {}, nowIso);
+    const { cat, migrated } = await opsCatalog();
+    const v = OpsRoom.validateInterconsult(req.body || {}, nowIso, { services: migrated ? OpsRoom.activeCodes(cat, 'ic_service') : null, reasons: OpsRoom.activeCodes(cat, 'ic_reason') });
     if (v.error) return res.status(400).json({ error: v.error });
     let row = { ...v.value, created_by: req.user.id };
     if (req.body.take === true && req.user.medical_staff_id) row = { ...row, status: 'assigned', assigned_to: req.user.medical_staff_id, assigned_at: nowIso < row.received_at ? row.received_at : nowIso };
@@ -4506,7 +4538,8 @@ app.put('/api/ops/interconsults/:icId', authenticateToken, Portfolio.read('train
     const { data: row, error: rErr } = await supabase.from('ops_interconsults').select('id, deleted_at, answered_at').eq('id', req.params.icId).maybeSingle();
     if (rErr) throw rErr;
     if (!row || row.deleted_at) return res.status(404).json({ error: 'Interconsulta not found' });
-    const v = OpsRoom.validateInterconsult(req.body || {}, new Date().toISOString(), { partial: true });
+    const { cat, migrated } = await opsCatalog();
+    const v = OpsRoom.validateInterconsult(req.body || {}, new Date().toISOString(), { partial: true, services: migrated ? OpsRoom.activeCodes(cat, 'ic_service') : null, reasons: OpsRoom.activeCodes(cat, 'ic_reason') });
     if (v.error) return res.status(400).json({ error: v.error });
     if (v.value.received_at && row.answered_at && v.value.received_at > row.answered_at) return res.status(400).json({ error: 'Reception cannot be after the answer.' });
     const { data, error } = await supabase.from('ops_interconsults').update({ ...v.value, updated_at: new Date().toISOString() }).eq('id', row.id).select(IC_SELECT).single();
@@ -4537,13 +4570,17 @@ async function opsIndicatorData(unitIds, indicatorIds) {
     opsSoft(supabase.from('ops_interconsults').select('unit_id, priority, received_at, answered_at, deleted_at').is('deleted_at', null).or(`answered_at.is.null,answered_at.gte.${since}T00:00:00Z`).limit(20000)),
     indicatorIds.length ? opsSoft(supabase.from('ops_indicator_values').select('indicator_id, period_start, value, note').in('indicator_id', indicatorIds)) : Promise.resolve([])
   ]);
-  return { measurements: m, resources: r, incidents: i, interconsults: ic, manualValues: mv };
+  const { icTargets } = await opsCatalog();
+  const th = indicatorIds.length ? await opsSoftOrNull(supabase.from('ops_targets').select('id, ref, value, direction, valid_from, note, created_at').eq('scope', 'indicator').in('ref', indicatorIds.map(String)).order('valid_from')) : [];
+  return { measurements: m, resources: r, incidents: i, interconsults: ic, manualValues: mv, icTargets, targetHistory: th };
 }
 function opsShapeIndicators(defs, data, today, unitIdFilter) {
   return defs.map(d => {
     const scoped = { ...data, measurements: data.measurements.filter(x => !d.unit_id || String(x.unit_id) === String(d.unit_id)),
       resources: data.resources.filter(x => !d.unit_id || String(x.unit_id) === String(d.unit_id)), incidents: data.incidents.filter(x => !d.unit_id || String(x.unit_id) === String(d.unit_id)) };
-    return { ...d, kind_label: OpsRoom.IND_KINDS[d.kind]?.label || d.kind, result: OpsRoom.computeIndicator(d, scoped, today) };
+    // With the OR-C table, each period is judged with the target in force then; before it, the single target applies.
+    const withHistory = data.targetHistory ? { ...d, targets: data.targetHistory.filter(t => t.ref === String(d.id)) } : d;
+    return { ...withHistory, kind_label: OpsRoom.IND_KINDS[d.kind]?.label || d.kind, result: OpsRoom.computeIndicator(withHistory, scoped, today) };
   });
 }
 const IND_SELECT = '*, owner:medical_staff!ops_indicators_owner_id_fkey(id, full_name)';
@@ -4554,7 +4591,8 @@ app.get('/api/ops/units/:unitId/indicators', authenticateToken, Portfolio.read('
     const defs = await opsSoft(supabase.from('ops_indicators').select(IND_SELECT).eq('unit_id', req.params.unitId).eq('active', true).order('sort').order('created_at'));
     const types = await opsSoft(supabase.from('ops_measure_types').select('id, code, label, kind, active').eq('unit_id', req.params.unitId).order('sort'));
     const data = await opsIndicatorData([req.params.unitId], defs.map(d => d.id));
-    res.json({ today, kinds: OpsRoom.IND_KINDS, priorities: OpsRoom.IC_PRIORITY, types, indicators: opsShapeIndicators(defs, data, today) });
+    const { cat } = await opsCatalog();
+    res.json({ today, kinds: OpsRoom.IND_KINDS, priorities: OpsRoom.labelsOf(cat, 'ic_priority'), types, indicators: opsShapeIndicators(defs, data, today) });
   } catch (e) { res.status(500).json({ error: 'Failed to load indicators', message: e.message }); }
 });
 
@@ -4565,7 +4603,8 @@ app.get('/api/ops/indicators', authenticateToken, Portfolio.read('training_units
     const defs = await opsSoft(supabase.from('ops_indicators').select(IND_SELECT + ', unit:training_units!ops_indicators_unit_id_fkey(id, unit_name, unit_code)').eq('active', true).order('sort').order('created_at'));
     const unitIds = [...new Set(defs.map(d => d.unit_id).filter(Boolean))];
     const data = await opsIndicatorData(unitIds.length ? unitIds : null, defs.map(d => d.id));
-    res.json({ today, kinds: OpsRoom.IND_KINDS, priorities: OpsRoom.IC_PRIORITY, indicators: opsShapeIndicators(defs, data, today) });
+    const { cat } = await opsCatalog();
+    res.json({ today, kinds: OpsRoom.IND_KINDS, priorities: OpsRoom.labelsOf(cat, 'ic_priority'), indicators: opsShapeIndicators(defs, data, today) });
   } catch (e) { res.status(500).json({ error: 'Failed to load indicators', message: e.message }); }
 });
 
@@ -4582,12 +4621,26 @@ async function opsSaveIndicator(req, res, unitId) {
   }
   if (isNew) {
     const { data, error } = await supabase.from('ops_indicators').insert({ ...v.value, unit_id: unitId || null, created_by: req.user.id }).select(IND_SELECT).single();
-    if (error) throw error; return res.status(201).json({ success: true, indicator: data });
+    if (error) throw error;
+    // The first target is in force from the start of the current period unless another date is given.
+    if (data.target !== null && data.target !== undefined) await opsRecordTarget('indicator', data.id, { value: data.target, direction: data.direction, valid_from: req.body.target_valid_from || OpsRoom.periodBounds(data.period, opsToday(), 1)[0].start, note: 'Target at creation' }, req);
+    return res.status(201).json({ success: true, indicator: data });
   }
   const { data: row } = await supabase.from('ops_indicators').select('id, unit_id').eq('id', req.params.indId).maybeSingle();
   if (!row || String(row.unit_id || '') !== String(unitId || '')) return res.status(404).json({ error: 'Indicator not found' });
   const { data, error } = await supabase.from('ops_indicators').update({ ...v.value, updated_at: new Date().toISOString() }).eq('id', row.id).select(IND_SELECT).single();
-  if (error) throw error; return res.json({ success: true, indicator: data });
+  if (error) throw error;
+  // A target change is a new history entry (from today unless dated); the past keeps its own target.
+  if (v.value.target !== undefined || v.value.direction !== undefined) await opsRecordTarget('indicator', data.id, { value: data.target, direction: data.direction, valid_from: req.body.target_valid_from || opsToday(), note: req.body.target_note || null }, req);
+  return res.json({ success: true, indicator: data });
+}
+// Insert or replace (same scope, ref and date) a target-history entry. No-op before the OR-C migration.
+async function opsRecordTarget(scope, ref, entry, req) {
+  const v = OpsRoom.validateTargetEntry(entry, opsToday());
+  if (v.error) { const e = new Error(v.error); e.status = 400; throw e; }
+  const { error } = await supabase.from('ops_targets').upsert({ scope, ref: String(ref), ...v.value, set_by: req.user.id }, { onConflict: 'scope,ref,valid_from' });
+  if (error && !(error.code === '42P01' || /does not exist/i.test(error.message || ''))) throw error;
+  opsCatalogBust();
 }
 async function opsSaveIndicatorValue(req, res, unitId) {
   const { data: row } = await supabase.from('ops_indicators').select('id, unit_id, kind, period').eq('id', req.params.indId).maybeSingle();
@@ -4608,7 +4661,7 @@ async function opsRemoveIndicator(req, res, unitId) {
   const q = permanent ? supabase.from('ops_indicators').delete().eq('id', row.id) : supabase.from('ops_indicators').update({ active: false, updated_at: new Date().toISOString() }).eq('id', row.id);
   const { error } = await q; if (error) throw error; res.json({ success: true });
 }
-const opsWrap = fn => async (req, res) => { try { await fn(req, res); } catch (e) { res.status(500).json({ error: 'Indicator request failed', message: e.message }); } };
+const opsWrap = fn => async (req, res) => { try { await fn(req, res); } catch (e) { res.status(e.status || 500).json(e.status ? { error: e.message } : { error: 'Indicator request failed', message: e.message }); } };
 const opsDeptOnly = (req, res, next) => opsAdmin(req) ? next() : res.status(403).json({ error: 'Forbidden', message: 'Department indicators are managed by the head of department or a system administrator.' });
 
 app.post('/api/ops/units/:unitId/indicators', authenticateToken, Portfolio.write('training_units'), opsWrap((req, res) => opsSaveIndicator(req, res, req.params.unitId)));
@@ -4619,6 +4672,77 @@ app.post('/api/ops/indicators', authenticateToken, opsDeptOnly, opsWrap((req, re
 app.put('/api/ops/indicators/:indId', authenticateToken, opsDeptOnly, opsWrap((req, res) => opsSaveIndicator(req, res, null)));
 app.delete('/api/ops/indicators/:indId', authenticateToken, opsDeptOnly, opsWrap((req, res) => opsRemoveIndicator(req, res, null)));
 app.post('/api/ops/indicators/:indId/values', authenticateToken, opsDeptOnly, opsWrap((req, res) => opsSaveIndicatorValue(req, res, null)));
+
+// ===== PNEUMO OPS ROOM (OR-C): configuration — catalogues and target history =====
+// Read: Units read. Department-wide lists and interconsulta targets: head of department / admin.
+// Codes are fixed, labels editable; switching off hides an item but keeps every record that uses it.
+const opsDeptOnlyEarly = (req, res, next) => opsAdmin(req) ? next() : res.status(403).json({ error: 'Forbidden', message: 'Department-wide configuration is managed by the head of department or a system administrator.' });
+app.get('/api/ops/catalog', authenticateToken, Portfolio.read('training_units'), apiLimiter, async (req, res) => {
+  try {
+    const { cat, migrated, icHistory, icTargets } = await opsCatalog();
+    const today = opsToday();
+    res.json({ migrated, catalogs: cat, names: OpsRoom.CATALOGS, fixed: OpsRoom.FIXED_CODES,
+      ic_targets: { now: Object.fromEntries(Object.keys(OpsRoom.IC_PRIORITY).map(p => [p, icTargets(p, today)])), history: icHistory } });
+  } catch (e) { res.status(500).json({ error: 'Failed to load configuration', message: e.message }); }
+});
+
+app.post('/api/ops/catalog/:catalog', authenticateToken, opsDeptOnlyEarly, async (req, res) => {
+  try {
+    const v = OpsRoom.validateCatalogItem(req.params.catalog, req.body || {});
+    if (v.error) return res.status(400).json({ error: v.error });
+    const { data, error } = await supabase.from('ops_catalog_items').insert({ catalog: req.params.catalog, ...v.value, updated_by: req.user.id }).select('*').single();
+    if (error) { if (error.code === '23505') return res.status(409).json({ error: 'That item already exists in this list (it may be switched off).' }); if (error.code === '42P01') return res.status(409).json({ error: 'Run the OR-C database migration first.' }); throw error; }
+    opsCatalogBust(); res.status(201).json({ success: true, item: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to add item', message: e.message }); }
+});
+
+app.put('/api/ops/catalog/:catalog/:code', authenticateToken, opsDeptOnlyEarly, async (req, res) => {
+  try {
+    const { data: row, error: rErr } = await supabase.from('ops_catalog_items').select('*').eq('catalog', req.params.catalog).eq('code', req.params.code).maybeSingle();
+    if (rErr) { if (rErr.code === '42P01') return res.status(409).json({ error: 'Run the OR-C database migration first.' }); throw rErr; }
+    if (!row) return res.status(404).json({ error: 'Item not found' });
+    const v = OpsRoom.validateCatalogItem(req.params.catalog, req.body || {}, { existing: row });
+    if (v.error) return res.status(400).json({ error: v.error });
+    const { data, error } = await supabase.from('ops_catalog_items').update({ ...v.value, updated_by: req.user.id, updated_at: new Date().toISOString() }).eq('id', row.id).select('*').single();
+    if (error) throw error;
+    opsCatalogBust(); res.json({ success: true, item: data });
+  } catch (e) { res.status(500).json({ error: 'Failed to update item', message: e.message }); }
+});
+
+// Interconsulta response target for a priority, in force from a date (history kept).
+app.post('/api/ops/targets/ic/:priority', authenticateToken, opsDeptOnlyEarly, async (req, res) => {
+  try {
+    if (!OpsRoom.IC_PRIORITY[req.params.priority]) return res.status(404).json({ error: 'Unknown priority' });
+    if (req.body?.value === null || req.body?.value === undefined || req.body?.value === '') return res.status(400).json({ error: 'Set the target in hours.' });
+    await opsRecordTarget('ic_priority', req.params.priority, { value: req.body.value, valid_from: req.body.valid_from, note: req.body.note }, req);
+    res.status(201).json({ success: true });
+  } catch (e) { res.status(e.status || 500).json(e.status ? { error: e.message } : { error: 'Failed to set target', message: e.message }); }
+});
+
+// Indicator target in force from a date (unit indicators: Units write on that unit; department: head of department / admin).
+async function opsAddIndicatorTarget(req, res, unitId) {
+  const { data: row } = await supabase.from('ops_indicators').select('id, unit_id, direction, period').eq('id', req.params.indId).maybeSingle();
+  if (!row || String(row.unit_id || '') !== String(unitId || '')) return res.status(404).json({ error: 'Indicator not found' });
+  const direction = req.body?.direction || row.direction;
+  await opsRecordTarget('indicator', row.id, { value: req.body?.value, direction, valid_from: req.body?.valid_from, note: req.body?.note }, req);
+  // Keep the indicator's "current target" in step when the new entry is already in force.
+  const vf = String(req.body?.valid_from || opsToday()).slice(0, 10);
+  if (vf <= opsToday()) await supabase.from('ops_indicators').update({ target: req.body?.value === '' ? null : req.body?.value ?? null, direction, updated_at: new Date().toISOString() }).eq('id', row.id);
+  res.status(201).json({ success: true });
+}
+async function opsDeleteTarget(req, res, unitId) {
+  const { data: t, error } = await supabase.from('ops_targets').select('id, scope, ref').eq('id', req.params.targetId).maybeSingle();
+  if (error) throw error;
+  if (!t || t.scope !== 'indicator' || String(t.ref) !== String(req.params.indId)) return res.status(404).json({ error: 'Target entry not found' });
+  const { data: row } = await supabase.from('ops_indicators').select('id, unit_id').eq('id', req.params.indId).maybeSingle();
+  if (!row || String(row.unit_id || '') !== String(unitId || '')) return res.status(404).json({ error: 'Indicator not found' });
+  const { error: dErr } = await supabase.from('ops_targets').delete().eq('id', t.id); if (dErr) throw dErr;
+  res.json({ success: true });
+}
+app.post('/api/ops/units/:unitId/indicators/:indId/targets', authenticateToken, Portfolio.write('training_units'), opsWrap((req, res) => opsAddIndicatorTarget(req, res, req.params.unitId)));
+app.delete('/api/ops/units/:unitId/indicators/:indId/targets/:targetId', authenticateToken, Portfolio.write('training_units'), opsWrap((req, res) => opsDeleteTarget(req, res, req.params.unitId)));
+app.post('/api/ops/indicators/:indId/targets', authenticateToken, opsDeptOnlyEarly, opsWrap((req, res) => opsAddIndicatorTarget(req, res, null)));
+app.delete('/api/ops/indicators/:indId/targets/:targetId', authenticateToken, opsDeptOnlyEarly, opsWrap((req, res) => opsDeleteTarget(req, res, null)));
 
 // Which units does a staff member belong to? (used in staff profile + absence impact)
 app.get('/api/staff/:id/units', authenticateToken, async (req, res) => {

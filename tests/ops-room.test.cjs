@@ -17,7 +17,7 @@ test('roster accepts non-resident active staff with a valid role and dates', () 
 test('residents are refused (they come from Rotations); inactive, bad role and bad dates too', () => {
   assert.match(O.validateRosterEntry({ staff: { ...att, staff_type: 'medical_resident' } }, T).error, /Residents come from Rotations/);
   assert.match(O.validateRosterEntry({ staff: { ...att, employment_status: 'inactive' } }, T).error, /Only active staff/);
-  assert.match(O.validateRosterEntry({ staff: att, role: 'boss' }, T).error, /Role must be/);
+  assert.match(O.validateRosterEntry({ staff: att, role: 'boss' }, T).error, /roles defined for units/);
   assert.match(O.validateRosterEntry({ staff: att, assigned_from: '2026-11-01', assigned_until: '2026-10-01' }, T).error, /on or after/);
   assert.match(O.validateRosterEntry({ staff: null }, T).error, /not found/);
 });
