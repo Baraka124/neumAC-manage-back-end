@@ -149,3 +149,27 @@ test('CM-2 routes and migration: private bucket + signed links; public feed with
   assert.match(mig2, /visibility text not null default 'internal'/);
   assert.match(mig2, /Run AFTER 2026-10-17_comms_cm1/);
 });
+
+/* ── CM-3: private messages ── */
+const mig3 = fs.readFileSync(path.join(__dirname, '..', 'migrations', '2026-10-17_comms_cm3_private_messages.sql'), 'utf8');
+test('private message: default recipients = all active clinicians (adjuntos + residentes), not the sender', () => {
+  const staff = [{ id: 'a1', staff_type: 'attending_physician' }, { id: 'r1', staff_type: 'medical_resident' }, { id: 'e1', staff_type: 'biomedical_engineer' },
+    { id: 'r2', staff_type: 'medical_resident', employment_status: 'inactive' }, { id: 'a2', staff_type: 'attending_physician', deleted_at: '2026-01-01' }, { id: 'boss', staff_type: 'attending_physician' }];
+  assert.deepEqual(C.validateMessage({ body: 'Reunión el lunes' }).value.audience, { clinicians: true });
+  assert.deepEqual(C.resolveRecipients({ clinicians: true }, staff, [], [], { excludeId: 'boss' }), ['a1', 'r1']);
+  assert.ok(C.CLINICIAN_TYPES.includes('medical_resident'));
+  // Narrower audiences reuse the same rules as posts
+  assert.deepEqual(C.resolveRecipients({ roles: ['medical_resident'] }, staff), ['r1']);
+  assert.deepEqual(C.resolveRecipients({ units: [U1] }, staff, [{ staff_id: 'a1', unit_id: U1 }]), ['a1']);
+  assert.match(C.validateMessage({ body: '' }).error, /Write/);
+  assert.match(C.validateMessage({ body: 'hola', audience: {} }).error, /who receives/);
+});
+test('private messages: copies per recipient, inbox only shows my own, sender sees counts only; migration safe', () => {
+  assert.match(idx, /app\.post\('\/api\/comms\/messages', authenticateToken, commsCan\('message'\)/);
+  assert.match(idx, /\.eq\('staff_id', sid\)\.is\('message\.deleted_at', null\)/);                 // my copies only
+  assert.match(idx, /return data && String\(data\.staff_id\) === String\(sid\) \? data : null;/);     // read / archive only my copy
+  assert.match(idx, /read_count: count\[m\.id\] \|\| 0/);                                           // counts, never who
+  assert.doesNotMatch(idx.slice(idx.indexOf("app.get('/api/me/messages'"), idx.indexOf("async function commsMyCopy")), /staff_id:|recipients:/);
+  for (const t of ['comm_messages', 'comm_message_recipients']) { assert.match(mig3, new RegExp(`alter table public\\.${t} enable row level security`)); assert.match(mig3, new RegExp(`create trigger audit_${t} `)); }
+  assert.match(mig3, /unique \(message_id, staff_id\)/);
+});

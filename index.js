@@ -7084,6 +7084,73 @@ app.post('/api/comms/brief/send', authenticateToken, commsCan('brief'), commsWra
   const link = commsLink('brief', date), share = Comms.briefText(brief, link);
   res.json({ success: true, row: saved, brief, share: { text: share, whatsapp: Comms.whatsappUrl(share) } });
 }));
+// ── CM-3: private messages → each recipient's Mi espacio. Not in the feed; recipients never see the recipient list.
+// The sender sees how many received and how many have opened it (counts only, never who).
+COMMS_PERMS.message = ['communications', 'create'];
+app.post('/api/comms/messages', authenticateToken, commsCan('message'), commsWrap(async (req, res) => {
+  const v = Comms.validateMessage(req.body || {}); if (v.error) return res.status(400).json({ error: v.error });
+  const today = opsToday();
+  const [{ data: staff, error: sErr }, roster, oncall] = await Promise.all([
+    supabase.from('medical_staff').select('id, staff_type, employment_status, deleted_at').limit(2000),
+    opsSoft(supabase.from('unit_staff').select('staff_id, unit_id').lte('assigned_from', today).or(`assigned_until.is.null,assigned_until.gte.${today}`)),
+    v.value.audience.oncall_today ? commsOncall(today) : Promise.resolve([])
+  ]);
+  if (sErr) throw sErr;
+  const ids = Comms.resolveRecipients(v.value.audience, staff, roster, oncall.map(o => o.staff_id), { excludeId: req.user.medical_staff_id });
+  if (!ids.length) return res.status(400).json({ error: 'Nobody matches these recipients.' });
+  if (ids.length > 1000) return res.status(400).json({ error: 'Too many recipients.' });
+  const { data: msg, error } = await supabase.from('comm_messages').insert({ ...v.value, author_user_id: req.user.id, author_staff_id: req.user.medical_staff_id || null,
+    author_name: req.user.full_name || 'Jefatura', recipient_count: ids.length }).select('*').single();
+  if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return res.status(409).json({ error: 'Private messages need the CM-3 database update first.' }); throw error; }
+  const { error: rErr } = await supabase.from('comm_message_recipients').insert(ids.map(staff_id => ({ message_id: msg.id, staff_id })));
+  if (rErr) { await supabase.from('comm_messages').delete().eq('id', msg.id); throw rErr; }
+  res.status(201).json({ success: true, message: { ...msg, read_count: 0 } });
+}));
+// What I have sent (counts only).
+app.get('/api/comms/messages/sent', authenticateToken, commsCan('message'), apiLimiter, commsWrap(async (req, res) => {
+  const msgs = await opsSoftOrNull(supabase.from('comm_messages').select('*').eq('author_user_id', req.user.id).is('deleted_at', null).order('created_at', { ascending: false }).limit(100));
+  if (msgs === null) return res.json({ migrated: false, messages: [] });
+  const ids = msgs.map(m => m.id);
+  const reads = ids.length ? await opsSoft(supabase.from('comm_message_recipients').select('message_id, read_at').in('message_id', ids).not('read_at', 'is', null)) : [];
+  const count = reads.reduce((m, r) => { m[r.message_id] = (m[r.message_id] || 0) + 1; return m; }, {});
+  res.json({ migrated: true, messages: msgs.map(m => ({ ...m, read_count: count[m.id] || 0 })) });
+}));
+app.delete('/api/comms/messages/:id', authenticateToken, commsCan('read'), commsWrap(async (req, res) => {
+  const { data: m } = await supabase.from('comm_messages').select('id, author_user_id, deleted_at').eq('id', req.params.id).maybeSingle();
+  if (!m || m.deleted_at) return res.status(404).json({ error: 'Message not found' });
+  if (String(m.author_user_id) !== String(req.user.id) && !(await commsAllowed(req, 'remove'))) return res.status(403).json({ error: 'Only its author can withdraw this message.' });
+  const { error } = await supabase.from('comm_messages').update({ deleted_at: commsNow() }).eq('id', m.id);
+  if (error) throw error; res.json({ success: true });
+}));
+// My private inbox (Mi espacio). Only my own copies; withdrawn messages disappear.
+app.get('/api/me/messages', authenticateToken, apiLimiter, commsWrap(async (req, res) => {
+  const sid = req.user.medical_staff_id;
+  if (!sid) return res.json({ migrated: true, unread: 0, messages: [] });
+  const rows = await opsSoftOrNull(supabase.from('comm_message_recipients').select('id, read_at, archived_at, message:comm_messages!inner(id, subject, body, author_name, created_at, deleted_at)')
+    .eq('staff_id', sid).is('message.deleted_at', null).order('id', { ascending: false }).limit(200));
+  if (rows === null) return res.json({ migrated: false, unread: 0, messages: [] });
+  const list = rows.filter(r => r.message && !r.message.deleted_at && (String(req.query.archived) === 'true' || !r.archived_at))
+    .map(r => ({ id: r.id, read_at: r.read_at, archived_at: r.archived_at, message_id: r.message.id, subject: r.message.subject, body: r.message.body, author_name: r.message.author_name, created_at: r.message.created_at }))
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  res.json({ migrated: true, unread: list.filter(m => !m.read_at && !m.archived_at).length, messages: list });
+}));
+async function commsMyCopy(req, id) {
+  const sid = req.user.medical_staff_id; if (!sid) return null;
+  const { data } = await supabase.from('comm_message_recipients').select('id, staff_id, read_at').eq('id', id).maybeSingle();
+  return data && String(data.staff_id) === String(sid) ? data : null;
+}
+app.post('/api/me/messages/:id/read', authenticateToken, commsWrap(async (req, res) => {
+  const c = await commsMyCopy(req, req.params.id); if (!c) return res.status(404).json({ error: 'Message not found' });
+  if (!c.read_at) { const { error } = await supabase.from('comm_message_recipients').update({ read_at: commsNow() }).eq('id', c.id); if (error) throw error; }
+  res.json({ success: true });
+}));
+app.post('/api/me/messages/:id/archive', authenticateToken, commsWrap(async (req, res) => {
+  const c = await commsMyCopy(req, req.params.id); if (!c) return res.status(404).json({ error: 'Message not found' });
+  const restore = req.body && req.body.restore === true;
+  const { error } = await supabase.from('comm_message_recipients').update({ archived_at: restore ? null : commsNow(), ...(c.read_at ? {} : { read_at: commsNow() }) }).eq('id', c.id);
+  if (error) throw error; res.json({ success: true });
+}));
+
 
 // ===== 12. LIVE STATUS =====
 app.get('/api/live-status/current', authenticateToken, apiLimiter, async (req, res) => {
