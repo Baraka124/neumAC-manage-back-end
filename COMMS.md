@@ -10,3 +10,4 @@ Backend quick map:
   · interconsultas that come in are logged once in `ops_interconsults` and linked.
 - CM-2: events internal / public; banner + flyer in the private `attachments` bucket (signed 1 h links);
   public feed `GET /api/public/events[/:id]` (no sign-in, safe fields only).
+- CM-3: private messages (`comm_messages` + one copy per recipient in `comm_message_recipients`); inbox at `/api/me/messages`.
