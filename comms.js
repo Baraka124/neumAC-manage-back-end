@@ -284,5 +284,25 @@ function resolveRecipients(audience, staff, roster = [], oncallIds = [], { exclu
   return ids.filter(id => !excludeId || id !== String(excludeId));
 }
 
-module.exports = { CLINICIAN_TYPES, validateMessage, resolveRecipients, EVENT_FILES, checkEventFile, eventFilePath, publicEvent, monthGrid, POST_TYPES, SYSTEM_TYPES, PRIORITIES, COMMS_FALLBACK, validateAudience, audienceIncludes, validatePost, validateAction, actionTransition, actionState,
+/* ── Mi espacio "Hoy para ti": one person's operational day, from records that already exist ── */
+// parts: { oncall:[{role,shift}], rotation:{unit,end_date}|null, units:[{id,name,level,reasons}], actions:[{text,due_on,state,...}],
+//          interconsults:[{service,priority,hours,target_hours,over,status}], meetings:[{title,starts_at,...}], posts:[...], unread }
+function myToday(parts, today) {
+  const rank = { overdue: 0, due_today: 1, open: 2 };
+  const actions = (parts.actions || []).slice().sort((a, b) => (rank[a.state] ?? 3) - (rank[b.state] ?? 3) || String(a.due_on || '9999').localeCompare(String(b.due_on || '9999')));
+  const ics = (parts.interconsults || []).slice().sort((a, b) => (b.over === true) - (a.over === true) || (b.hours || 0) - (a.hours || 0));
+  const meetings = (parts.meetings || []).slice().sort((a, b) => String(a.starts_at).localeCompare(String(b.starts_at)));
+  const meetingsToday = meetings.filter(m => String(m.local_day || '').slice(0, 10) === today);
+  const needs = actions.filter(a => a.state === 'overdue' || a.state === 'due_today').length + ics.filter(i => i.over).length + (parts.unread || 0);
+  const lines = [];
+  if ((parts.oncall || []).length) lines.push('De guardia hoy');
+  if (parts.rotation) lines.push(`Rotando en ${parts.rotation.unit}`);
+  if (meetingsToday.length) lines.push(`${meetingsToday.length} ${meetingsToday.length === 1 ? 'sesión' : 'sesiones'} hoy`);
+  if (ics.length) lines.push(`${ics.length} interconsulta${ics.length === 1 ? '' : 's'} a tu cargo`);
+  if (actions.length) lines.push(`${actions.length} pendiente${actions.length === 1 ? '' : 's'}`);
+  return { needs_you: needs, headline: lines, oncall: parts.oncall || [], rotation: parts.rotation || null, units: parts.units || [],
+    actions, interconsults: ics, meetings, posts: parts.posts || [], unread: parts.unread || 0, empty: !lines.length && !needs && !(parts.posts || []).length && !(parts.units || []).length };
+}
+
+module.exports = { myToday, CLINICIAN_TYPES, validateMessage, resolveRecipients, EVENT_FILES, checkEventFile, eventFilePath, publicEvent, monthGrid, POST_TYPES, SYSTEM_TYPES, PRIORITIES, COMMS_FALLBACK, validateAudience, audienceIncludes, validatePost, validateAction, actionTransition, actionState,
   validateMeeting, meetingSchedule, BRIEF_SECTIONS, BRIEF_DEFAULT, validateBriefEdit, buildDailyBrief, briefText, postText, meetingText, whatsappUrl, fmtDay };

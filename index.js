@@ -7153,6 +7153,48 @@ app.post('/api/me/messages/:id/archive', authenticateToken, commsWrap(async (req
   const { error } = await supabase.from('comm_message_recipients').update({ archived_at: restore ? null : commsNow(), ...(c.read_at ? {} : { read_at: commsNow() }) }).eq('id', c.id);
   if (error) throw error; res.json({ success: true });
 }));
+// ===== Mi espacio — "Hoy para ti": one person's operational day (read-only, own records only) =====
+app.get('/api/me/today', authenticateToken, apiLimiter, commsWrap(async (req, res) => {
+  const sid = req.user.medical_staff_id;
+  if (!sid) return res.json({ linked: false });
+  const today = opsToday(), nowIso = commsNow(), soon = OpsRoom.addDays(today, 2);
+  const madridDay = ts => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ts));
+  const [oncallR, rotR, rosterR, actions, ics, meetings, posts, unreadR, meR] = await Promise.all([
+    opsSoft(supabase.from('oncall_schedule').select('shift_type, primary_physician_id, backup_physician_id, resident_physician_id, deleted_at').eq('duty_date', today).is('deleted_at', null)
+      .or(`primary_physician_id.eq.${sid},backup_physician_id.eq.${sid},resident_physician_id.eq.${sid}`)),
+    opsSoft(supabase.from('resident_rotations').select('training_unit_id, start_date, end_date, actual_start_date, actual_end_date, rotation_status, deleted_at, unit:training_units!resident_rotations_training_unit_id_fkey(id, unit_name)')
+      .eq('resident_id', sid).is('deleted_at', null).neq('rotation_status', 'cancelled').lte('start_date', today).gte('end_date', OpsRoom.addDays(today, -60))),
+    opsSoft(supabase.from('unit_staff').select('unit_id').eq('staff_id', sid).lte('assigned_from', today).or(`assigned_until.is.null,assigned_until.gte.${today}`)),
+    opsSoftOrNull(supabase.from('comm_actions').select('id, text, due_on, status, post_id, meeting_id, deleted_at').eq('owner_id', sid).eq('status', 'open').is('deleted_at', null).limit(50)),
+    opsSoft(supabase.from('ops_interconsults').select('id, requesting_service, priority, status, received_at, answered_at, deleted_at').eq('assigned_to', sid).is('deleted_at', null).in('status', ['received', 'assigned', 'follow_up']).limit(50)),
+    opsSoftOrNull(supabase.from('comm_meetings').select('id, title, kind, starts_at, ends_at, location, status, audience, organizer_id, deleted_at, items:comm_meeting_items(presenter_id)').is('deleted_at', null).neq('status', 'cancelled')
+      .gte('starts_at', OpsRoom.addDays(today, -1) + 'T22:00:00Z').lte('starts_at', soon + 'T23:59:59Z').order('starts_at').limit(60)),
+    opsCompat(() => supabase.from('department_announcements').select('id, title, type, priority_level, audience, created_at, created_by_name, deleted_at').is('deleted_at', null).gte('created_at', new Date(Date.now() - 48 * 3600000).toISOString()).order('created_at', { ascending: false }).limit(60),
+      () => supabase.from('department_announcements').select('id').limit(0)),
+    opsSoftOrNull(supabase.from('comm_message_recipients').select('id, read_at, archived_at, message:comm_messages!inner(deleted_at)').eq('staff_id', sid).is('read_at', null).is('archived_at', null).is('message.deleted_at', null).limit(100)),
+    supabase.from('medical_staff').select('staff_type').eq('id', sid).maybeSingle()
+  ]);
+  const roleOf = r => String(r.primary_physician_id) === String(sid) ? 'Adjunto/a' : String(r.backup_physician_id) === String(sid) ? 'Refuerzo' : 'Residente';
+  const rot = rotR.map(r => ({ ...r, s: String(r.actual_start_date || r.start_date).slice(0, 10), e: String(r.actual_end_date || r.end_date).slice(0, 10) })).find(r => r.s <= today && r.e >= today) || null;
+  const unitIds = [...new Set([...rosterR.map(r => r.unit_id), ...(rot ? [rot.training_unit_id] : [])].filter(Boolean))];
+  const unitsOut = unitIds.length ? (await opsLoadUnits(unitIds)).units : [];
+  const me = { staff_id: sid, unit_ids: unitIds, roles: meR.data && meR.data.staff_type ? [meR.data.staff_type] : [] };
+  const oncallIds = oncallR.length ? [sid] : [];
+  const { cat, icTargets } = await opsCatalog(), svc = OpsRoom.labelsOf(cat, 'ic_service');
+  const mine = m => String(m.organizer_id) === String(sid) || (m.items || []).some(i => String(i.presenter_id) === String(sid)) || !m.audience || Comms.audienceIncludes(m.audience, me, oncallIds);
+  res.json({ linked: true, today, ...Comms.myToday({
+    oncall: oncallR.map(r => ({ role: roleOf(r), shift: r.shift_type || null })),
+    rotation: rot ? { unit: rot.unit ? rot.unit.unit_name : 'unidad', unit_id: rot.training_unit_id, end_date: rot.e } : null,
+    units: unitsOut.map(u => ({ id: u.id, name: u.unit_name, level: u.pulse ? u.pulse.level : 'ok', reasons: u.pulse ? u.pulse.reasons.slice(0, 2).map(r => r.text) : [] })),
+    actions: (actions || []).map(a => ({ id: a.id, text: a.text, due_on: a.due_on, state: Comms.actionState(a, today), from: a.meeting_id ? 'meeting' : a.post_id ? 'post' : null })),
+    interconsults: ics.map(r => { const c = OpsRoom.interconsultClock(r, nowIso, icTargets); return { id: r.id, service: svc[r.requesting_service] || r.requesting_service, priority: r.priority, status: r.status, hours: c.hours, target_hours: c.target_hours, over: c.over }; }),
+    meetings: (meetings || []).filter(mine).map(m => ({ id: m.id, title: m.title, starts_at: m.starts_at, ends_at: m.ends_at, location: m.location, local_day: madridDay(m.starts_at), presenting: (m.items || []).some(i => String(i.presenter_id) === String(sid)) })),
+    posts: posts.filter(p => (p.audience && Comms.audienceIncludes(p.audience, me, oncallIds)) || (!p.audience && p.priority_level === 'urgent')).slice(0, 5)
+      .map(p => ({ id: p.id, title: p.title, type: p.type, urgent: p.priority_level === 'urgent', created_at: p.created_at, by: p.created_by_name })),
+    unread: (unreadR || []).length
+  }, today) });
+}));
+
 // ===== NOTIFICATIONS (NT-1): email to registered users =====
 // Outbox → sender with retries (actions never wait on email). Instant: private messages, urgent posts, Parte del día.
 // Daily summary at 07:00 Madrid: my follow-ups + agenda today/tomorrow (only when there is something).
