@@ -257,5 +257,32 @@ function monthGrid(year, month /* 1-12 */) {
   return weeks;
 }
 
-module.exports = { EVENT_FILES, checkEventFile, eventFilePath, publicEvent, monthGrid, POST_TYPES, SYSTEM_TYPES, PRIORITIES, COMMS_FALLBACK, validateAudience, audienceIncludes, validatePost, validateAction, actionTransition, actionState,
+/* ── CM-3: private messages (one message → a private copy per clinician, read in Mi espacio) ── */
+const CLINICIAN_TYPES = Object.freeze(['attending_physician', 'medical_resident']);   // residents are clinicians too
+function validateMessage(body) {
+  const b = str(body.body, 4000); if (!b || b.length < 2) return { error: 'Write the message.' };
+  const subject = str(body.subject, 120);
+  let audience = body.audience === undefined || body.audience === null || body.audience === 'clinicians' ? { clinicians: true } : body.audience;
+  if (typeof audience !== 'object') return { error: 'Invalid recipients.' };
+  if (audience.clinicians === true) audience = { clinicians: true };
+  else { const a = validateAudience(audience); if (a.error) return a; if (!a.value) return { error: 'Choose who receives it.' }; audience = a.value; }
+  return { value: { subject, body: b, audience } };
+}
+// staff: [{id, staff_type, employment_status, deleted_at}], roster: [{staff_id, unit_id}] (current), oncallIds: []
+function resolveRecipients(audience, staff, roster = [], oncallIds = [], { excludeId = null } = {}) {
+  const active = (staff || []).filter(s => !s.deleted_at && (s.employment_status || 'active') === 'active');
+  let ids;
+  if (!audience || audience.clinicians) ids = active.filter(s => CLINICIAN_TYPES.includes(s.staff_type)).map(s => String(s.id));
+  else {
+    const set = new Set();
+    for (const s of active) {
+      const me = { staff_id: s.id, unit_ids: (roster || []).filter(r => String(r.staff_id) === String(s.id)).map(r => r.unit_id), roles: [s.staff_type] };
+      if (audienceIncludes(audience, me, oncallIds)) set.add(String(s.id));
+    }
+    ids = [...set];
+  }
+  return ids.filter(id => !excludeId || id !== String(excludeId));
+}
+
+module.exports = { CLINICIAN_TYPES, validateMessage, resolveRecipients, EVENT_FILES, checkEventFile, eventFilePath, publicEvent, monthGrid, POST_TYPES, SYSTEM_TYPES, PRIORITIES, COMMS_FALLBACK, validateAudience, audienceIncludes, validatePost, validateAction, actionTransition, actionState,
   validateMeeting, meetingSchedule, BRIEF_SECTIONS, BRIEF_DEFAULT, validateBriefEdit, buildDailyBrief, briefText, postText, meetingText, whatsappUrl, fmtDay };
