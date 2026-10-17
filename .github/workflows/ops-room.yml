@@ -1,7 +1,7 @@
 name: Ops Room + Communication
 on:
   pull_request:
-    paths: [index.js, ops-room.js, comms.js, notify.js, outlook.js, narrative.js, portfolio.js, 'tests/ops-room*.test.cjs', tests/comms.test.cjs, tests/notify.test.cjs, tests/outlook.test.cjs, tests/narrative.test.cjs tests/jobs.test.cjs, migrations/**, .github/workflows/ops-room.yml]
+    paths: [index.js, ops-room.js, comms.js, notify.js, outlook.js, narrative.js, portfolio.js, 'tests/ops-room*.test.cjs', tests/comms.test.cjs, tests/notify.test.cjs, tests/outlook.test.cjs, tests/narrative.test.cjs tests/jobs.test.cjs tests/imports.test.cjs, migrations/**, .github/workflows/ops-room.yml]
   push:
     branches: [main]
     paths: [index.js, ops-room.js, comms.js, notify.js, outlook.js, narrative.js, 'tests/*.test.cjs']
@@ -14,9 +14,9 @@ jobs:
         with:
           node-version: '22'
       - name: Syntax
-        run: node --check index.js && node --check ops-room.js && node --check comms.js && node --check notify.js && node --check outlook.js && node --check narrative.js && node --check jobs.js
+        run: node --check index.js && node --check ops-room.js && node --check comms.js && node --check notify.js && node --check outlook.js && node --check narrative.js && node --check jobs.js && node --check imports.js
       - name: Ops Room rules and guards
-        run: node --test tests/ops-room.test.cjs tests/ops-room-or2.test.cjs tests/ops-room-or3.test.cjs tests/ops-room-orc.test.cjs tests/ops-room-orr.test.cjs tests/ops-room-ui.test.cjs tests/comms.test.cjs tests/notify.test.cjs tests/outlook.test.cjs tests/narrative.test.cjs tests/jobs.test.cjs
+        run: node --test tests/ops-room.test.cjs tests/ops-room-or2.test.cjs tests/ops-room-or3.test.cjs tests/ops-room-orc.test.cjs tests/ops-room-orr.test.cjs tests/ops-room-ui.test.cjs tests/comms.test.cjs tests/notify.test.cjs tests/outlook.test.cjs tests/narrative.test.cjs tests/jobs.test.cjs tests/imports.test.cjs
       - name: Install dependencies
         run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
       - name: Server boots (all routes register)
