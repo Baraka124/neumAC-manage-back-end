@@ -6820,6 +6820,7 @@ app.post('/api/comms/posts', authenticateToken, commsCan('post'), commsWrap(asyn
   let action = null;
   if (a) { const r = await supabase.from('comm_actions').insert({ ...a.value, post_id: data.id, created_by: req.user.id }).select('*').single(); if (r.error) throw r.error; action = r.data; }
   const shaped = commsShapePost(data, lists, await commsMe(req), []);
+  if (data.priority_level === 'urgent') notifySafe(notifyUrgentPost(data, lists));
   res.status(201).json({ success: true, post: shaped, action, share: { text: Comms.postText(shaped, shaped.link), whatsapp: Comms.whatsappUrl(Comms.postText(shaped, shaped.link)) } });
 }));
 async function commsOwnedPost(req, id) {
@@ -7082,6 +7083,7 @@ app.post('/api/comms/brief/send', authenticateToken, commsCan('brief'), commsWra
   const { data: saved, error } = await supabase.from('comm_daily_briefs').upsert({ brief_date: date, ...edit.value, snapshot: brief, status: 'sent', sent_at: commsNow(), sent_by: req.user.id, post_id: postId, updated_by: req.user.id, updated_at: commsNow() }, { onConflict: 'brief_date' }).select('*').single();
   if (error) throw error;
   const link = commsLink('brief', date), share = Comms.briefText(brief, link);
+  notifySafe(notifyParte(date, Comms.briefText(brief, null)));
   res.json({ success: true, row: saved, brief, share: { text: share, whatsapp: Comms.whatsappUrl(share) } });
 }));
 // ── CM-3: private messages → each recipient's Mi espacio. Not in the feed; recipients never see the recipient list.
@@ -7104,6 +7106,7 @@ app.post('/api/comms/messages', authenticateToken, commsCan('message'), commsWra
   if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return res.status(409).json({ error: 'Private messages need the CM-3 database update first.' }); throw error; }
   const { error: rErr } = await supabase.from('comm_message_recipients').insert(ids.map(staff_id => ({ message_id: msg.id, staff_id })));
   if (rErr) { await supabase.from('comm_messages').delete().eq('id', msg.id); throw rErr; }
+  notifySafe(notifyPrivateMessage(msg, ids));
   res.status(201).json({ success: true, message: { ...msg, read_count: 0 } });
 }));
 // What I have sent (counts only).
@@ -7150,6 +7153,159 @@ app.post('/api/me/messages/:id/archive', authenticateToken, commsWrap(async (req
   const { error } = await supabase.from('comm_message_recipients').update({ archived_at: restore ? null : commsNow(), ...(c.read_at ? {} : { read_at: commsNow() }) }).eq('id', c.id);
   if (error) throw error; res.json({ success: true });
 }));
+// ===== NOTIFICATIONS (NT-1): email to registered users =====
+// Outbox → sender with retries (actions never wait on email). Instant: private messages, urgent posts, Parte del día.
+// Daily summary at 07:00 Madrid: my follow-ups + agenda today/tomorrow (only when there is something).
+// TEST MODE is the default: every email goes to EMAIL_TEST_TO with the real recipient in the subject.
+// Go live with EMAIL_MODE=live (+ RESEND_API_KEY and a verified EMAIL_FROM domain in Railway).
+const Notify = require('./notify.js');
+const EMAIL_MODE = String(process.env.EMAIL_MODE || 'test').toLowerCase() === 'live' ? 'live' : 'test';
+const EMAIL_TEST_TO = process.env.EMAIL_TEST_TO || 'barakaaloyce@gmail.com';
+// Without a verified domain Resend only sends from onboarding@resend.dev, and only to the Resend account owner.
+const EMAIL_FROM = process.env.EMAIL_FROM || (EMAIL_MODE === 'live' ? FROM_EMAIL : 'neumDesk <onboarding@resend.dev>');
+const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || 'https://neumac-manage-back-end-production.up.railway.app').replace(/\/$/, '');
+const NOTIFY_USER_COLS = 'id, email, full_name, account_status, archived_at, suspended_at, locked_at, notifications_enabled, email_prefs, medical_staff_id';
+const notifyUnsubLink = (userId, kind) => `${PUBLIC_API_URL}/api/public/email/unsubscribe?u=${userId}&k=${kind}&s=${Notify.signUnsub(JWT_SECRET, userId, kind)}`;
+// Queue one email per eligible user. build(user) → {subject, html} | null. Duplicates (same key) are ignored.
+async function notifyEnqueue(users, kind, build, keyOf) {
+  const rows = [];
+  for (const u of users || []) {
+    if (!Notify.eligible(u, kind === 'test' ? 'message' : kind)) continue;
+    const e = build(u); if (!e) continue;
+    const footer = kind === 'test' ? '' : `<p style="color:#8a98a3;font-size:11px;text-align:center;margin:6px 0 0"><a href="${notifyUnsubLink(u.id, kind)}" style="color:#8a98a3">No recibir más «${Notify.esc(Notify.KINDS[kind].label)}» por email</a></p>`;
+    rows.push({ user_id: u.id, to_email: u.email, kind, subject: e.subject, html: e.html + footer, text_body: Notify.toText(e.html), dedupe_key: keyOf(u) });
+  }
+  if (!rows.length) return 0;
+  const { error } = await supabase.from('notif_outbox').upsert(rows, { onConflict: 'dedupe_key', ignoreDuplicates: true });
+  if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return 0; throw error; }
+  setTimeout(() => notifyTick().catch(() => {}), 500);   // send soon, not inside the request
+  return rows.length;
+}
+const notifySafe = p => Promise.resolve(p).catch(e => console.error('[NOTIFY] enqueue failed:', e.message));   // email never breaks an action
+async function notifyUsersForStaff(staffIds) {
+  const ids = [...new Set((staffIds || []).filter(Boolean).map(String))]; if (!ids.length) return [];
+  const { data } = await supabase.from('app_users').select(NOTIFY_USER_COLS).in('medical_staff_id', ids);
+  return data || [];
+}
+async function notifyAllUsers() { const { data } = await supabase.from('app_users').select(NOTIFY_USER_COLS).limit(2000); return data || []; }
+
+let notifyBusy = false, notifyDigestDate = null;
+async function notifySendOne(row) {
+  // Claim it (only one server instance sends it).
+  const { data: claimed } = await supabase.from('notif_outbox').update({ status: 'sending', attempts: (row.attempts || 0) + 1 }).eq('id', row.id).eq('status', 'queued').select('id');
+  if (!claimed || !claimed.length) return;
+  if (Date.now() - Date.parse(row.created_at) > 24 * 3600000) { await supabase.from('notif_outbox').update({ status: 'skipped', last_error: 'expired (older than 24 h)' }).eq('id', row.id); return; }
+  const route = Notify.routeAddress(row.to_email, { mode: EMAIL_MODE, testTo: EMAIL_TEST_TO });
+  try {
+    const res = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: EMAIL_FROM, to: [route.to], subject: route.subjectPrefix + row.subject, html: row.html, text: row.text_body || undefined }) });
+    if (!res.ok) throw new Error(`Resend ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    await supabase.from('notif_outbox').update({ status: 'sent', sent_at: new Date().toISOString(), delivered_to: route.to, last_error: null }).eq('id', row.id);
+  } catch (e) {
+    const attempts = (row.attempts || 0) + 1, give = attempts >= 5;
+    await supabase.from('notif_outbox').update({ status: give ? 'failed' : 'queued', last_error: String(e.message).slice(0, 500), send_after: new Date(Date.now() + Notify.backoffMinutes(attempts) * 60000).toISOString() }).eq('id', row.id);
+  }
+}
+async function notifyDigests(date) {
+  const users = (await notifyAllUsers()).filter(u => u.medical_staff_id && Notify.eligible(u, 'digest'));
+  if (!users.length) return;
+  const tomorrow = OpsRoom.addDays(date, 1);
+  const [actions, meetings] = await Promise.all([
+    opsSoft(supabase.from('comm_actions').select('text, owner_id, due_on, status, deleted_at').is('deleted_at', null).eq('status', 'open').in('owner_id', users.map(u => u.medical_staff_id))),
+    opsSoft(supabase.from('comm_meetings').select('title, starts_at, location, status, audience, deleted_at').is('deleted_at', null).neq('status', 'cancelled').gte('starts_at', OpsRoom.addDays(date, -1) + 'T22:00:00Z').lte('starts_at', tomorrow + 'T23:59:59Z').order('starts_at'))
+  ]);
+  const dayLabel = Comms.fmtDay(date), fmtWhen = ts => new Date(ts).toLocaleString('es-ES', { weekday: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Madrid' });
+  // Events: those addressed to everyone, or whose audience includes the person.
+  const today = opsToday(), roster = await opsSoft(supabase.from('unit_staff').select('staff_id, unit_id').lte('assigned_from', today).or(`assigned_until.is.null,assigned_until.gte.${today}`));
+  const { data: st } = await supabase.from('medical_staff').select('id, staff_type').in('id', users.map(u => u.medical_staff_id));
+  const typeOf = Object.fromEntries((st || []).map(s => [String(s.id), s.staff_type]));
+  await notifyEnqueue(users, 'digest', u => {
+    const me = { staff_id: u.medical_staff_id, unit_ids: roster.filter(r => String(r.staff_id) === String(u.medical_staff_id)).map(r => r.unit_id), roles: [typeOf[String(u.medical_staff_id)]].filter(Boolean) };
+    const mine = actions.filter(a => String(a.owner_id) === String(u.medical_staff_id)).map(a => ({ text: a.text, due_on: a.due_on, state: Comms.actionState(a, date) }))
+      .filter(a => a.state === 'overdue' || a.state === 'due_today' || (a.due_on && a.due_on <= OpsRoom.addDays(date, 3)));
+    const evs = meetings.filter(m => !m.audience || Comms.audienceIncludes(m.audience, me, [])).map(m => ({ when: fmtWhen(m.starts_at), title: m.title, location: m.location }));
+    return Notify.digestEmail({ name: u.full_name, dayLabel, actions: mine, events: evs, link: `${COMMS_APP_URL}/?view=pendientes` });
+  }, u => `digest:${u.id}:${date}`);
+}
+async function notifyTick() {
+  if (notifyBusy) return; notifyBusy = true;
+  try {
+    const now = Notify.madridNow();
+    if (now.hour >= 7 && now.hour < 12 && notifyDigestDate !== now.date) { notifyDigestDate = now.date; await notifyDigests(now.date).catch(e => console.error('[NOTIFY] digest:', e.message)); }
+    if (!RESEND_API_KEY) return;   // queued emails wait (and expire after 24 h) until a provider is configured
+    const rows = await opsSoftOrNull(supabase.from('notif_outbox').select('*').eq('status', 'queued').lte('send_after', new Date().toISOString()).order('created_at').limit(25));
+    for (const r of rows || []) await notifySendOne(r);
+  } finally { notifyBusy = false; }
+}
+if (NODE_ENV !== 'test') { const t = setInterval(() => notifyTick().catch(e => console.error('[NOTIFY] tick:', e.message)), 60000); if (t.unref) t.unref(); }
+
+// Hooks (called after the action has succeeded; failures are logged, never returned to the user).
+async function notifyPrivateMessage(msg, staffIds) {
+  const users = await notifyUsersForStaff(staffIds);
+  return notifyEnqueue(users, 'message', () => Notify.messageEmail({ author: msg.author_name, subject: msg.subject, body: msg.body, link: `${COMMS_APP_URL}/?view=mensajes` }), u => `message:${msg.id}:${u.id}`);
+}
+async function notifyUrgentPost(post, lists) {
+  let users;
+  if (!post.audience) users = await notifyAllUsers();
+  else {
+    const today = opsToday();
+    const [{ data: staff }, roster, oncall] = await Promise.all([supabase.from('medical_staff').select('id, staff_type, employment_status, deleted_at').limit(2000),
+      opsSoft(supabase.from('unit_staff').select('staff_id, unit_id').lte('assigned_from', today).or(`assigned_until.is.null,assigned_until.gte.${today}`)),
+      post.audience.oncall_today ? commsOncall(today) : Promise.resolve([])]);
+    users = await notifyUsersForStaff(Comms.resolveRecipients(post.audience, staff || [], roster, oncall.map(o => o.staff_id)));
+  }
+  const source = [post.source_service ? (lists.labels.ic_service[post.source_service] || post.source_service) : null, post.source_detail].filter(Boolean).join(' · ');
+  return notifyEnqueue(users, 'urgent', () => Notify.urgentEmail({ title: post.title, content: post.content, source, link: commsLink('post', post.id) }), u => `urgent:${post.id}:${u.id}`);
+}
+async function notifyParte(date, text) {
+  const users = await notifyAllUsers();
+  return notifyEnqueue(users, 'parte', () => Notify.parteEmail({ dayLabel: Comms.fmtDay(date), text, link: `${COMMS_APP_URL}/?view=parte:${date}` }), u => `parte:${date}:${u.id}`);
+}
+
+// My email preferences (Mi espacio).
+app.get('/api/me/email-prefs', authenticateToken, apiLimiter, commsWrap(async (req, res) => {
+  const { data, error } = await supabase.from('app_users').select('email, notifications_enabled, email_prefs').eq('id', req.user.id).maybeSingle();
+  if (error && !/email_prefs/.test(error.message || '')) throw error;
+  const p = (data && data.email_prefs) || {};
+  res.json({ email: data ? data.email : null, mode: EMAIL_MODE, enabled: !data || data.notifications_enabled !== false,
+    kinds: Object.entries(Notify.KINDS).map(([k, v]) => ({ key: k, label: v.label, instant: v.instant, on: p[k] !== false })) });
+}));
+app.put('/api/me/email-prefs', authenticateToken, commsWrap(async (req, res) => {
+  const v = Notify.validatePrefs(req.body || {}); if (v.error) return res.status(400).json({ error: v.error });
+  const { data: cur } = await supabase.from('app_users').select('email_prefs').eq('id', req.user.id).maybeSingle();
+  const { error } = await supabase.from('app_users').update({ email_prefs: { ...((cur && cur.email_prefs) || {}), ...v.value } }).eq('id', req.user.id);
+  if (error) { if (/email_prefs/.test(error.message || '')) return res.status(409).json({ error: 'Email preferences need the NT-1 database update first.' }); throw error; }
+  res.json({ success: true });
+}));
+// One-click unsubscribe from an email (signed link; no sign-in needed).
+app.get('/api/public/email/unsubscribe', publicApiLimiterGuarded, async (req, res) => {
+  const { u, k, s } = req.query || {};
+  const page = (title, msg) => res.type('html').send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>neumDesk</title><body style="font-family:sans-serif;max-width:480px;margin:60px auto;padding:0 16px;color:#10283c"><h2>${Notify.esc(title)}</h2><p>${Notify.esc(msg)}</p></body>`);
+  if (!Notify.verifyUnsub(JWT_SECRET, u, k, s)) return res.status(400) && page('Enlace no válido', 'Este enlace no es válido o ha caducado.');
+  try {
+    const { data: cur } = await supabase.from('app_users').select('email_prefs').eq('id', u).maybeSingle();
+    if (!cur) return page('Enlace no válido', 'No encontramos la cuenta.');
+    await supabase.from('app_users').update({ email_prefs: { ...(cur.email_prefs || {}), [k]: false } }).eq('id', u);
+    page('Hecho', `Ya no recibirás «${Notify.KINDS[k].label}» por email. Puedes volver a activarlo en neumDesk → Mi espacio.`);
+  } catch { page('Error', 'No se pudo guardar. Inténtalo más tarde.'); }
+});
+// Admin: status + send a test email (to the test inbox in test mode).
+const notifyAdminOnly = (req, res, next) => opsAdmin(req) ? next() : res.status(403).json({ error: 'Forbidden', message: 'Head of department or system administrator only.' });
+app.get('/api/admin/email/status', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
+  const rows = await opsSoftOrNull(supabase.from('notif_outbox').select('status, kind, created_at, last_error').gte('created_at', new Date(Date.now() - 7 * 86400000).toISOString()).limit(2000));
+  const by = (rows || []).reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
+  res.json({ mode: EMAIL_MODE, test_inbox: EMAIL_MODE === 'test' ? EMAIL_TEST_TO : null, provider_configured: !!RESEND_API_KEY, from: EMAIL_FROM, migrated: rows !== null, last_7_days: by,
+    last_error: (rows || []).filter(r => r.last_error).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0]?.last_error || null });
+}));
+app.post('/api/admin/email/test', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
+  const { data: me } = await supabase.from('app_users').select(NOTIFY_USER_COLS).eq('id', req.user.id).maybeSingle();
+  if (!me) return res.status(404).json({ error: 'Account not found' });
+  const n = await notifyEnqueue([{ ...me, notifications_enabled: true, email_prefs: {} }], 'test', () => ({ subject: 'Prueba de notificaciones', html: Notify.layout({ heading: 'Las notificaciones funcionan', intro: `Modo: ${EMAIL_MODE === 'live' ? 'real' : 'prueba (todo va a ' + EMAIL_TEST_TO + ')'}`, blocks: [{ html: 'Este es un correo de prueba de neumDesk.' }] }) }), () => `test:${crypto.randomBytes(8).toString('hex')}`);
+  if (!n) return res.status(409).json({ error: 'Could not queue the test email (check the NT-1 database update and that your account has an email).' });
+  await notifyTick();
+  res.json({ success: true, mode: EMAIL_MODE, provider_configured: !!RESEND_API_KEY, to: EMAIL_MODE === 'test' ? EMAIL_TEST_TO : me.email });
+}));
+
 
 
 // ===== 12. LIVE STATUS =====
