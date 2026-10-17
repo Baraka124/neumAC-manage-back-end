@@ -284,5 +284,20 @@ function resolveRecipients(audience, staff, roster = [], oncallIds = [], { exclu
   return ids.filter(id => !excludeId || id !== String(excludeId));
 }
 
-module.exports = { CLINICIAN_TYPES, validateMessage, resolveRecipients, EVENT_FILES, checkEventFile, eventFilePath, publicEvent, monthGrid, POST_TYPES, SYSTEM_TYPES, PRIORITIES, COMMS_FALLBACK, validateAudience, audienceIncludes, validatePost, validateAction, actionTransition, actionState,
+/* ── "Hoy para mí" (Mi espacio): only the signed-in person's own items, most urgent first ── */
+const ACTION_ORDER = { overdue: 0, due_today: 1, open: 2 };
+function buildMyToday({ today, actions = [], interconsults = [], oncall = null, meetings = [], units = [], rotation = null, unread = 0 }) {
+  const acts = actions.map(a => ({ ...a, state: actionState(a, today) })).filter(a => a.status === 'open')
+    .sort((a, b) => ACTION_ORDER[a.state] - ACTION_ORDER[b.state] || String(a.due_on || '9999').localeCompare(String(b.due_on || '9999')));
+  const ics = interconsults.slice().sort((a, b) => (b.clock && b.clock.over ? 1 : 0) - (a.clock && a.clock.over ? 1 : 0) || String(a.received_at).localeCompare(String(b.received_at)));
+  const attention = acts.filter(a => a.state === 'overdue').length + ics.filter(i => i.clock && i.clock.over).length + units.filter(u => u.level === 'alert').length;
+  const lines = [];
+  if (oncall) lines.push(`De guardia hoy (${oncall.role})`);
+  if (rotation) lines.push(`Rotando en ${rotation.unit_name} hasta ${rotation.end_date}`);
+  if (unread) lines.push(`${unread} mensaje${unread === 1 ? '' : 's'} sin leer`);
+  return { today, attention, headline: lines, actions: acts.slice(0, 20), interconsults: ics.slice(0, 20), meetings: meetings.slice(0, 10), units, oncall, rotation, unread,
+    empty: !acts.length && !ics.length && !meetings.length && !units.length && !oncall && !rotation && !unread };
+}
+
+module.exports = { buildMyToday, CLINICIAN_TYPES, validateMessage, resolveRecipients, EVENT_FILES, checkEventFile, eventFilePath, publicEvent, monthGrid, POST_TYPES, SYSTEM_TYPES, PRIORITIES, COMMS_FALLBACK, validateAudience, audienceIncludes, validatePost, validateAction, actionTransition, actionState,
   validateMeeting, meetingSchedule, BRIEF_SECTIONS, BRIEF_DEFAULT, validateBriefEdit, buildDailyBrief, briefText, postText, meetingText, whatsappUrl, fmtDay };

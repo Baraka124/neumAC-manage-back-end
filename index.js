@@ -7153,6 +7153,41 @@ app.post('/api/me/messages/:id/archive', authenticateToken, commsWrap(async (req
   const { error } = await supabase.from('comm_message_recipients').update({ archived_at: restore ? null : commsNow(), ...(c.read_at ? {} : { read_at: commsNow() }) }).eq('id', c.id);
   if (error) throw error; res.json({ success: true });
 }));
+// ── Mi espacio "Hoy para mí": my follow-ups, my interconsultas, my guardia, my agenda, my units, my rotation, unread messages.
+// Only the signed-in person's own items; nothing about colleagues beyond what their unit status already shows.
+app.get('/api/me/today', authenticateToken, apiLimiter, commsWrap(async (req, res) => {
+  const sid = req.user.medical_staff_id, today = opsToday(), nowIso = commsNow();
+  if (!sid) return res.json(Comms.buildMyToday({ today }));
+  const [actions, ics, oncall, meetingsAll, myUnitsRows, rotR, unreadRows, staffRow] = await Promise.all([
+    opsSoft(supabase.from('comm_actions').select('id, text, due_on, status, post_id, meeting_id, deleted_at').eq('owner_id', sid).is('deleted_at', null).eq('status', 'open').limit(100)),
+    opsSoft(supabase.from('ops_interconsults').select('id, requesting_service, priority, status, received_at, answered_at, deleted_at').eq('assigned_to', sid).is('deleted_at', null).in('status', ['assigned', 'follow_up']).limit(100)),
+    commsOncall(today),
+    opsSoft(supabase.from('comm_meetings').select('id, title, kind, starts_at, location, audience, status, deleted_at').is('deleted_at', null).neq('status', 'cancelled')
+      .gte('starts_at', OpsRoom.addDays(today, -1) + 'T22:00:00Z').lte('starts_at', OpsRoom.addDays(today, 1) + 'T23:59:59Z').order('starts_at')),
+    opsSoft(supabase.from('unit_staff').select('unit_id, role').eq('staff_id', sid).lte('assigned_from', today).or(`assigned_until.is.null,assigned_until.gte.${today}`)),
+    supabase.from('resident_rotations').select('start_date, end_date, actual_start_date, actual_end_date, rotation_status, deleted_at, training_unit:training_units!resident_rotations_training_unit_id_fkey(id, unit_name)')
+      .eq('resident_id', sid).is('deleted_at', null).neq('rotation_status', 'cancelled').lte('start_date', today).gte('end_date', today).limit(3),
+    opsSoft(supabase.from('comm_message_recipients').select('id, message:comm_messages!inner(deleted_at)').eq('staff_id', sid).is('read_at', null).is('archived_at', null).is('message.deleted_at', null).limit(200)),
+    supabase.from('medical_staff').select('staff_type').eq('id', sid).maybeSingle()
+  ]);
+  const lists = await commsLists(), { icTargets } = await opsCatalog();
+  const me = { staff_id: sid, unit_ids: myUnitsRows.map(r => r.unit_id), roles: staffRow?.data?.staff_type ? [staffRow.data.staff_type] : [] };
+  const myOncall = oncall.find(o => String(o.staff_id) === String(sid)) || null;
+  const meetings = meetingsAll.filter(m => !m.audience || Comms.audienceIncludes(m.audience, me, oncall.map(o => o.staff_id)))
+    .map(m => ({ id: m.id, title: m.title, starts_at: m.starts_at, location: m.location, kind_label: lists.labels.meeting_kind[m.kind] || m.kind }));
+  let units = [];
+  if (myUnitsRows.length) {
+    const out = await opsLoadUnits(myUnitsRows.map(r => r.unit_id)), roles = OpsRoom.labelsOf(lists.cat, 'roster_role');
+    units = out.units.map(u => ({ id: u.id, name: u.unit_name, my_role: roles[(myUnitsRows.find(r => r.unit_id === u.id) || {}).role] || null,
+      level: u.pulse ? u.pulse.level : 'ok', reasons: u.pulse ? u.pulse.reasons.slice(0, 3).map(r => r.text) : [] }));
+  }
+  const rot = (rotR.data || [])[0];
+  res.json(Comms.buildMyToday({ today, unread: unreadRows.length, oncall: myOncall ? { role: myOncall.role, shift: myOncall.shift } : null,
+    actions, meetings, units,
+    interconsults: ics.map(r => ({ id: r.id, service: lists.labels.ic_service[r.requesting_service] || r.requesting_service, priority: r.priority, status: r.status, received_at: r.received_at, clock: OpsRoom.interconsultClock(r, nowIso, icTargets) })),
+    rotation: rot && rot.training_unit ? { unit_name: rot.training_unit.unit_name, unit_id: rot.training_unit.id, end_date: String(rot.actual_end_date || rot.end_date).slice(0, 10) } : null }));
+}));
+
 // ===== NOTIFICATIONS (NT-1): email to registered users =====
 // Outbox → sender with retries (actions never wait on email). Instant: private messages, urgent posts, Parte del día.
 // Daily summary at 07:00 Madrid: my follow-ups + agenda today/tomorrow (only when there is something).
