@@ -126,6 +126,9 @@ function validateMeeting(body, { kinds = null, partial = false } = {}) {
   if (body.audience !== undefined) { const a = validateAudience(body.audience); if (a.error) return a; out.audience = a.value; }
   if (body.status !== undefined) { if (!['planned', 'held', 'cancelled'].includes(body.status)) return { error: 'Unknown status.' }; out.status = body.status; }
   if (body.minutes !== undefined) out.minutes = str(body.minutes, 8000);
+  if (body.visibility !== undefined) { if (!['internal', 'public'].includes(body.visibility)) return { error: 'Visibility is internal or public.' }; out.visibility = body.visibility; }
+  if (body.description !== undefined) out.description = str(body.description, 2000);
+  if (body.banner_alt !== undefined) out.banner_alt = str(body.banner_alt, 160);
   if (body.materials !== undefined) {
     if (body.materials === null) out.materials = null;
     else {
@@ -222,5 +225,37 @@ function meetingText(m, items, link) {
 }
 const whatsappUrl = text => 'https://wa.me/?text=' + encodeURIComponent(String(text || '').slice(0, 3500));
 
-module.exports = { POST_TYPES, SYSTEM_TYPES, PRIORITIES, COMMS_FALLBACK, validateAudience, audienceIncludes, validatePost, validateAction, actionTransition, actionState,
+/* ── CM-2: event files and the public view ── */
+const EVENT_FILES = Object.freeze({
+  banner: { types: { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }, maxBytes: 5 * 1024 * 1024 },
+  flyer: { types: { 'application/pdf': '.pdf', 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp' }, maxBytes: 10 * 1024 * 1024 },
+});
+// Check the declared type AND the file's first bytes (a renamed file is refused).
+function checkEventFile(kind, mimetype, buffer) {
+  const spec = EVENT_FILES[kind]; if (!spec) return { error: 'Unknown file kind.' };
+  const ext = spec.types[mimetype]; if (!ext) return { error: kind === 'banner' ? 'The banner must be a JPEG, PNG or WEBP image.' : 'The flyer must be a PDF or an image.' };
+  if (!buffer || !buffer.length) return { error: 'Empty file.' };
+  if (buffer.length > spec.maxBytes) return { error: `Too large (max ${Math.round(spec.maxBytes / 1048576)} MB).` };
+  const b = buffer, sig = { '.jpg': b[0] === 0xff && b[1] === 0xd8, '.png': b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47,
+    '.webp': b.slice(0, 4).toString('latin1') === 'RIFF' && b.slice(8, 12).toString('latin1') === 'WEBP', '.pdf': b.slice(0, 5).toString('latin1') === '%PDF-' };
+  if (!sig[ext]) return { error: 'The file content does not match its type.' };
+  return { ext };
+}
+const eventFilePath = (meetingId, kind, ext, now = Date.now()) => `comms/meetings/${meetingId}/${kind}-${now}${ext}`;
+// What a public event shows — nothing internal (no minutes, follow-ups, audience, organiser account, creator).
+function publicEvent(m, { kindLabel, bannerUrl, flyerUrl } = {}) {
+  return { id: m.id, title: m.title, kind: m.kind, kind_label: kindLabel || m.kind, starts_at: m.starts_at, ends_at: m.ends_at || null,
+    location: m.location || null, online_url: m.online_url || null, description: m.description || null, status: m.status === 'cancelled' ? 'cancelled' : 'scheduled',
+    banner_url: bannerUrl || null, banner_alt: m.banner_alt || m.title, flyer_url: flyerUrl || null, flyer_name: m.flyer_name || null };
+}
+// Month grid (Monday first) for the calendar: weeks of 7 days, each { date, in_month }.
+function monthGrid(year, month /* 1-12 */) {
+  const first = new Date(Date.UTC(year, month - 1, 1)), start = new Date(first); start.setUTCDate(1 - ((first.getUTCDay() + 6) % 7));
+  const weeks = []; let d = new Date(start);
+  do { const w = []; for (let i = 0; i < 7; i++) { w.push({ date: d.toISOString().slice(0, 10), in_month: d.getUTCMonth() === month - 1 }); d.setUTCDate(d.getUTCDate() + 1); } weeks.push(w); }
+  while (d.getUTCMonth() === month - 1);
+  return weeks;
+}
+
+module.exports = { EVENT_FILES, checkEventFile, eventFilePath, publicEvent, monthGrid, POST_TYPES, SYSTEM_TYPES, PRIORITIES, COMMS_FALLBACK, validateAudience, audienceIncludes, validatePost, validateAction, actionTransition, actionState,
   validateMeeting, meetingSchedule, BRIEF_SECTIONS, BRIEF_DEFAULT, validateBriefEdit, buildDailyBrief, briefText, postText, meetingText, whatsappUrl, fmtDay };
