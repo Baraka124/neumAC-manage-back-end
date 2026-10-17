@@ -96,7 +96,7 @@ test('indicator validation: unit-only kinds, measure required, direction, target
   assert.match(O.validateIndicator({ name: 'X ok', kind: 'manual' }, { unitScoped: false }).error, /minimum or a maximum/);
   assert.match(O.validateIndicator({ name: 'X ok', kind: 'manual', direction: 'min', target: -1 }, { unitScoped: false }).error, /from 0/);
   assert.deepEqual(O.validateIndicator({ name: 'IC urgentes', kind: 'interconsult_within_target_pct', params: { priority: 'urgent' }, direction: 'min', target: 90, iso_clause: '7101 §8.2' }, { unitScoped: false }).value,
-    { name: 'IC urgentes', kind: 'interconsult_within_target_pct', params: { priority: 'urgent' }, period: 'month', direction: 'min', target: 90, iso_clause: '7101 §8.2' });
+    { name: 'IC urgentes', kind: 'interconsult_within_target_pct', params: { priority: 'urgent' }, period: 'month', direction: 'min', target: 90 });   // ISO clause no longer accepted
 });
 
 const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');

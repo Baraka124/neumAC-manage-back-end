@@ -393,7 +393,8 @@ function validateIndicator(body, { unitScoped, partial = false } = {}) {
   if (!partial || body.period !== undefined) { const p = body.period || 'month'; if (!['week', 'month', 'quarter'].includes(p)) return { error: 'Period must be week, month or quarter.' }; out.period = p; }
   if (!partial || body.direction !== undefined) { if (!['min', 'max'].includes(body.direction)) return { error: 'Say whether the target is a minimum or a maximum.' }; out.direction = body.direction; }
   if (body.target !== undefined) { if (body.target === null || body.target === '') out.target = null; else { const t = Number(body.target); if (!Number.isFinite(t) || t < 0) return { error: 'The target must be a number from 0.' }; out.target = t; } }
-  for (const [k, max] of [['iso_clause', 40], ['notes', 300], ['unit_label', 20]]) if (body[k] !== undefined) out[k] = str(body[k], max);
+  // The ISO clause field was removed (17 Oct 2026): it is no longer accepted; old values stay in the column, unused.
+  for (const [k, max] of [['notes', 300], ['unit_label', 20]]) if (body[k] !== undefined) out[k] = str(body[k], max);
   if (body.owner_id !== undefined) out.owner_id = body.owner_id || null;
   if (body.active !== undefined) out.active = body.active === true;
   return { value: out };
@@ -572,7 +573,7 @@ function buildUnitReport(rp, data) {
   const indicators = (data.indicators || []).map(({ def, data: d }) => {
     const v = indicatorValue(def, rp, d, data.today), t = Array.isArray(def.targets) ? targetAt(def.targets, rp.end) : (def.target !== null && def.target !== undefined ? { value: def.target, direction: def.direction } : null);
     const tv = t && t.value !== null && t.value !== undefined ? Number(t.value) : null, dir = (t && t.direction) || def.direction;
-    return { name: def.name, kind: def.kind, value: v === undefined ? null : v, target: tv, direction: dir, met: v === null || v === undefined || tv === null ? null : (dir === 'min' ? v >= tv : v <= tv), iso_clause: def.iso_clause || null };
+    return { name: def.name, kind: def.kind, value: v === undefined ? null : v, target: tv, direction: dir, met: v === null || v === undefined || tv === null ? null : (dir === 'min' ? v >= tv : v <= tv) };
   });
   return { kind: 'unit', unit: { id: data.unit.id, name: data.unit.unit_name, code: data.unit.unit_code }, period: rp.period, start: rp.start, end: rp.end, previous: rp.previous,
     team: data.roster || null, activity, pending,
