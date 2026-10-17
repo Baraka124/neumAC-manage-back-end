@@ -3,6 +3,8 @@
 The plan of record and the full **handoff** live in the frontend repo: `OPS_ROOMS.md` (§8 "Handoff — how to continue")
 in `Baraka124/neumAC-manage-Frontend-end`. Read that first.
 
+**How to design and extend the backend (principles, layers, weaknesses, checklist): `OPS_ROOM_BACKEND.md`.**
+
 Backend quick map:
 - Rules (pure, tested): `ops-room.js` — roster, resources/events, measures, incidents, interconsultas (`IC_*`,
   provisional targets `IC_TARGET_HOURS`), indicator engine (`IND_KINDS`, `periodBounds`, `computeIndicator`).
