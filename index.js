@@ -6782,10 +6782,11 @@ app.get('/api/comms/overview', authenticateToken, commsCan('read'), apiLimiter, 
     .gte('starts_at', OpsRoom.addDays(today, -1) + 'T00:00:00Z').lte('starts_at', OpsRoom.addDays(today, 45) + 'T23:59:59Z').order('starts_at').limit(100));
   const brief = await opsSoftOrNull(supabase.from('comm_daily_briefs').select('id, brief_date, status, sent_at, post_id').eq('brief_date', today).limit(1));
   const names = await commsStaffNames([...(actions || []).map(a => a.owner_id), ...(meetings || []).map(m => m.organizer_id)]);
+  const meetingsF = meetings ? await commsWithFileUrls(meetings) : null;
   res.json({ today, migrated: actions !== null, me,
     posts: posts.map(p => commsShapePost(p, lists, me, oncallIds)),
     actions: (actions || []).map(a => ({ ...a, owner_name: a.owner_id ? names[String(a.owner_id)] || null : null, state: Comms.actionState(a, today), mine: !!me.staff_id && String(a.owner_id) === String(me.staff_id) })),
-    meetings: (meetings || []).map(m => ({ ...m, items: undefined, item_count: (m.items || []).length, kind_label: lists.labels.meeting_kind[m.kind] || m.kind, organizer_name: m.organizer_id ? names[String(m.organizer_id)] || null : null,
+    meetings: (meetingsF || []).map(m => ({ ...m, items: undefined, item_count: (m.items || []).length, kind_label: lists.labels.meeting_kind[m.kind] || m.kind, organizer_name: m.organizer_id ? names[String(m.organizer_id)] || null : null,
       for_me: !!m.audience && Comms.audienceIncludes(m.audience, me, oncallIds), link: commsLink('meeting', m.id) })),
     brief: brief && brief[0] ? brief[0] : null, oncall_today: oncall,
     lists: { post_types: Comms.POST_TYPES, categories: (lists.cat.comm_category || []).map(i => ({ code: i.code, label: i.label, active: i.active })),
@@ -6881,7 +6882,8 @@ async function commsMeetingFull(id) {
   const names = await commsStaffNames([m.organizer_id, ...(items || []).map(i => i.presenter_id), ...(actions || []).map(a => a.owner_id)]);
   const lists = await commsLists(), today = opsToday();
   const its = (items || []).map(i => ({ ...i, presenter: i.presenter_id ? names[String(i.presenter_id)] || null : i.presenter_name }));
-  const meeting = { ...m, kind_label: lists.labels.meeting_kind[m.kind] || m.kind, organizer_name: m.organizer_id ? names[String(m.organizer_id)] || null : null, link: commsLink('meeting', m.id) };
+  const [withUrls] = await commsWithFileUrls([m]);
+  const meeting = { ...withUrls, kind_label: lists.labels.meeting_kind[m.kind] || m.kind, organizer_name: m.organizer_id ? names[String(m.organizer_id)] || null : null, link: commsLink('meeting', m.id) };
   const text = Comms.meetingText(meeting, its, meeting.link);
   return { meeting, items: Comms.meetingSchedule(m.starts_at, its), actions: (actions || []).map(a => ({ ...a, owner_name: a.owner_id ? names[String(a.owner_id)] || null : null, state: Comms.actionState(a, today) })),
     share: { text, whatsapp: Comms.whatsappUrl(text) } };
@@ -6895,7 +6897,8 @@ app.get('/api/comms/meetings', authenticateToken, commsCan('read'), apiLimiter, 
   const from = isoOk(req.query.from) ? req.query.from : OpsRoom.addDays(today, -90), to = isoOk(req.query.to) ? req.query.to : OpsRoom.addDays(today, 120);
   const rows = await opsSoftOrNull(supabase.from('comm_meetings').select('*, items:comm_meeting_items(id)').is('deleted_at', null).gte('starts_at', from + 'T00:00:00Z').lte('starts_at', to + 'T23:59:59Z').order('starts_at').limit(400));
   const lists = await commsLists(), names = await commsStaffNames((rows || []).map(m => m.organizer_id));
-  res.json({ from, to, migrated: rows !== null, meetings: (rows || []).map(m => ({ ...m, items: undefined, item_count: (m.items || []).length, kind_label: lists.labels.meeting_kind[m.kind] || m.kind, organizer_name: m.organizer_id ? names[String(m.organizer_id)] || null : null, link: commsLink('meeting', m.id) })) });
+  const rowsF = rows ? await commsWithFileUrls(rows) : [];
+  res.json({ from, to, migrated: rows !== null, meetings: rowsF.map(m => ({ ...m, items: undefined, item_count: (m.items || []).length, kind_label: lists.labels.meeting_kind[m.kind] || m.kind, organizer_name: m.organizer_id ? names[String(m.organizer_id)] || null : null, link: commsLink('meeting', m.id) })) });
 }));
 app.get('/api/comms/meetings/:id', authenticateToken, commsCan('read'), apiLimiter, commsWrap(async (req, res) => {
   const full = await commsMeetingFull(req.params.id); if (!full) return res.status(404).json({ error: 'Meeting not found' }); res.json(full);
@@ -6937,6 +6940,83 @@ app.post('/api/comms/meetings/:id/announce', authenticateToken, commsCan('post')
     created_by: req.user.id, created_by_name: req.user.full_name || 'Staff', created_at: commsNow(), updated_at: commsNow(), announcement_id: generateId('ANN') }).select('*').single();
   if (error) throw error; res.status(201).json({ success: true, post: data, share: full.share });
 }));
+
+// ── CM-2: event banner / flyer and the public events feed ──
+// Files: private `attachments` bucket under comms/meetings/<id>/…, served through 1-hour signed links.
+const eventUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
+async function commsSignedMap(paths) {
+  const list = [...new Set((paths || []).filter(Boolean))];
+  if (!list.length) return {};
+  const { data, error } = await supabase.storage.from(ATTACHMENT_BUCKET).createSignedUrls(list, 3600);
+  if (error) return {};
+  return Object.fromEntries((data || []).filter(x => x.signedUrl).map(x => [x.path, x.signedUrl]));
+}
+async function commsWithFileUrls(meetings) {
+  const urls = await commsSignedMap(meetings.flatMap(m => [m.banner_path, m.flyer_path]));
+  return meetings.map(m => ({ ...m, banner_url: m.banner_path ? urls[m.banner_path] || null : null, flyer_url: m.flyer_path ? urls[m.flyer_path] || null : null }));
+}
+async function commsMeetingEditable(req, id) {
+  const { data: row, error } = await supabase.from('comm_meetings').select('*').eq('id', id).maybeSingle();
+  if (error) throw error; if (!row || row.deleted_at) return { status: 404 };
+  const mine = String(row.created_by) === String(req.user.id) || (req.user.medical_staff_id && String(row.organizer_id) === String(req.user.medical_staff_id));
+  if (!mine && !(await commsAllowed(req, 'edit'))) return { status: 403 };
+  return { row };
+}
+app.post('/api/comms/meetings/:id/files/:kind', authenticateToken, commsCan('read'), (req, res, next) => eventUpload.single('file')(req, res, e => e ? res.status(400).json({ error: e.code === 'LIMIT_FILE_SIZE' ? 'Too large (max 10 MB).' : 'Upload failed.' }) : next()), commsWrap(async (req, res) => {
+  const kind = req.params.kind;
+  if (!Comms.EVENT_FILES[kind]) return res.status(400).json({ error: 'Upload a banner or a flyer.' });
+  const r = await commsMeetingEditable(req, req.params.id);
+  if (r.status === 404) return res.status(404).json({ error: 'Meeting not found' });
+  if (r.status === 403) return res.status(403).json({ error: 'Only its organiser, its author or an editor can change this event.' });
+  if (!req.file) return res.status(400).json({ error: 'No file received.' });
+  const chk = Comms.checkEventFile(kind, req.file.mimetype, req.file.buffer); if (chk.error) return res.status(400).json({ error: chk.error });
+  const objectPath = Comms.eventFilePath(r.row.id, kind, chk.ext);
+  const { error: upErr } = await supabase.storage.from(ATTACHMENT_BUCKET).upload(objectPath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
+  if (upErr) throw upErr;
+  const col = kind === 'banner' ? 'banner_path' : 'flyer_path', old = r.row[col];
+  const patch = { [col]: objectPath, updated_at: commsNow() };
+  if (kind === 'flyer') patch.flyer_name = String(req.file.originalname || 'flyer').replace(/[^\w.\- ()áéíóúñÁÉÍÓÚÑ]/g, '').slice(0, 160) || 'flyer';
+  if (kind === 'banner' && req.body && req.body.alt !== undefined) patch.banner_alt = String(req.body.alt || '').slice(0, 160) || null;
+  const { error } = await supabase.from('comm_meetings').update(patch).eq('id', r.row.id);
+  if (error) { await supabase.storage.from(ATTACHMENT_BUCKET).remove([objectPath]); throw error; }
+  if (old) await supabase.storage.from(ATTACHMENT_BUCKET).remove([old]);
+  res.status(201).json({ success: true, ...(await commsMeetingFull(r.row.id)) });
+}));
+app.delete('/api/comms/meetings/:id/files/:kind', authenticateToken, commsCan('read'), commsWrap(async (req, res) => {
+  const kind = req.params.kind; if (!Comms.EVENT_FILES[kind]) return res.status(400).json({ error: 'Unknown file.' });
+  const r = await commsMeetingEditable(req, req.params.id);
+  if (r.status === 404) return res.status(404).json({ error: 'Meeting not found' });
+  if (r.status === 403) return res.status(403).json({ error: 'Only its organiser, its author or an editor can change this event.' });
+  const col = kind === 'banner' ? 'banner_path' : 'flyer_path', old = r.row[col];
+  const { error } = await supabase.from('comm_meetings').update({ [col]: null, ...(kind === 'flyer' ? { flyer_name: null } : {}), updated_at: commsNow() }).eq('id', r.row.id);
+  if (error) throw error;
+  if (old) await supabase.storage.from(ATTACHMENT_BUCKET).remove([old]);
+  res.json({ success: true, ...(await commsMeetingFull(r.row.id)) });
+}));
+
+// PUBLIC (no sign-in): events marked public — only the fields in Comms.publicEvent. For the website / a public page later.
+const PUBLIC_EVENT_COLS = 'id, title, kind, starts_at, ends_at, location, online_url, description, status, banner_path, banner_alt, flyer_path, flyer_name, visibility, deleted_at';
+app.get('/api/public/events', publicApiLimiterGuarded, async (req, res) => {
+  try {
+    const isoOk = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || '')), today = opsToday();
+    const from = isoOk(req.query.from) ? req.query.from : OpsRoom.addDays(today, -30), to = isoOk(req.query.to) ? req.query.to : OpsRoom.addDays(today, 365);
+    const rows = await opsSoftOrNull(supabase.from('comm_meetings').select(PUBLIC_EVENT_COLS).eq('visibility', 'public').is('deleted_at', null)
+      .gte('starts_at', from + 'T00:00:00Z').lte('starts_at', to + 'T23:59:59Z').order('starts_at').limit(200));
+    const lists = await commsLists(), withUrls = await commsWithFileUrls(rows || []);
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.json({ from, to, events: withUrls.map(m => Comms.publicEvent(m, { kindLabel: lists.labels.meeting_kind[m.kind], bannerUrl: m.banner_url, flyerUrl: m.flyer_url })) });
+  } catch (e) { res.status(500).json({ error: 'Failed to load events' }); }
+});
+app.get('/api/public/events/:id', publicApiLimiterGuarded, async (req, res) => {
+  try {
+    if (!/^[0-9a-f-]{36}$/i.test(req.params.id)) return res.status(404).json({ error: 'Event not found' });
+    const { data: m } = await supabase.from('comm_meetings').select(PUBLIC_EVENT_COLS).eq('id', req.params.id).maybeSingle();
+    if (!m || m.deleted_at || m.visibility !== 'public') return res.status(404).json({ error: 'Event not found' });   // internal events look like missing ones
+    const lists = await commsLists(), [withUrls] = await commsWithFileUrls([m]);
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    res.json({ event: Comms.publicEvent(withUrls, { kindLabel: lists.labels.meeting_kind[m.kind], bannerUrl: withUrls.banner_url, flyerUrl: withUrls.flyer_url }) });
+  } catch (e) { res.status(500).json({ error: 'Failed to load event' }); }
+});
 
 // ── Parte del día ──
 async function commsBriefData(date, row) {

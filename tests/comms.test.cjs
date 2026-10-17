@@ -112,3 +112,40 @@ test('migration: additive, RLS + audit on every new table, lists editable, no pa
   assert.match(mig, /'comm_category','meeting_kind'\)\)/);
   for (const banned of ['patient_name', 'nhc', 'dni', 'birth', 'diagnosis']) assert.ok(!mig.toLowerCase().includes(banned), banned);
 });
+
+/* ── CM-2: events with banner / flyer, internal or public ── */
+const mig2 = fs.readFileSync(path.join(__dirname, '..', 'migrations', '2026-10-17_comms_cm2_event_visibility_banner.sql'), 'utf8');
+test('event files: banner = image, flyer = PDF or image; content must match the type; size capped', () => {
+  const jpg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0]), png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]), pdf = Buffer.from('%PDF-1.7 …');
+  assert.equal(C.checkEventFile('banner', 'image/jpeg', jpg).ext, '.jpg');
+  assert.equal(C.checkEventFile('banner', 'image/png', png).ext, '.png');
+  assert.match(C.checkEventFile('banner', 'application/pdf', pdf).error, /JPEG, PNG or WEBP/);
+  assert.equal(C.checkEventFile('flyer', 'application/pdf', pdf).ext, '.pdf');
+  assert.match(C.checkEventFile('banner', 'image/png', jpg).error, /does not match/);                // renamed file refused
+  assert.match(C.checkEventFile('flyer', 'image/svg+xml', Buffer.from('<svg/>')).error, /PDF or an image/);   // no SVG (scripts)
+  assert.match(C.checkEventFile('banner', 'image/jpeg', Buffer.alloc(6 * 1024 * 1024, 0xff)).error, /Too large/);
+  assert.match(C.eventFilePath('m1', 'banner', '.jpg', 5), /^comms\/meetings\/m1\/banner-5\.jpg$/);
+});
+test('public event: only safe fields — never minutes, follow-ups, audience or who created it', () => {
+  const m = { id: 'm1', title: 'Seminario VMNI', kind: 'seminario', starts_at: '2026-11-05T15:00:00Z', location: 'Salón de actos', description: 'Abierto a residentes de Galicia',
+    minutes: 'acta interna', audience: { roles: ['medical_resident'] }, created_by: 'u1', organizer_id: 's1', banner_path: 'comms/meetings/m1/banner-1.jpg', status: 'planned', visibility: 'public' };
+  const p = C.publicEvent(m, { kindLabel: 'Seminario', bannerUrl: 'https://signed/x' });
+  assert.deepEqual(Object.keys(p).sort(), ['banner_alt', 'banner_url', 'description', 'ends_at', 'flyer_name', 'flyer_url', 'id', 'kind', 'kind_label', 'location', 'online_url', 'starts_at', 'status', 'title']);
+  assert.equal(p.status, 'scheduled'); assert.equal(p.banner_alt, 'Seminario VMNI');
+  assert.equal(C.publicEvent({ ...m, status: 'cancelled' }).status, 'cancelled');
+  assert.equal(C.validateMeeting({ title: 'X y', starts_at: '2026-11-05T15:00:00Z', visibility: 'secret' }).error, 'Visibility is internal or public.');
+  assert.equal(C.validateMeeting({ title: 'X y', starts_at: '2026-11-05T15:00:00Z', visibility: 'public', description: 'd'.repeat(3000) }).value.description.length, 2000);
+});
+test('calendar month grid: Monday first, whole weeks', () => {
+  const g = C.monthGrid(2026, 10);
+  assert.equal(g[0][0].date, '2026-09-28'); assert.equal(g[0][3].date, '2026-10-01'); assert.equal(g[0][3].in_month, true);
+  assert.ok(g.every(w => w.length === 7)); assert.equal(g[g.length - 1][6].date, '2026-11-01');
+});
+test('CM-2 routes and migration: private bucket + signed links; public feed without sign-in; internal looks missing', () => {
+  assert.match(idx, /app\.get\('\/api\/public\/events', publicApiLimiterGuarded,/);
+  assert.match(idx, /if \(!m \|\| m\.deleted_at \|\| m\.visibility !== 'public'\) return res\.status\(404\)/);
+  assert.match(idx, /createSignedUrls\(list, 3600\)/);
+  assert.match(idx, /app\.post\('\/api\/comms\/meetings\/:id\/files\/:kind', authenticateToken/);
+  assert.match(mig2, /visibility text not null default 'internal'/);
+  assert.match(mig2, /Run AFTER 2026-10-17_comms_cm1/);
+});
