@@ -322,7 +322,7 @@ app.use(express.json({ limit: '10mb' }));
 app.get('/api/release',(req,res)=>{res.setHeader('Cache-Control','no-store');res.json(require('./release.json'))});
 app.use('/api',(req,res,next)=>{
  const supplied=req.get('X-Neumdesk-Release');
- if(!['GET','HEAD','OPTIONS'].includes(req.method) && (req.get('Authorization')||['/auth/login','/auth/complete-password-setup'].includes(req.path)) && supplied!==require('./release.json').id)return res.status(409).json({error:'Release mismatch',message:'Refresh the frontend or deploy the matching backend before saving changes.'});
+ if(!req.path.startsWith('/feed/') && !['GET','HEAD','OPTIONS'].includes(req.method) && (req.get('Authorization')||['/auth/login','/auth/complete-password-setup'].includes(req.path)) && supplied!==require('./release.json').id)return res.status(409).json({error:'Release mismatch',message:'Refresh the frontend or deploy the matching backend before saving changes.'});
  next();
 });
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -968,7 +968,7 @@ app.use('/api', async (req, res, next) => {
   // the public status and the contact form are always served.
   if (req.path.startsWith('/auth/') || req.path.startsWith('/api/auth/') ||
       req.path.startsWith('/public/') || req.path.startsWith('/api/public/') ||
-      req.path.includes('/website') || req.path.endsWith('/contact')) return next()
+      req.path.includes('/website') || req.path.endsWith('/contact') || req.path.startsWith('/feed/')) return next()  // hospital feeds (IM-1) keep flowing
   const now = Date.now()
   if (now - _maintenanceCache.at > 30000) {
     try {
@@ -4908,6 +4908,127 @@ async function opsBuildDeptReport(rp) {
     indicators: data ? defs.map(d => opsScopeIndicator(d, data)) : [] });
 }
 // Save (insert or replace) the snapshot of one period. Returns null before the OR-R migration.
+
+// ===== IMPORTS (IM-1): hospital activity counts → Ops measures =====
+// Mappings (hospital system + key → unit measure [+ category]) · preview (no writes) · commit (one transaction, checksum = once)
+// · batch history + undo · token feed. Manual values are never overwritten. Counts only; patient-like columns reject the file.
+// Rules: imports.js. Department-wide → head of department / system admin.
+const Imports = require('./imports.js');
+const OPS_FEED_TOKEN = process.env.OPS_FEED_TOKEN || '';
+const IMPORT_MAP_COLS = 'id, system, external_key, unit_id, type_id, category_code, active, note, updated_at';
+const imNeeds = res => res.status(409).json({ error: 'Imports need the IM-1 database update (migrations/2026-10-17_import_im1_mappings_batches.sql).' });
+async function imContext(system, rows) {
+  const mappings = await opsSoftOrNull(supabase.from('ops_import_mappings').select(IMPORT_MAP_COLS).eq('system', system));
+  if (mappings === null) return null;
+  const typeIds = [...new Set(mappings.map(m => String(m.type_id)))];
+  const tq = cols => supabase.from('ops_measure_types').select(cols).in('id', typeIds.length ? typeIds : ['00000000-0000-0000-0000-000000000000']);
+  const typeRows = await opsCompat(() => tq('id, unit_id, label, kind, active, breakdown'), () => tq('id, unit_id, label, kind, active'));
+  const { cat } = await opsCatalog();
+  const categories = Object.fromEntries(Object.entries(cat || {}).map(([k, items]) => [k, (items || []).map(i => i.code)]));
+  const types = Object.fromEntries(typeRows.map(t => [String(t.id), t]));
+  // Existing values for the touched types and dates (plan once without, then fetch what it touches).
+  const first = Imports.planImport({ rows, system, today: opsToday(), mappings, types, categories, existing: [] });
+  let existing = [];
+  if (first.range && first.groups) {
+    const ids = [...new Set(first.writes.map(w => w.type_id))];
+    if (ids.length) existing = await opsCompat(
+      () => supabase.from('ops_measurements').select('id, type_id, measured_on, value, breakdown, source').in('type_id', ids).gte('measured_on', first.range.from).lte('measured_on', first.range.to).limit(20000),
+      () => supabase.from('ops_measurements').select('id, type_id, measured_on, value, source').in('type_id', ids).gte('measured_on', first.range.from).lte('measured_on', first.range.to).limit(20000));
+  }
+  return { mappings, types, categories, existing };
+}
+async function imPlan(system, parsed) {
+  const ctx = await imContext(system, parsed.rows);
+  if (!ctx) return null;
+  const plan = Imports.planImport({ rows: parsed.rows, system, today: opsToday(), ...ctx });
+  const dup = await opsSoftOrNull(supabase.from('ops_import_batches').select('id, created_at, filename, channel').eq('system', system).eq('checksum', plan.checksum).eq('status', 'committed').limit(1));
+  return { ...plan, already_imported: dup && dup[0] ? dup[0] : null };
+}
+async function imCommit({ system, channel, filename, plan, userId }) {
+  const counts = { rows: plan.rows, values: plan.groups, inserted_planned: plan.plan.insert, updated_planned: plan.plan.update, unchanged: plan.plan.unchanged,
+    manual_kept: plan.plan.manual_kept.length, errors: plan.errors.length };
+  const r = await opsRpc('ops_import_commit', { p_system: system, p_channel: channel, p_filename: filename || null, p_checksum: plan.checksum, p_counts: counts,
+    p_from: plan.range?.from || null, p_to: plan.range?.to || null, p_user: userId || null, p_rows: plan.writes });
+  if (r.missing) return { missing: true };
+  opsCache.bust('');
+  return { batch: Array.isArray(r.data) ? r.data[0] : r.data };
+}
+const imPreviewOut = p => ({ rows: p.rows, values: p.groups, range: p.range, plan: p.plan, errors: p.errors.slice(0, 200), error_count: p.errors.length,
+  unknown_keys: p.unknown_keys.slice(0, 50), already_imported: p.already_imported, checksum: p.checksum });
+
+app.get('/api/ops/import/mappings', authenticateToken, opsDeptOnlyEarly, opsWrap(async (req, res) => {
+  const rows = await opsSoftOrNull(supabase.from('ops_import_mappings').select(IMPORT_MAP_COLS).order('system').order('external_key').limit(2000));
+  res.json({ migrated: rows !== null, mappings: rows || [], feed_enabled: !!OPS_FEED_TOKEN, max_rows: Imports.MAX_ROWS });
+}));
+app.post('/api/ops/import/mappings', authenticateToken, opsDeptOnlyEarly, opsWrap(async (req, res) => {
+  const v = Imports.validateMapping(req.body || {}); if (v.error) return res.status(400).json({ error: v.error });
+  const { data: t } = await supabase.from('ops_measure_types').select('id, unit_id').eq('id', v.value.type_id).maybeSingle();
+  if (!t || String(t.unit_id) !== String(v.value.unit_id)) return res.status(400).json({ error: 'That measure does not belong to the chosen unit.' });
+  const { data, error } = await supabase.from('ops_import_mappings').insert({ ...v.value, created_by: req.user.id }).select(IMPORT_MAP_COLS).single();
+  if (error) { if (error.code === '42P01') return imNeeds(res); if (error.code === '23505') return res.status(409).json({ error: 'That hospital key is already mapped for this system.' }); throw error; }
+  res.status(201).json({ success: true, mapping: data });
+}));
+app.put('/api/ops/import/mappings/:id', authenticateToken, opsDeptOnlyEarly, opsWrap(async (req, res) => {
+  const v = Imports.validateMapping(req.body || {}, { partial: true }); if (v.error) return res.status(400).json({ error: v.error });
+  const { data, error } = await supabase.from('ops_import_mappings').update({ ...v.value, updated_at: new Date().toISOString() }).eq('id', req.params.id).select(IMPORT_MAP_COLS).maybeSingle();
+  if (error) { if (error.code === '23505') return res.status(409).json({ error: 'That hospital key is already mapped for this system.' }); throw error; }
+  if (!data) return res.status(404).json({ error: 'Mapping not found' });
+  res.json({ success: true, mapping: data });
+}));
+app.delete('/api/ops/import/mappings/:id', authenticateToken, opsDeptOnlyEarly, opsWrap(async (req, res) => {
+  const { error } = await supabase.from('ops_import_mappings').delete().eq('id', req.params.id); if (error) throw error;
+  res.json({ success: true });
+}));
+// Preview: parse + plan, no writes. Body: { system, filename, csv }.
+app.post('/api/ops/import/preview', authenticateToken, opsDeptOnlyEarly, apiLimiter, opsWrap(async (req, res) => {
+  const system = String(req.body?.system || '').trim().toLowerCase();
+  if (!/^[a-z0-9_]{2,30}$/.test(system)) return res.status(400).json({ error: 'Choose the hospital system.' });
+  const parsed = Imports.parseFile(req.body?.csv); if (parsed.error) return res.status(400).json(parsed);
+  const plan = await imPlan(system, parsed); if (!plan) return imNeeds(res);
+  res.json({ ...imPreviewOut(plan), columns: parsed.columns });
+}));
+// Commit: re-plans on the server (never trusts a client plan). Refuses if there are row errors unless accept_errors=true.
+app.post('/api/ops/import/commit', authenticateToken, opsDeptOnlyEarly, apiLimiter, opsWrap(async (req, res) => {
+  const system = String(req.body?.system || '').trim().toLowerCase();
+  if (!/^[a-z0-9_]{2,30}$/.test(system)) return res.status(400).json({ error: 'Choose the hospital system.' });
+  const parsed = Imports.parseFile(req.body?.csv); if (parsed.error) return res.status(400).json(parsed);
+  const plan = await imPlan(system, parsed); if (!plan) return imNeeds(res);
+  if (plan.already_imported) return res.status(409).json({ error: 'This exact data was already imported.', batch: plan.already_imported });
+  if (plan.errors.length && !req.body?.accept_errors) return res.status(400).json({ error: `${plan.errors.length} row(s) have errors. Fix them or import the valid rows only.`, ...imPreviewOut(plan) });
+  if (!plan.writes.length) return res.status(400).json({ error: 'Nothing to import: every value is unchanged or entered by hand.', ...imPreviewOut(plan) });
+  const out = await imCommit({ system, channel: 'upload', filename: String(req.body?.filename || '').slice(0, 200), plan, userId: req.user.id });
+  if (out.missing) return imNeeds(res);
+  res.status(201).json({ success: true, batch: out.batch, preview: imPreviewOut(plan) });
+}));
+app.get('/api/ops/import/batches', authenticateToken, opsDeptOnlyEarly, opsWrap(async (req, res) => {
+  const rows = await opsSoftOrNull(supabase.from('ops_import_batches').select('id, system, channel, filename, status, counts, range_from, range_to, created_by, created_at, undone_at').order('created_at', { ascending: false }).limit(100));
+  res.json({ migrated: rows !== null, batches: rows || [] });
+}));
+app.post('/api/ops/import/batches/:id/undo', authenticateToken, opsDeptOnlyEarly, opsWrap(async (req, res) => {
+  const r = await opsRpc('ops_import_undo', { p_batch: req.params.id, p_user: req.user.id }).catch(e => ({ fail: e }));
+  if (r.missing) return imNeeds(res);
+  if (r.fail) { const m = r.fail.message || ''; if (/not found/.test(m)) return res.status(404).json({ error: 'Batch not found' }); if (/already undone/.test(m)) return res.status(409).json({ error: 'This import was already undone.' }); throw r.fail; }
+  opsCache.bust('');
+  res.json({ success: true, batch: Array.isArray(r.data) ? r.data[0] : r.data });
+}));
+// Feed: a hospital system posts counts with a token. Off unless OPS_FEED_TOKEN is set (then 404 hides it).
+// Body JSON { system, rows: [{ key, date, value, category? }] } or { system, csv }. Re-sending the same data is a no-op.
+app.post('/api/feed/ops/measurements', publicApiLimiterGuarded, opsWrap(async (req, res) => {
+  if (!OPS_FEED_TOKEN) return res.status(404).json({ error: 'Not found' });
+  const given = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '') || String(req.headers['x-feed-token'] || '');
+  if (!Imports.tokenOk(given, OPS_FEED_TOKEN)) return res.status(401).json({ error: 'Invalid feed token' });
+  const system = String(req.body?.system || '').trim().toLowerCase();
+  if (!/^[a-z0-9_]{2,30}$/.test(system)) return res.status(400).json({ error: 'system is required (2–30 lowercase letters, digits or _).' });
+  const parsed = req.body?.csv ? Imports.parseFile(req.body.csv) : Imports.fromFeed(req.body?.rows);
+  if (parsed.error) return res.status(400).json(parsed);
+  const plan = await imPlan(system, parsed); if (!plan) return imNeeds(res);
+  if (plan.already_imported) return res.json({ success: true, duplicate: true, batch_id: plan.already_imported.id });
+  if (!plan.writes.length) return res.json({ success: true, written: 0, plan: plan.plan, errors: plan.errors.slice(0, 100) });
+  const out = await imCommit({ system, channel: 'feed', filename: null, plan, userId: null });
+  if (out.missing) return imNeeds(res);
+  res.status(201).json({ success: true, batch_id: out.batch?.id, counts: out.batch?.counts, errors: plan.errors.slice(0, 100) });
+}));
+
 async function opsStoreReport(scope, unitId, rp, content, userId) {
   const atomic = await opsRpc('ops_store_report', { p_scope: scope, p_unit: unitId || null, p_period: rp.period, p_start: rp.start, p_end: rp.end, p_content: { ...content, complete: rp.complete }, p_user: userId || null }).catch(e => { if (/ops_reports/.test(e.message || '') && /does not exist/i.test(e.message || '')) return { data: null, noTable: true }; throw e; });
   if (atomic.noTable) return null;

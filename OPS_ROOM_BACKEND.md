@@ -42,6 +42,8 @@ Rule of thumb: **if it decides something, it is a pure function with a test.** R
 | `outlook.js` | next-weeks signals from the plan + trends against set targets |
 | `narrative.js` | report "in plain words" |
 | `notify.js` | who may get which email, test-mode routing, signed unsubscribe, email bodies, digest |
+| `jobs.js` | daily job windows, run lock + retry rules, admin summary, TTL cache |
+| `imports.js` | CSV/feed parsing, patient-column guard, key → measure plan, manual-kept rule, checksum |
 
 ## 3. Data model rules
 
@@ -139,7 +141,7 @@ tests prove a guard *is written*, not that it *works*. See §8.
    process, jobs wait until it wakes (the admin view shows them as *late*).
 5. **The cache is per instance** (fine for one instance; with several, each warms its own).
 6. ~~UTC "today"~~ fixed in JB-1.
-7. **All activity is typed by hand.** There is no import pipeline from hospital systems yet.
+7. ~~All activity typed by hand~~ — IM-1 imports (§10). Still to do: agree the keys and file format with hospital IT.
 
 ## 9. Checklist — adding a new Ops capability
 
@@ -155,3 +157,31 @@ tests prove a guard *is written*, not that it *works*. See §8.
    rule (never `<` inside `{{ }}`).
 7. **Docs:** add the table, the routes and the migration to `OPS_ROOMS.md` §8 (or `COMMS.md`), and send the SQL to
    whoever applies it.
+
+## 10. Imports from hospital systems (IM-1)
+
+Hospital counts arrive as rows `key · date · value [· category]`, from a CSV upload (Configuración → Importar datos) or the
+token feed. Nothing about patients ever enters: a column whose header looks like a patient identifier (NHC, nombre, DNI,
+SIP, CIP, fecha de nacimiento, teléfono…) rejects the **whole** file.
+
+| Piece | Where |
+|---|---|
+| Mapping `(system, external_key)` → unit measure (+ category for a measure with a breakdown) | `ops_import_mappings` |
+| One row per committed file / feed call, with counts, date range, checksum | `ops_import_batches` |
+| Provenance on each value: `source` (`import`/`feed`), `import_batch_id`, `import_previous` | `ops_measurements` |
+| Commit and undo, each one transaction | `ops_import_commit`, `ops_import_undo` |
+
+Rules:
+1. **Preview first** (`POST /api/ops/import/preview`, no writes). Commit re-plans on the server; it never trusts a client plan.
+2. **Manual wins:** a value entered by hand is never overwritten (checked in the plan *and* inside the transaction).
+   Unchanged values are skipped.
+3. **Once:** the checksum is over the normalised content (row order and file format do not matter), unique per system
+   while committed. Re-sending the same data is a no-op (feed) or a 409 (upload).
+4. **Undo** restores what each value was before the batch, or removes it if the batch created it. A value edited by hand
+   since then, or replaced by a later batch, is left alone.
+5. **Feed** `POST /api/feed/ops/measurements` — off (404) unless `OPS_FEED_TOKEN` is set; `Authorization: Bearer <token>`
+   (constant-time check); public rate limiter; exempt from the release header and maintenance mode. Body
+   `{ system, rows: [{ key, date, value, category? }] }` or `{ system, csv }`.
+6. Department-wide → head of department / system admin (`opsDeptOnlyEarly`). Max 5,000 rows, 1 MB.
+
+SQL: `migrations/2026-10-17_import_im1_mappings_batches.sql` (after OR-2 and OR-R).
