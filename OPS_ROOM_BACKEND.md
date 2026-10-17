@@ -81,19 +81,38 @@ Rule of thumb: **if it decides something, it is a pure function with a test.** R
 - **Outbox pattern** (`notif_outbox`): enqueue with a dedupe key → a 60-second sender *claims* a row
   (`queued → sending` with a conditional update) → sends → `sent` or retries with backoff (1, 5, 15, 60, 240 min, 5 tries)
   → anything older than 24 h is `skipped`. This is safe with more than one server instance.
-- **Lazy snapshots:** the last complete week and month reports are created the first time someone opens Informes.
-  This is simple and cheap, but it means a report exists only if someone looked (see §8).
-- **Daily jobs** (the 07:00 digest) run inside the same interval, guarded by date. The dedupe key stops duplicates after
-  restarts.
+- **One scheduler** (`jobsTick`, every 60 s; rules in `jobs.js`). Nothing else starts its own interval.
+
+  | Job | When (Madrid) | Logged | What |
+  |---|---|---|---|
+  | `email_send` | every minute | no | sends the outbox |
+  | `digest` | daily, window 07:00–12:00 | yes | the morning email |
+  | `reports` | daily, window 06:00–23:00 | yes | last complete week + month for the department and every Ops unit |
+  | `cache_warm` | every 5 min | no | recomputes Grounded and the 8-week Outlook |
+
+- **Run log and lock** (`job_runs`, JB-1): a daily job *claims* `job:YYYY-MM-DD` by inserting a row; the unique
+  `run_key` means only one server instance runs it. `ok` blocks for the day; a `running` row older than 30 min is treated
+  as a crashed instance; a failure is renamed (`…#f<ms>`) so the key is free and retried after 15 min, at most 3 times.
+  Without the table it falls back to an in-memory lock (one instance only).
+- **Admin:** `GET /api/admin/jobs` (state per job today: ok / waiting / running / late / failed, last 30 runs) and
+  `POST /api/admin/jobs/:job/run` (run now; e-mail dedupe keys still stop duplicates).
+- **Lazy snapshots stay** as a safety net: Informes still creates a missing report on open.
+- **Atomic multi-step writes** are Postgres functions called with `opsRpc(name, args)`: `comms_send_message`
+  (message + every recipient copy), `comms_send_brief` (feed post + frozen brief), `ops_store_report` (one upsert).
+  `opsRpc` returns `{ missing: true }` when the function is not created yet, and the route then uses its previous path.
+  New multi-step writes should follow the same pattern.
+- **Cache:** `opsCache.get(key, ttl, fn)` (in-process, shares in-flight work, keeps the old value if a refresh fails).
+  Grounded 2 min, Outlook 5 min; both answer `as_of` + `cached`; `?fresh=1` recomputes; sending the Parte busts Grounded.
+  Cache only department-wide data that does not depend on who asks.
 
 ## 6. Time
 
 - Periods are Monday–Sunday weeks and calendar months. A period is judged with the target in force on its last day; an
   interconsulta is judged with the target in force on the day it was received.
-- The digest uses Madrid time (`madridNow`).
-- ⚠️ **Known bug:** `opsToday()` uses `formatDate(new Date())`, which is the **UTC** date. Between 00:00 and 02:00
-  Madrid time (01:00 in winter) "today" is still yesterday. The fix is one helper (`madridNow().date`) used by every
-  `opsToday()` caller, plus a test.
+- **"Today" is always the Madrid date:** `opsToday()` (Intl, `Europe/Madrid`). Fixed in JB-1 for every caller in
+  `index.js`, including on-call, absences and announcements (it used to be the UTC date, so 00:00–02:00 was "yesterday").
+  Never write `formatDate(new Date())` or `toISOString().slice(0,10)` for "today".
+- Jobs and the digest use `madridNow()` (date + hour). Timestamps are stored in UTC (`timestamptz`).
 
 ## 7. Testing
 
@@ -114,13 +133,12 @@ tests prove a guard *is written*, not that it *works*. See §8.
    need rotating.
 2. **No integration tests and manual migrations.** SQL is run by hand in the SQL editor. Nothing proves the database
    matches the code, and a forgotten file fails quietly (thanks to the compat helpers).
-3. **One 10,600-line `index.js` with 338 routes.** Multi-step writes (message fan-out, Parte send, report store) are
-   several calls with manual rollback, not one transaction.
-4. **Background work lives inside the web process** (interval + lazy generation). If the process sleeps, the 07:00
-   digest and reports wait. There is no single scheduler and no record of job runs.
-5. **Heavy read endpoints** (`/api/ops/grounded`, the department report, the outlook) recompute everything per request
-   and per server (only the catalogue is cached).
-6. **The UTC "today" bug** (§6).
+3. **One 10,600-line `index.js` with 340 routes.** The three multi-step writes are now transactions (JB-1); other legacy
+   modules still write step by step.
+4. **Jobs still run inside the web process.** JB-1 gives one scheduler, a run log and a lock, but if Railway sleeps the
+   process, jobs wait until it wakes (the admin view shows them as *late*).
+5. **The cache is per instance** (fine for one instance; with several, each warms its own).
+6. ~~UTC "today"~~ fixed in JB-1.
 7. **All activity is typed by hand.** There is no import pipeline from hospital systems yet.
 
 ## 9. Checklist — adding a new Ops capability

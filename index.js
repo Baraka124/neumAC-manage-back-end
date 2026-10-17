@@ -3945,7 +3945,7 @@ app.get('/api/rotations/current', authenticateToken, apiLimiter, async (req, res
   try {
     const plan = await resolveCollectionAuthority(req, 'rotation.view');
     if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'rotation.view', plan.authority);
-    const today = formatDate(new Date());
+    const today = opsToday();
     let query = supabase.from('resident_rotations')
       .select('*, resident:medical_staff!resident_rotations_resident_id_fkey(id, full_name, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id), supervising_attending:medical_staff!resident_rotations_supervising_attending_id_fkey(id, full_name, staff_type, specialization, public_photo_url), training_unit:training_units!resident_rotations_training_unit_id_fkey(id, unit_name, unit_code)')
       .is('deleted_at', null).lte('start_date', today).gte('end_date', today).eq('rotation_status', 'active');
@@ -3977,7 +3977,7 @@ app.get('/api/rotations/needs-review', authenticateToken, apiLimiter, async (req
   try {
     const plan = await resolveCollectionAuthority(req, 'rotation.view');
     if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'rotation.view', plan.authority);
-    const today = formatDate(new Date());
+    const today = opsToday();
     let query = supabase.from('resident_rotations')
       .select('*, resident:medical_staff!resident_rotations_resident_id_fkey(id, full_name, professional_email, staff_type, specialization, public_photo_url, department_id), training_unit:training_units!resident_rotations_training_unit_id_fkey(id, unit_name, unit_code)')
       .is('deleted_at', null)
@@ -4108,7 +4108,7 @@ app.post('/api/training-units/:id/staff', authenticateToken,
     if (!staff_id) return res.status(400).json({ error: 'staff_id is required' });
     const { data, error } = await supabase.from('unit_staff').insert([{
       unit_id: req.params.id, staff_id, role,
-      assigned_from: formatDate(new Date()),
+      assigned_from: opsToday(),
       created_at: new Date().toISOString(), updated_at: new Date().toISOString()
     }]).select(`
       id, role, assigned_from,
@@ -4128,7 +4128,7 @@ app.delete('/api/training-units/:unitId/staff/:staffId', authenticateToken,
   Portfolio.write('training_units'), async (req, res) => {
   try {
     const { error } = await supabase.from('unit_staff')
-      .update({ assigned_until: formatDate(new Date()), updated_at: new Date().toISOString() })
+      .update({ assigned_until: opsToday(), updated_at: new Date().toISOString() })
       .eq('unit_id', req.params.unitId)
       .eq('staff_id', req.params.staffId)
       .is('assigned_until', null);
@@ -4145,7 +4145,17 @@ app.delete('/api/training-units/:unitId/staff/:staffId', authenticateToken,
 const OpsRoom = require('./ops-room.js');
 const OPS_ROSTER_SELECT = 'id, unit_id, role, assigned_from, assigned_until, staff:medical_staff!unit_staff_staff_id_fkey(id, full_name, staff_type, employment_status)';
 const OPS_UNIT_SELECT = 'id, unit_code, unit_name, unit_type, maximum_residents, location_building, location_floor, ops_capabilities, ops_enabled, unit_status';
-const opsToday = () => formatDate(new Date());
+// "Today" is the department's day (Europe/Madrid), not the server's UTC date (fixes 00:00–02:00 being "yesterday").
+const opsToday = (d = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+const Jobs = require('./jobs.js');
+const opsCache = Jobs.makeCache();
+// Call a Postgres function; { missing: true } when it is not created yet (the caller then uses its previous path).
+async function opsRpc(name, args) {
+  const { data, error } = await supabase.rpc(name, args);
+  if (error && (error.code === 'PGRST202' || /could not find the function|function .* does not exist/i.test(error.message || ''))) return { missing: true };
+  if (error) throw error;
+  return { data };
+}
 const opsAdmin = req => ['system_admin', 'department_head'].includes(Authority.normalizeRole(req.user?.user_role || req.user?.role));
 
 async function opsLoadUnits(ids, { history = false } = {}) {
@@ -4716,7 +4726,9 @@ app.post('/api/ops/indicators/:indId/values', authenticateToken, opsDeptOnly, op
 // Read-only, Units read. Facts from the plan + trends against targets the department set; no invented thresholds.
 const Outlook = require('./outlook.js');
 app.get('/api/ops/outlook', authenticateToken, Portfolio.read('training_units'), apiLimiter, opsWrap(async (req, res) => {
-  res.json(await opsComputeOutlook(Math.min(Math.max(parseInt(req.query.weeks) || 8, 2), 12)));
+  const weeks = Math.min(Math.max(parseInt(req.query.weeks) || 8, 2), 12);
+  const c = await opsCache.get(`outlook:${weeks}`, 300000, () => opsComputeOutlook(weeks), { fresh: req.query.fresh === '1' });
+  res.json({ ...c.value, as_of: c.as_of, cached: c.cached });
 }));
 async function opsComputeOutlook(weeks) {
   const today = opsToday();
@@ -4752,6 +4764,11 @@ async function opsComputeOutlook(weeks) {
 // Grounded: one compact department snapshot (units, interconsultas, next 2 weeks, last month in plain words, today's Parte).
 // Read-only, Units read. Every part says where it comes from.
 app.get('/api/ops/grounded', authenticateToken, Portfolio.read('training_units'), apiLimiter, opsWrap(async (req, res) => {
+  // Same for every reader → one shared 2-minute cache (department-wide, counts only). ?fresh=1 recomputes.
+  const c = await opsCache.get('grounded', 120000, () => opsComputeGrounded(), { fresh: req.query.fresh === '1' });
+  res.json({ ...c.value, as_of: c.as_of, cached: c.cached });
+}));
+async function opsComputeGrounded() {
   const today = opsToday(), nowIso = commsNow(), fromIso = new Date(Date.now() - 30 * 86400000).toISOString();
   const [{ units }, outlook, icOpen, icRecent, brief] = await Promise.all([
     opsLoadUnits(null), opsComputeOutlook(2),
@@ -4769,13 +4786,13 @@ app.get('/api/ops/grounded', authenticateToken, Portfolio.read('training_units')
     const m = (list.reports || []).find(r => r.period === 'month');
     if (m) { const full = await opsSoftOrNull(supabase.from('ops_reports').select('*').eq('id', m.id).limit(1)); if (full && full[0]) { const n = Narrative.narrate(full[0].content); lastMonth = { id: m.id, period_start: String(m.period_start).slice(0, 10), period_end: String(m.period_end).slice(0, 10), narrative: n, text: Narrative.narrativeText(n) }; } }
   } catch (e) { /* reports are optional here */ }
-  res.json({ today,
+  return { today,
     units: units.map(u => ({ id: u.id, name: u.unit_name, level: u.pulse ? u.pulse.level : 'ok', reasons: u.pulse ? u.pulse.reasons.map(r => r.text) : [] })),
     interconsults: { waiting: st.waiting, overdue: st.overdue, unassigned: st.unassigned, oldest_waiting_hours: st.oldest_waiting_hours, received_30d: st.received, median_hours: st.median_hours, within_target_pct: st.within_target_pct,
       calls_30d: OpsRoom.callStats(all, fromIso, nowIso) },
     outlook: { weeks: outlook.weeks.map(w => ({ start: w.start, end: w.end, level: w.level, signals: w.signals.filter(x => x.level !== 'info') })), notes: outlook.notes, trends: outlook.trends.filter(t => t.crosses || t.off_target_now) },
-    last_month: lastMonth, parte_today: brief && brief[0] ? brief[0] : null });
-}));
+    last_month: lastMonth, parte_today: brief && brief[0] ? brief[0] : null };
+}
 
 // ===== PNEUMO OPS ROOM (OR-C): configuration — catalogues and target history =====
 // Read: Units read. Department-wide lists and interconsulta targets: head of department / admin.
@@ -4892,6 +4909,10 @@ async function opsBuildDeptReport(rp) {
 }
 // Save (insert or replace) the snapshot of one period. Returns null before the OR-R migration.
 async function opsStoreReport(scope, unitId, rp, content, userId) {
+  const atomic = await opsRpc('ops_store_report', { p_scope: scope, p_unit: unitId || null, p_period: rp.period, p_start: rp.start, p_end: rp.end, p_content: { ...content, complete: rp.complete }, p_user: userId || null }).catch(e => { if (/ops_reports/.test(e.message || '') && /does not exist/i.test(e.message || '')) return { data: null, noTable: true }; throw e; });
+  if (atomic.noTable) return null;
+  if (!atomic.missing) return Array.isArray(atomic.data) ? atomic.data[0] : atomic.data;
+  // Fallback before JB-1 (select then insert / update).
   let q = supabase.from('ops_reports').select('id').eq('scope', scope).eq('period', rp.period).eq('period_start', rp.start);
   q = unitId ? q.eq('unit_id', unitId) : q.is('unit_id', null);
   const existing = await opsSoftOrNull(q.limit(1));
@@ -5154,7 +5175,7 @@ app.post('/api/rotations', authenticateToken, checkPermission('resident_rotation
     // Temporal state is derived for ordinary scheduled/active records so UI and
     // Grounded cannot disagree about a rotation that already started or ended.
     // Explicit historical/terminal states remain deliberate inputs.
-    const today = formatDate(new Date());
+    const today = opsToday();
     let rotationStatus = dataSource.rotation_status || 'scheduled';
     if (['scheduled','active'].includes(rotationStatus)) {
       rotationStatus = startDate > today ? 'scheduled' : (endDate < today ? 'completed' : 'active');
@@ -5332,7 +5353,7 @@ app.post('/api/imports/review', authenticateToken, importAuthority(req => ({ onc
   try {
     const kind = req.body.kind, rows = Array.isArray(req.body.rows) ? req.body.rows : [];
     if (!rows.length || rows.length > 1000) return res.status(400).json({ error: 'Provide 1 to 1000 rows.' });
-    const today = formatDate(new Date());
+    const today = opsToday();
     const isoOk = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
     if (kind === 'oncall') {
       const proposed = rows.filter(r => isoOk(r.duty_date)).map((r, i) => ({ key: String(r.key ?? i), duty_date: r.duty_date,
@@ -5495,7 +5516,7 @@ app.post('/api/rotations/batch', authenticateToken, requireAuthority('sync.rotat
         if(training_unit_id!=='(new)') pending.push({id:'pending-'+pending.length,resident_id:r.resident_id,training_unit_id,start_date:start,end_date:end,rotation_status:'scheduled',training_unit:{unit_name:'(this file)'}});
         if(replaced) replacedIds.add(replaced.id);
         continue; }
-      const today=formatDate(new Date());
+      const today=opsToday();
       const rotation_status = start>today ? 'scheduled' : (end<today ? 'completed' : 'active');
       const provenance=`[Imported ${new Date().toISOString().slice(0,10)} from ${String(req.body.source_file||'rotations Excel').slice(0,120)}${r.source_sheet?` · ${String(r.source_sheet).slice(0,40)}`:''}]`;
       const row={ resident_id:r.resident_id, training_unit_id, supervising_attending_id:supervisor,
@@ -5670,7 +5691,7 @@ app.delete('/api/rotations/:id', authenticateToken, checkPermission('resident_ro
       throw fetchError;
     }
     const recordedAt = new Date().toISOString();
-    const today = formatDate(new Date());
+    const today = opsToday();
     const plannedStart = formatDate(currentRecord.start_date);
     const plannedEnd = formatDate(currentRecord.end_date);
     const existingStatus = currentRecord.rotation_status;
@@ -5968,7 +5989,7 @@ app.get('/api/oncall/today', authenticateToken, apiLimiter, async (req, res) => 
   try {
     const plan = await resolveCollectionAuthority(req, 'oncall.view');
     if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'oncall.view', plan.authority);
-    const today = formatDate(new Date());
+    const today = opsToday();
     const { data, error } = await supabase.from('oncall_schedule').select(`
         *, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
         backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id),
@@ -5987,7 +6008,7 @@ app.get('/api/oncall/upcoming', authenticateToken, apiLimiter, async (req, res) 
   try {
     const plan = await resolveCollectionAuthority(req, 'oncall.view');
     if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'oncall.view', plan.authority);
-    const today = formatDate(new Date());
+    const today = opsToday();
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     const { data, error } = await supabase.from('oncall_schedule')
       .select('*, primary_physician:medical_staff!oncall_schedule_primary_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id), backup_physician:medical_staff!oncall_schedule_backup_physician_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url, professional_email, work_phone, office_phone, mobile_phone, department_id), resident_physician:medical_staff!oncall_schedule_resident_physician_id_fkey(id,full_name,staff_type,department_id), coverage_area:coverage_areas(id,name,code,color)')
@@ -6191,7 +6212,7 @@ app.get('/api/absence-records/upcoming', authenticateToken, apiLimiter, async (r
   try {
     const plan = await resolveCollectionAuthority(req, 'leave.view');
     if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', plan.authority);
-    const today = formatDate(new Date());
+    const today = opsToday();
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     let query = supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, work_phone, office_phone, staff_type, specialization, public_photo_url, department_id),
@@ -6223,7 +6244,7 @@ app.get('/api/absence-records/needs-review', authenticateToken, apiLimiter, asyn
   try {
     const plan = await resolveCollectionAuthority(req, 'leave.view');
     if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', plan.authority);
-    const today = formatDate(new Date());
+    const today = opsToday();
     let query = supabase.from('staff_absence_records').select(`
         *, staff_member:medical_staff!staff_absence_records_staff_member_id_fkey(id, full_name, title, professional_email, staff_type, specialization, public_photo_url, department_id),
         covering_staff:medical_staff!staff_absence_records_covering_staff_id_fkey(id, full_name, title, staff_type, specialization, public_photo_url)
@@ -6273,7 +6294,7 @@ app.get('/api/absence-records/dashboard/stats', authenticateToken, apiLimiter, a
   try {
     const plan = await resolveCollectionAuthority(req, 'leave.view');
     if (plan.authority?.decision === Authority.DECISIONS.DENY) return sendAuthorityDenied(res, 'leave.view', plan.authority);
-    const today = formatDate(new Date());
+    const today = opsToday();
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     let query = supabase.from('staff_absence_records')
       .select('staff_member_id,current_status,coverage_arranged,absence_type,absence_reason,start_date').is('deleted_at', null);
@@ -6603,7 +6624,7 @@ app.put('/api/absence-records/:id/return', authenticateToken, checkPermission('s
     if (currentRecord.current_status === 'returned_to_duty' && currentRecord.actual_return_date) {
       return res.status(400).json({ error: 'Already returned', message: 'Staff has already been marked as returned' });
     }
-    const effectiveReturnDate = return_date ? formatDate(return_date) : formatDate(new Date());
+    const effectiveReturnDate = return_date ? formatDate(return_date) : opsToday();
     const effectiveStart = currentRecord.actual_start_date || currentRecord.start_date;
     if (!effectiveReturnDate || effectiveReturnDate < effectiveStart) {
       return res.status(400).json({ error:'Invalid return date', message:'Return date cannot be before the effective leave start.' });
@@ -6727,7 +6748,7 @@ app.get('/api/absence-records/:id/audit-log', authenticateToken, apiLimiter, asy
 // ===== 11. ANNOUNCEMENTS =====
 app.get('/api/announcements', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const today = formatDate(new Date());
+    const today = opsToday();
     const q = live => { let x = supabase.from('department_announcements').select('*')
       .lte('publish_start_date', today).or(`publish_end_date.gte.${today},publish_end_date.is.null`)
       .order('publish_start_date', { ascending: false }); return live ? x.is('deleted_at', null) : x; };
@@ -6746,7 +6767,7 @@ app.post('/api/announcements', authenticateToken, checkPermission('communication
       type: ['announcement', 'broadcast', 'protocol', 'kudos', 'entrada'].includes(req.body?.type) ? req.body.type : 'announcement',
       priority_level: dataSource.priority_level || 'normal', target_audience: dataSource.target_audience || 'all_staff',
       visible_to_roles: ['system_admin', 'department_head', 'medical_resident'],
-      publish_start_date: dataSource.publish_start_date ? formatDate(dataSource.publish_start_date) : formatDate(new Date()),
+      publish_start_date: dataSource.publish_start_date ? formatDate(dataSource.publish_start_date) : opsToday(),
       publish_end_date: dataSource.publish_end_date ? formatDate(dataSource.publish_end_date) : null,
       created_by: req.user.id, created_by_name: req.user.full_name || 'System',
       created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
@@ -7140,6 +7161,14 @@ app.post('/api/comms/brief/send', authenticateToken, commsCan('brief'), commsWra
   const merged = { ...(row || {}), ...edit.value };
   const brief = await commsBriefData(date, merged), text = Comms.briefText(brief, null);
   const post = { type: 'parte', title: 'Parte del día · ' + Comms.fmtDay(date), content: text.slice(0, 4000), priority_level: 'normal', brief_date: date, category: 'organisation', updated_at: commsNow() };
+  // Atomic (JB-1): the feed post and the frozen brief together, or neither.
+  const atomic = await opsRpc('comms_send_brief', { p_date: date, p_notes: merged.notes ?? null, p_sections: merged.sections ?? null, p_snapshot: brief,
+    p_user: req.user.id, p_user_name: req.user.full_name || 'Staff', p_title: post.title, p_content: post.content });
+  if (!atomic.missing) {
+    const link = commsLink('brief', date), share = Comms.briefText(brief, link);
+    notifySafe(notifyParte(date, Comms.briefText(brief, null))); opsCache.bust('grounded');
+    return res.json({ success: true, row: atomic.data, brief, share: { text: share, whatsapp: Comms.whatsappUrl(share) } });
+  }
   let postId = row?.post_id || null;
   if (postId) { const { error } = await supabase.from('department_announcements').update(post).eq('id', postId); if (error) throw error; }
   else {
@@ -7150,7 +7179,7 @@ app.post('/api/comms/brief/send', authenticateToken, commsCan('brief'), commsWra
   const { data: saved, error } = await supabase.from('comm_daily_briefs').upsert({ brief_date: date, ...edit.value, snapshot: brief, status: 'sent', sent_at: commsNow(), sent_by: req.user.id, post_id: postId, updated_by: req.user.id, updated_at: commsNow() }, { onConflict: 'brief_date' }).select('*').single();
   if (error) throw error;
   const link = commsLink('brief', date), share = Comms.briefText(brief, link);
-  notifySafe(notifyParte(date, Comms.briefText(brief, null)));
+  notifySafe(notifyParte(date, Comms.briefText(brief, null))); opsCache.bust('grounded');
   res.json({ success: true, row: saved, brief, share: { text: share, whatsapp: Comms.whatsappUrl(share) } });
 }));
 // ── CM-3: private messages → each recipient's Mi espacio. Not in the feed; recipients never see the recipient list.
@@ -7168,6 +7197,10 @@ app.post('/api/comms/messages', authenticateToken, commsCan('message'), commsWra
   const ids = Comms.resolveRecipients(v.value.audience, staff, roster, oncall.map(o => o.staff_id), { excludeId: req.user.medical_staff_id });
   if (!ids.length) return res.status(400).json({ error: 'Nobody matches these recipients.' });
   if (ids.length > 1000) return res.status(400).json({ error: 'Too many recipients.' });
+  // Atomic (JB-1): message + every recipient copy in one transaction.
+  const atomic = await opsRpc('comms_send_message', { p_author_user: req.user.id, p_author_staff: req.user.medical_staff_id || null, p_author_name: req.user.full_name || 'Jefatura',
+    p_subject: v.value.subject, p_body: v.value.body, p_audience: v.value.audience, p_recipients: ids });
+  if (!atomic.missing) { notifySafe(notifyPrivateMessage(atomic.data, ids)); return res.status(201).json({ success: true, message: { ...atomic.data, read_count: 0 } }); }
   const { data: msg, error } = await supabase.from('comm_messages').insert({ ...v.value, author_user_id: req.user.id, author_staff_id: req.user.medical_staff_id || null,
     author_name: req.user.full_name || 'Jefatura', recipient_count: ids.length }).select('*').single();
   if (error) { if (error.code === '42P01' || /does not exist/i.test(error.message || '')) return res.status(409).json({ error: 'Private messages need the CM-3 database update first.' }); throw error; }
@@ -7298,7 +7331,7 @@ async function notifyUsersForStaff(staffIds) {
 }
 async function notifyAllUsers() { const { data } = await supabase.from('app_users').select(NOTIFY_USER_COLS).limit(2000); return data || []; }
 
-let notifyBusy = false, notifyDigestDate = null;
+let notifyBusy = false;
 async function notifySendOne(row) {
   // Claim it (only one server instance sends it).
   const { data: claimed } = await supabase.from('notif_outbox').update({ status: 'sending', attempts: (row.attempts || 0) + 1 }).eq('id', row.id).eq('status', 'queued').select('id');
@@ -7339,14 +7372,70 @@ async function notifyDigests(date) {
 async function notifyTick() {
   if (notifyBusy) return; notifyBusy = true;
   try {
-    const now = Notify.madridNow();
-    if (now.hour >= 7 && now.hour < 12 && notifyDigestDate !== now.date) { notifyDigestDate = now.date; await notifyDigests(now.date).catch(e => console.error('[NOTIFY] digest:', e.message)); }
     if (!RESEND_API_KEY) return;   // queued emails wait (and expire after 24 h) until a provider is configured
     const rows = await opsSoftOrNull(supabase.from('notif_outbox').select('*').eq('status', 'queued').lte('send_after', new Date().toISOString()).order('created_at').limit(25));
     for (const r of rows || []) await notifySendOne(r);
   } finally { notifyBusy = false; }
 }
-if (NODE_ENV !== 'test') { const t = setInterval(() => notifyTick().catch(e => console.error('[NOTIFY] tick:', e.message)), 60000); if (t.unref) t.unref(); }
+
+// ===== JOBS (JB-1): one scheduler for all background work =====
+// Daily jobs claim a run key in job_runs (unique → lock across instances, and a run log); without the table they fall back
+// to an in-memory lock (one instance). Interval jobs (email sending, cache warm) are not logged. Rules: jobs.js.
+const jobsMemory = new Set();
+let jobsBusy = false, jobsLastWarm = 0;
+async function jobsClaim(job, key) {
+  const nowMs = Date.now();
+  const ins = await supabase.from('job_runs').insert({ job, run_key: key, status: 'running' }).select('id').single();
+  if (!ins.error) return { id: ins.data.id, logged: true };
+  if (ins.error.code === '42P01' || /job_runs/.test(ins.error.message || '') && /does not exist|schema cache/i.test(ins.error.message || '')) {
+    if (jobsMemory.has(key)) return null; jobsMemory.add(key); return { id: null, logged: false };
+  }
+  if (ins.error.code !== '23505') throw ins.error;
+  const { data: cur } = await supabase.from('job_runs').select('id, status, started_at').eq('run_key', key).maybeSingle();
+  if (!cur || Jobs.blocking(cur, nowMs)) return null;
+  // Stale 'running' (crashed instance) or a failure: retire the row so the key is free, then retry within the limits.
+  await supabase.from('job_runs').update({ run_key: Jobs.retiredKey(key, nowMs), status: 'failed', finished_at: new Date().toISOString(), error: cur.status === 'running' ? 'abandoned (instance stopped)' : undefined })
+    .eq('id', cur.id).eq('status', cur.status);
+  const { data: failed } = await supabase.from('job_runs').select('started_at, finished_at').like('run_key', key + '#f%').order('started_at', { ascending: false }).limit(5);
+  if (!Jobs.mayRetry(failed || [], nowMs)) return null;
+  const again = await supabase.from('job_runs').insert({ job, run_key: key, status: 'running' }).select('id').single();
+  return again.error ? null : { id: again.data.id, logged: true };
+}
+async function jobsRun(job, key, fn) {
+  const claim = await jobsClaim(job, key).catch(e => { console.error('[JOBS] claim', key, e.message); return null; });
+  if (!claim) return;
+  const t0 = Date.now();
+  try {
+    const detail = (await fn()) || null;
+    if (claim.logged) await supabase.from('job_runs').update({ status: 'ok', finished_at: new Date().toISOString(), duration_ms: Date.now() - t0, detail }).eq('id', claim.id);
+  } catch (e) {
+    console.error('[JOBS]', key, e.message);
+    if (claim.logged) await supabase.from('job_runs').update({ status: 'failed', run_key: Jobs.retiredKey(key, Date.now()), finished_at: new Date().toISOString(), duration_ms: Date.now() - t0, error: String(e.message || e).slice(0, 500) }).eq('id', claim.id);
+    else jobsMemory.delete(key);
+  }
+}
+// Daily snapshots: last complete week and month for the department and every Ops unit (so reports exist even if nobody opened Informes).
+async function jobsReports() {
+  const made = { department: 0, units: 0 };
+  const d = await opsListReports('department', null); if (!d.migrated) return { skipped: 'OR-R not applied' }; made.department = 1;
+  const { units } = await opsLoadUnits(null);
+  for (const u of units) { await opsListReports('unit', u); made.units++; }
+  return made;
+}
+async function jobsWarm() {
+  await Promise.all([opsCache.get('grounded', 120000, () => opsComputeGrounded(), { fresh: true }), opsCache.get('outlook:8', 300000, () => opsComputeOutlook(8), { fresh: true })]);
+}
+const JOB_FNS = { digest: date => notifyDigests(date).then(() => ({ date })), reports: () => jobsReports() };
+async function jobsTick() {
+  if (jobsBusy) return; jobsBusy = true;
+  try {
+    await notifyTick().catch(e => console.error('[NOTIFY] tick:', e.message));
+    const now = Notify.madridNow();
+    for (const { job, key } of Jobs.dueDaily(now)) if (JOB_FNS[job]) await jobsRun(job, key, () => JOB_FNS[job](now.date));
+    if (Date.now() - jobsLastWarm >= Jobs.JOBS.cache_warm.minutes * 60000) { jobsLastWarm = Date.now(); await jobsWarm().catch(e => console.error('[JOBS] warm:', e.message)); }
+  } finally { jobsBusy = false; }
+}
+if (NODE_ENV !== 'test') { const t = setInterval(() => jobsTick().catch(e => console.error('[JOBS] tick:', e.message)), 60000); if (t.unref) t.unref(); }
 
 // Hooks (called after the action has succeeded; failures are logged, never returned to the user).
 async function notifyPrivateMessage(msg, staffIds) {
@@ -7405,6 +7494,18 @@ app.get('/api/admin/email/status', authenticateToken, notifyAdminOnly, commsWrap
   const by = (rows || []).reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
   res.json({ mode: EMAIL_MODE, test_inbox: EMAIL_MODE === 'test' ? EMAIL_TEST_TO : null, provider_configured: !!RESEND_API_KEY, from: EMAIL_FROM, migrated: rows !== null, last_7_days: by,
     last_error: (rows || []).filter(r => r.last_error).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0]?.last_error || null });
+}));
+// Admin: background jobs — last run, state today, recent failures. ?run=reports|digest runs one now (still locked by key).
+app.get('/api/admin/jobs', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
+  const now = Notify.madridNow(), nowMs = Date.now();
+  const rows = await opsSoftOrNull(supabase.from('job_runs').select('job, run_key, status, started_at, finished_at, duration_ms, detail, error').gte('started_at', new Date(nowMs - 14 * 86400000).toISOString()).order('started_at', { ascending: false }).limit(300));
+  res.json({ migrated: rows !== null, now, jobs: Jobs.summarize(rows || [], now, nowMs), recent: (rows || []).slice(0, 30), cache_entries: opsCache.size() });
+}));
+app.post('/api/admin/jobs/:job/run', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
+  const job = req.params.job; if (!JOB_FNS[job]) return res.status(404).json({ error: 'Unknown job' });
+  const now = Notify.madridNow(), key = `${job}:${now.date}:manual:${Date.now()}`;
+  await jobsRun(job, key, () => JOB_FNS[job](now.date));
+  res.json({ success: true, run_key: key });
 }));
 app.post('/api/admin/email/test', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
   const { data: me } = await supabase.from('app_users').select(NOTIFY_USER_COLS).eq('id', req.user.id).maybeSingle();
@@ -7753,7 +7854,7 @@ app.delete('/api/attachments/:id', authenticateToken, checkPermission('attachmen
 // ===== 17. DASHBOARD =====
 app.get('/api/system-stats', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const today = formatDate(new Date());
+    const today = opsToday();
     // FIX 8: Use staff_types table to find resident/attending keys dynamically
     const { data: staffTypes } = await supabase.from('staff_types').select('type_key, is_resident_type').eq('is_active', true);
     const residentKeys  = (staffTypes || []).filter(t =>  t.is_resident_type).map(t => t.type_key);
@@ -7783,7 +7884,7 @@ app.get('/api/system-stats', authenticateToken, apiLimiter, async (req, res) => 
 
 app.get('/api/dashboard/upcoming-events', authenticateToken, apiLimiter, async (req, res) => {
   try {
-    const today = formatDate(new Date());
+    const today = opsToday();
     const nextWeek = formatDate(new Date(Date.now() + 7 * 24 * 60 * 60 * 1000));
     const [rotations, oncall, absences] = await Promise.all([
       supabase.from('resident_rotations').select('*, resident:medical_staff!resident_rotations_resident_id_fkey(full_name), training_unit:training_units!resident_rotations_training_unit_id_fkey(unit_name)').gte('start_date', today).lte('start_date', nextWeek).eq('rotation_status', 'scheduled').order('start_date').limit(5),
@@ -8850,7 +8951,7 @@ app.get('/api/analytics/export/:type', authenticateToken, apiLimiter, async (req
     const csv = toCSV(data,spec.columns.map(key=>({key,label:key})));
     res.header('Cache-Control','no-store');
     res.header('Content-Type', 'text/csv');
-    res.header('Content-Disposition', `attachment; filename=${filename}-${formatDate(new Date())}.csv`);
+    res.header('Content-Disposition', `attachment; filename=${filename}-${opsToday()}.csv`);
     res.send(csv);
   } catch (error) {
     res.status(error.status||500).json({error:error.status?error.message:'Export failed'});
