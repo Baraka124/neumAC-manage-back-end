@@ -173,3 +173,23 @@ test('private messages: copies per recipient, inbox only shows my own, sender se
   for (const t of ['comm_messages', 'comm_message_recipients']) { assert.match(mig3, new RegExp(`alter table public\\.${t} enable row level security`)); assert.match(mig3, new RegExp(`create trigger audit_${t} `)); }
   assert.match(mig3, /unique \(message_id, staff_id\)/);
 });
+
+/* ── Mi espacio "Hoy para ti" ── */
+test('Hoy para ti: overdue first, over-target interconsultas first, what needs you counted, a short headline', () => {
+  const t = C.myToday({
+    oncall: [{ role: 'Adjunto/a' }], rotation: null, units: [{ name: 'PFR', level: 'alert', reasons: ['1 out of service'] }],
+    actions: [{ text: 'b', state: 'open', due_on: '2026-10-20' }, { text: 'a', state: 'overdue', due_on: '2026-10-15' }, { text: 'c', state: 'due_today', due_on: T }],
+    interconsults: [{ service: 'MI', hours: 10, over: false }, { service: 'Urgencias', hours: 30, over: true }],
+    meetings: [{ title: 'Sesión', starts_at: '2026-10-17T06:30:00Z', local_day: T }, { title: 'Mañana', starts_at: '2026-10-18T06:30:00Z', local_day: '2026-10-18' }], unread: 2 }, T);
+  assert.deepEqual(t.actions.map(a => a.text), ['a', 'c', 'b']);
+  assert.equal(t.interconsults[0].service, 'Urgencias');
+  assert.equal(t.needs_you, 2 + 1 + 2);                                     // overdue/today + over target + unread
+  assert.deepEqual(t.headline, ['De guardia hoy', '1 sesión hoy', '2 interconsultas a tu cargo', '3 pendientes']);
+  assert.equal(C.myToday({}, T).empty, true);
+});
+test('Hoy para ti route: own records only (owner / assigned / my copies), read-only', () => {
+  assert.match(idx, /app\.get\('\/api\/me\/today', authenticateToken, apiLimiter,/);
+  assert.match(idx, /\.eq\('owner_id', sid\)\.eq\('status', 'open'\)/);
+  assert.match(idx, /\.eq\('assigned_to', sid\)/);
+  assert.match(idx, /from\('comm_message_recipients'\)\.select\('id, read_at, archived_at, message:comm_messages!inner\(deleted_at\)'\)\.eq\('staff_id', sid\)/);
+});
