@@ -43,6 +43,7 @@ Rule of thumb: **if it decides something, it is a pure function with a test.** R
 | `narrative.js` | report "in plain words" |
 | `notify.js` | who may get which email, test-mode routing, signed unsubscribe, email bodies, digest |
 | `jobs.js` | daily job windows, run lock + retry rules, admin summary, TTL cache |
+| `health.js` | status panel checks, error-log scrubbing + throttle + grouping, backup tables and paths |
 | `imports.js` | CSV/feed parsing, patient-column guard, key → measure plan, manual-kept rule, checksum |
 
 ## 3. Data model rules
@@ -91,6 +92,7 @@ Rule of thumb: **if it decides something, it is a pure function with a test.** R
   | `digest` | daily, window 07:00–12:00 | yes | the morning email |
   | `reports` | daily, window 06:00–23:00 | yes | last complete week + month for the department and every Ops unit |
   | `cache_warm` | every 5 min | no | recomputes Grounded and the 8-week Outlook |
+| `backup` | daily, window 02:00–06:00 | yes | Ops + Comms tables → gzipped JSON in the private `backups` bucket; keeps 30 days; prunes the error log to 90 days |
 
 - **Run log and lock** (`job_runs`, JB-1): a daily job *claims* `job:YYYY-MM-DD` by inserting a row; the unique
   `run_key` means only one server instance runs it. `ok` blocks for the day; a `running` row older than 30 min is treated
@@ -185,3 +187,17 @@ Rules:
 6. Department-wide → head of department / system admin (`opsDeptOnlyEarly`). Max 5,000 rows, 1 MB.
 
 SQL: `migrations/2026-10-17_import_im1_mappings_batches.sql` (after OR-2 and OR-R).
+
+## 11. Operating it (PR-1)
+
+- **Estado del sistema** (`GET /api/admin/status`, shown first in Configuración) puts these checks in one call:
+  database ping, which database updates are applied (one or more tables per update, `health.js` `MIGRATIONS`), secrets
+  and email mode, today's daily jobs, the email backlog, errors in the last 24 h, the last backup, and staff without an
+  account. **When you add a migration, add it to `MIGRATIONS`.**
+- **Error log** (`app_errors`): a single middleware records every 5xx answer from any route, old or new (route shape
+  without ids + scrubbed message). The browser reports what it shows on screen to `POST /api/public/client-errors`,
+  at most 10 per page load. Messages are scrubbed of query strings, tokens, e-mails and long numbers. Rows are written
+  once per fingerprint per 5 minutes, with repeats counted.
+- **Backups:** nightly plus "Back up now"; restore with `scripts/restore-backup.js` (dry run by default, upsert by id,
+  never deletes). Drill: frontend `PILOT.md` §4. **When you add a table that holds Ops or Comms records, add it to
+  `BACKUP_TABLES`** (parents before children).

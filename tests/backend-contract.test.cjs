@@ -20,6 +20,7 @@ const PUBLIC_MUTATIONS = new Set([
   'POST /api/auth/accept-invitation',
   'POST /api/auth/password-reset/request',
   'POST /api/contact',
+  'POST /api/public/client-errors',   // PR-1: browser error reports (public limiter, scrubbed, 204)
   'POST /api/feed/ops/measurements',   // IM-1: hospital feed, guarded by OPS_FEED_TOKEN (constant-time), 404 when unset
 ]);
 
