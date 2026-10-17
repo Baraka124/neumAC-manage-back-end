@@ -6,6 +6,7 @@
 const JOBS = {
   digest:  { kind: 'daily', from: 7, until: 12, label: 'Resumen diario por email (07:00)' },
   reports: { kind: 'daily', from: 6, until: 23, label: 'Informes semana / mes (06:00)' },
+  backup:  { kind: 'daily', from: 2, until: 6, label: 'Copia de seguridad nocturna (02:00)' },
   email_send: { kind: 'every', minutes: 1, label: 'Envío de emails en cola' },
   cache_warm: { kind: 'every', minutes: 5, label: 'Precarga de Grounded y Outlook' }
 };

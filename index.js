@@ -332,6 +332,14 @@ app.use((req, res, next) => {
   console.log(`📡 [${new Date().toISOString()}] ${req.method} ${req.url} - Origin: ${req.headers.origin || 'no-origin'}`);
   next();
 });
+// PR-1: every 5xx answer goes to the error log (route shape + scrubbed message; never bodies or query strings).
+app.use((req, res, next) => {
+  const json = res.json.bind(res);
+  res.json = body => { if (res.statusCode >= 500 && body && typeof body === 'object') res.locals.errMsg = [body.error, body.message].filter(Boolean).join(': '); return json(body); };
+  res.on('finish', () => { if (res.statusCode >= 500) pilotLogError({ source: 'server', route: req.method + ' ' + (req.baseUrl || '') + (req.route?.path || req.path), status: res.statusCode,
+    message: res.locals.errMsg || res.statusMessage || 'Server error', userId: req.user?.id || null, release: req.get('X-Neumdesk-Release') || null }); });
+  next();
+});
 
 // ── Maintenance mode — see maintenanceCheck middleware registered on /api below ──
 
@@ -7627,6 +7635,129 @@ app.post('/api/admin/jobs/:job/run', authenticateToken, notifyAdminOnly, commsWr
   const now = Notify.madridNow(), key = `${job}:${now.date}:manual:${Date.now()}`;
   await jobsRun(job, key, () => JOB_FNS[job](now.date));
   res.json({ success: true, run_key: key });
+}));
+// ===== PILOT READINESS (PR-1): status panel · error log · backups =====
+const Health = require('./health.js');
+const zlib = require('zlib');
+const BACKUP_BUCKET = 'backups';
+const pilotThrottle = Health.makeThrottle();
+let pilotErrorsOff = false;   // set when app_errors does not exist yet (re-checked every 10 min)
+function pilotLogError(e) {
+  try {
+    const row = Health.errorEntry(e), count = pilotThrottle(row.fingerprint, Date.now());
+    if (!count || pilotErrorsOff) return;
+    supabase.from('app_errors').insert({ ...row, count }).then(({ error }) => {
+      if (error && /app_errors/.test(error.message || '') && /does not exist|schema cache/i.test(error.message || '')) { pilotErrorsOff = true; setTimeout(() => { pilotErrorsOff = false; }, 600000).unref?.(); }
+    }, () => {});
+  } catch { /* the error log must never cause an error */ }
+}
+// Browser errors (no sign-in needed: errors also happen on the login screen). Strict public limiter; scrubbed; capped.
+app.post('/api/public/client-errors', publicApiLimiterGuarded, (req, res) => {
+  const b = req.body || {};
+  let userId = null; const h = req.headers.authorization;
+  if (h?.startsWith('Bearer ')) { try { userId = jwt.verify(h.slice(7), JWT_SECRET)?.id || null; } catch { /* anonymous */ } }
+  if (b.message) pilotLogError({ source: 'browser', route: String(b.route || '').slice(0, 200), message: String(b.message), detail: b.detail ? String(b.detail) : null,
+    release: b.release || null, userId, userAgent: req.get('user-agent') });
+  res.status(204).end();
+});
+
+async function pilotTableExists(t) {
+  const { error } = await supabase.from(t).select('*', { head: true, count: 'exact' }).limit(1);
+  if (!error) return true;
+  return /does not exist|schema cache|could not find the table/i.test(error.message || '') || error.code === '42P01' || error.code === 'PGRST205' ? false : true;
+}
+async function pilotBackups() {
+  const { data: days, error } = await supabase.storage.from(BACKUP_BUCKET).list('', { limit: 100, sortBy: { column: 'name', order: 'desc' } });
+  if (error) return { bucket: false, list: [] };
+  const folders = (days || []).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d.name));
+  const list = [];
+  for (const d of folders.slice(0, 10)) {
+    const { data: files } = await supabase.storage.from(BACKUP_BUCKET).list(d.name, { limit: 20, sortBy: { column: 'name', order: 'desc' } });
+    for (const f of files || []) list.push({ path: `${d.name}/${f.name}`, bytes: f.metadata?.size || null, created_at: f.created_at || null });
+  }
+  return { bucket: true, days: folders.map(d => d.name), list };
+}
+// Nightly backup: Ops + Comms tables → one gzipped JSON in the private 'backups' bucket; keeps 30 days; prunes the error log.
+async function pilotBackup(trigger = 'nightly') {
+  const t0 = Date.now(), stamp = new Date().toISOString().replace(/[:.]/g, '-'), date = opsToday();
+  const { error: bErr } = await supabase.storage.getBucket(BACKUP_BUCKET);
+  if (bErr) { const { error } = await supabase.storage.createBucket(BACKUP_BUCKET, { public: false }); if (error && !/already exists/i.test(error.message || '')) throw error; }
+  const tables = {}, counts = {};
+  for (const t of Health.BACKUP_TABLES) {
+    const rows = [];
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await supabase.from(t).select('*').order('id').range(from, from + 999);
+      if (error) { if (/does not exist|schema cache/i.test(error.message || '')) break; throw new Error(`${t}: ${error.message}`); }
+      rows.push(...(data || [])); if (!data || data.length < 1000) break;
+      if (rows.length > 200000) throw new Error(`${t}: more than 200,000 rows`);
+    }
+    tables[t] = rows; counts[t] = rows.length;
+  }
+  let release = null; try { release = require('./release.json').id; } catch {}
+  const body = zlib.gzipSync(Buffer.from(JSON.stringify({ meta: { kind: 'neumdesk-ops-comms', version: 1, created_at: new Date().toISOString(), release, trigger, counts }, tables })));
+  const path = Health.backupPath(date, stamp);
+  const { error: upErr } = await supabase.storage.from(BACKUP_BUCKET).upload(path, body, { contentType: 'application/gzip', upsert: false });
+  if (upErr) throw upErr;
+  // Retention: folders older than 30 days; error log older than 90 days.
+  const old = (await pilotBackups()).days.filter(d => d < OpsRoom.addDays(date, -Health.BACKUP_KEEP_DAYS));
+  for (const d of old) { const { data: files } = await supabase.storage.from(BACKUP_BUCKET).list(d, { limit: 100 }); if (files?.length) await supabase.storage.from(BACKUP_BUCKET).remove(files.map(f => `${d}/${f.name}`)); }
+  await supabase.from('app_errors').delete().lt('created_at', new Date(Date.now() - 90 * 86400000).toISOString()).then(() => {}, () => {});
+  return { path, bytes: body.length, rows: Object.values(counts).reduce((a, n) => a + n, 0), tables: counts, removed_days: old.length, ms: Date.now() - t0 };
+}
+JOB_FNS.backup = () => pilotBackup('nightly');
+
+// Status panel: everything a pilot owner needs to see in one call.
+app.get('/api/admin/status', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
+  const nowMs = Date.now(), t0 = Date.now();
+  const ping = await supabase.from('training_units').select('id', { head: true, count: 'exact' }).limit(1);
+  const db = { ok: !ping.error, ms: Date.now() - t0, error: ping.error ? ping.error.message : null };
+  const names = [...new Set(Health.MIGRATIONS.flatMap(m => m.tables))];
+  const exists = await Promise.all(names.map(t => pilotTableExists(t).catch(() => true)));
+  const tables = Object.fromEntries(names.map((t, i) => [t, exists[i]]));
+  const since24 = new Date(nowMs - 86400000).toISOString(), since7 = new Date(nowMs - 7 * 86400000).toISOString();
+  const [runs, queued, failed, errs, users, staff, backups] = await Promise.all([
+    tables.job_runs ? opsSoftOrNull(supabase.from('job_runs').select('job, run_key, status, started_at, finished_at, duration_ms, detail, error').gte('started_at', since7).order('started_at', { ascending: false }).limit(300)) : null,
+    tables.notif_outbox ? opsSoftOrNull(supabase.from('notif_outbox').select('created_at').eq('status', 'queued').order('created_at').limit(500)) : null,
+    tables.notif_outbox ? opsSoftOrNull(supabase.from('notif_outbox').select('id').eq('status', 'failed').gte('created_at', since7).limit(500)) : null,
+    tables.app_errors ? opsSoftOrNull(supabase.from('app_errors').select('source, count').gte('created_at', since24).limit(5000)) : null,
+    notifyAllUsers(),
+    opsSoft(supabase.from('medical_staff').select('id, full_name, employment_status, deleted_at').is('deleted_at', null).limit(2000)),
+    pilotBackups()
+  ]);
+  const active = staff.filter(st => !st.employment_status || String(st.employment_status).toLowerCase() === 'active');
+  const live = users.filter(u => !u.archived_at && !u.suspended_at && (u.account_status || 'active') !== 'archived');
+  const byStaff = new Map(live.filter(u => u.medical_staff_id).map(u => [String(u.medical_staff_id), u]));
+  const without = active.filter(st => !byStaff.has(String(st.id))).map(st => st.full_name).sort((a, b) => String(a).localeCompare(String(b), 'es'));
+  const now = Notify.madridNow();
+  const jobs = runs ? Jobs.summarize(runs, now, nowMs) : null;
+  const lastBackup = (runs || []).find(r => r.job === 'backup' && r.status === 'ok');
+  const status = Health.buildStatus({ db, tables, nowMs,
+    env: { email_provider: !!RESEND_API_KEY, email_mode: EMAIL_MODE, feed_token: !!OPS_FEED_TOKEN, jwt_secret_len: String(JWT_SECRET || '').length, public_api_url: !!process.env.PUBLIC_API_URL, node_env: NODE_ENV },
+    jobs, outbox: queued ? { queued: queued.length, failed_7d: (failed || []).length, oldest_queued_min: queued[0] ? Math.round((nowMs - Date.parse(queued[0].created_at)) / 60000) : 0 } : null,
+    errors24h: errs ? errs.reduce((m, e) => { m[e.source] = (m[e.source] || 0) + (Number(e.count) || 1); return m; }, {}) : null,
+    backups: backups.bucket || lastBackup ? { last_at: lastBackup?.finished_at || backups.list[0]?.created_at || null, count: backups.days?.length || 0 } : { last_at: null, count: 0 },
+    accounts: { staff: active.length, with_account: active.length - without.length, with_email: active.filter(st => byStaff.get(String(st.id))?.email).length, without } });
+  let release = null; try { release = require('./release.json').id; } catch {}
+  res.json({ ...status, now, release, uptime_s: Math.round(process.uptime()), jobs, accounts_without: without, backups: backups.list.slice(0, 10) });
+}));
+app.get('/api/admin/errors', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
+  const days = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 90);
+  const rows = await opsSoftOrNull(supabase.from('app_errors').select('id, source, route, status, message, detail, release, user_id, fingerprint, count, created_at').gte('created_at', new Date(Date.now() - days * 86400000).toISOString()).order('created_at', { ascending: false }).limit(2000));
+  res.json({ migrated: rows !== null, days, groups: Health.groupErrors(rows || []).slice(0, 100) });
+}));
+app.post('/api/admin/backup', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
+  const now = Notify.madridNow(), key = `backup:${now.date}:manual:${Date.now()}`;
+  let detail = null, failed = null;
+  await jobsRun('backup', key, async () => { try { detail = await pilotBackup('manual'); return detail; } catch (e) { failed = e; throw e; } });
+  if (failed) return res.status(500).json({ error: 'Backup failed', message: failed.message });
+  res.json({ success: true, ...(detail || {}) });
+}));
+app.get('/api/admin/backups/link', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
+  const path = String(req.query.path || '');
+  if (!/^\d{4}-\d{2}-\d{2}\/neumdesk-ops-comms-[\w-]+\.json\.gz$/.test(path)) return res.status(400).json({ error: 'Invalid backup path' });
+  const { data, error } = await supabase.storage.from(BACKUP_BUCKET).createSignedUrl(path, 600);
+  if (error) return res.status(404).json({ error: 'Backup not found' });
+  res.json({ url: data.signedUrl, expires_in: 600 });
 }));
 app.post('/api/admin/email/test', authenticateToken, notifyAdminOnly, commsWrap(async (req, res) => {
   const { data: me } = await supabase.from('app_users').select(NOTIFY_USER_COLS).eq('id', req.user.id).maybeSingle();
