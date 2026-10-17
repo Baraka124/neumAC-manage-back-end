@@ -4712,6 +4712,71 @@ app.put('/api/ops/indicators/:indId', authenticateToken, opsDeptOnly, opsWrap((r
 app.delete('/api/ops/indicators/:indId', authenticateToken, opsDeptOnly, opsWrap((req, res) => opsRemoveIndicator(req, res, null)));
 app.post('/api/ops/indicators/:indId/values', authenticateToken, opsDeptOnly, opsWrap((req, res) => opsSaveIndicatorValue(req, res, null)));
 
+// ===== OUTLOOK: the next weeks (guardias, absences, rotations, capacity, pending trends, sessions) =====
+// Read-only, Units read. Facts from the plan + trends against targets the department set; no invented thresholds.
+const Outlook = require('./outlook.js');
+app.get('/api/ops/outlook', authenticateToken, Portfolio.read('training_units'), apiLimiter, opsWrap(async (req, res) => {
+  res.json(await opsComputeOutlook(Math.min(Math.max(parseInt(req.query.weeks) || 8, 2), 12)));
+}));
+async function opsComputeOutlook(weeks) {
+  const today = opsToday();
+  const horizon = OpsRoom.addDays(Outlook.mondayOf(today), weeks * 7 - 1);
+  const { units } = await opsLoadUnits(null);
+  const unitIds = units.map(u => u.id);
+  const [rot, oncall, hist, abs, types, meas, inds, mtg] = await Promise.all([
+    opsSoft(supabase.from('resident_rotations').select('resident_id, training_unit_id, start_date, end_date, actual_start_date, actual_end_date, rotation_status, deleted_at, resident:medical_staff!resident_rotations_resident_id_fkey(full_name)')
+      .is('deleted_at', null).neq('rotation_status', 'cancelled').lte('start_date', horizon).gte('end_date', today).limit(2000)),
+    opsSoft(supabase.from('oncall_schedule').select('duty_date, primary_physician_id, backup_physician_id, resident_physician_id, deleted_at').is('deleted_at', null).gte('duty_date', today).lte('duty_date', horizon).limit(2000)),
+    opsSoft(supabase.from('oncall_schedule').select('duty_date, primary_physician_id, backup_physician_id, deleted_at').is('deleted_at', null).gte('duty_date', OpsRoom.addDays(today, -90)).lt('duty_date', today).limit(2000)),
+    opsSoft(supabase.from('staff_absence_records').select('staff_member_id, start_date, end_date, current_status, deleted_at, staff:medical_staff!staff_absence_records_staff_member_id_fkey(full_name)')
+      .is('deleted_at', null).lte('start_date', horizon).gte('end_date', today).limit(2000)),
+    unitIds.length ? opsSoft(supabase.from('ops_measure_types').select('id, unit_id, label, kind, active').in('unit_id', unitIds).eq('kind', 'stock')) : Promise.resolve([]),
+    unitIds.length ? opsSoft(supabase.from('ops_measurements').select('type_id, measured_on, value').in('unit_id', unitIds).gte('measured_on', OpsRoom.addDays(today, -60)).limit(5000)) : Promise.resolve([]),
+    opsSoft(supabase.from('ops_indicators').select('id, unit_id, kind, params, target, direction, active').eq('active', true).eq('kind', 'stock_latest')),
+    opsSoftOrNull(supabase.from('comm_meetings').select('title, starts_at, status, deleted_at').is('deleted_at', null).neq('status', 'cancelled').gte('starts_at', today + 'T00:00:00Z').lte('starts_at', horizon + 'T23:59:59Z').order('starts_at').limit(200))
+  ]);
+  const th = inds.length ? await opsSoftOrNull(supabase.from('ops_targets').select('ref, value, direction, valid_from').eq('scope', 'indicator').in('ref', inds.map(i => String(i.id))).order('valid_from')) : [];
+  const targetFor = typeId => { const d = inds.find(i => i.params && String(i.params.type_id) === String(typeId)); if (!d) return null;
+    const h = th ? OpsRoom.targetAt(th.filter(t => t.ref === String(d.id)), today) : null; const v = h ? h.value : d.target; return v === null || v === undefined ? null : { value: Number(v), direction: (h && h.direction) || d.direction }; };
+  const unitName = Object.fromEntries(units.map(u => [u.id, u.unit_name]));
+  const out = Outlook.buildOutlook({ today, weeks,
+    units: units.map(u => ({ id: u.id, unit_name: u.unit_name, maximum_residents: u.maximum_residents, roster: (u.roster?.current || []).map(r => r.staff?.id).filter(Boolean) })),
+    rotations: rot.map(r => ({ ...r, resident_name: r.resident?.full_name || null })), oncall, oncallHistory: hist,
+    absences: abs.map(a => ({ ...a, name: a.staff?.full_name || null })),
+    stocks: types.filter(t => t.active !== false).map(t => ({ unit_id: t.unit_id, unit_name: unitName[t.unit_id], label: t.label,
+      points: meas.filter(m => String(m.type_id) === String(t.id)).map(m => ({ date: m.measured_on, value: m.value })), target: targetFor(t.id) })),
+    meetings: mtg || [] });
+  return out;
+}
+
+// Grounded: one compact department snapshot (units, interconsultas, next 2 weeks, last month in plain words, today's Parte).
+// Read-only, Units read. Every part says where it comes from.
+app.get('/api/ops/grounded', authenticateToken, Portfolio.read('training_units'), apiLimiter, opsWrap(async (req, res) => {
+  const today = opsToday(), nowIso = commsNow(), fromIso = new Date(Date.now() - 30 * 86400000).toISOString();
+  const [{ units }, outlook, icOpen, icRecent, brief] = await Promise.all([
+    opsLoadUnits(null), opsComputeOutlook(2),
+    opsSoft(supabase.from('ops_interconsults').select('id, priority, status, received_at, answered_at, assigned_to, requesting_service, deleted_at').is('deleted_at', null).neq('status', 'closed').limit(500)),
+    opsCompat(() => supabase.from('ops_interconsults').select('id, priority, status, received_at, answered_at, assigned_to, requesting_service, channel, duration_min, deleted_at').is('deleted_at', null).or(`received_at.gte.${fromIso},answered_at.gte.${fromIso}`).limit(2000),
+      () => supabase.from('ops_interconsults').select('id, priority, status, received_at, answered_at, assigned_to, requesting_service, deleted_at').is('deleted_at', null).or(`received_at.gte.${fromIso},answered_at.gte.${fromIso}`).limit(2000)),
+    opsSoftOrNull(supabase.from('comm_daily_briefs').select('status, sent_at').eq('brief_date', today).limit(1))
+  ]);
+  const all = [...new Map([...icOpen, ...icRecent].map(r => [r.id, r])).values()];
+  const { icTargets } = await opsCatalog();
+  const st = OpsRoom.interconsultStats(all, nowIso, fromIso, icTargets);
+  let lastMonth = null;
+  try {
+    const list = await opsListReports('department', null);
+    const m = (list.reports || []).find(r => r.period === 'month');
+    if (m) { const full = await opsSoftOrNull(supabase.from('ops_reports').select('*').eq('id', m.id).limit(1)); if (full && full[0]) { const n = Narrative.narrate(full[0].content); lastMonth = { id: m.id, period_start: String(m.period_start).slice(0, 10), period_end: String(m.period_end).slice(0, 10), narrative: n, text: Narrative.narrativeText(n) }; } }
+  } catch (e) { /* reports are optional here */ }
+  res.json({ today,
+    units: units.map(u => ({ id: u.id, name: u.unit_name, level: u.pulse ? u.pulse.level : 'ok', reasons: u.pulse ? u.pulse.reasons.map(r => r.text) : [] })),
+    interconsults: { waiting: st.waiting, overdue: st.overdue, unassigned: st.unassigned, oldest_waiting_hours: st.oldest_waiting_hours, received_30d: st.received, median_hours: st.median_hours, within_target_pct: st.within_target_pct,
+      calls_30d: OpsRoom.callStats(all, fromIso, nowIso) },
+    outlook: { weeks: outlook.weeks.map(w => ({ start: w.start, end: w.end, level: w.level, signals: w.signals.filter(x => x.level !== 'info') })), notes: outlook.notes, trends: outlook.trends.filter(t => t.crosses || t.off_target_now) },
+    last_month: lastMonth, parte_today: brief && brief[0] ? brief[0] : null });
+}));
+
 // ===== PNEUMO OPS ROOM (OR-C): configuration — catalogues and target history =====
 // Read: Units read. Department-wide lists and interconsulta targets: head of department / admin.
 // Codes are fixed, labels editable; switching off hides an item but keeps every record that uses it.
@@ -4866,7 +4931,9 @@ function opsReportPeriodFrom(body, today) {
   }
   return { value: OpsRoom.reportPeriod(period, today, start) };
 }
-const opsReportOut = r => ({ ...r, period_start: String(r.period_start).slice(0, 10), period_end: String(r.period_end).slice(0, 10) });
+const Narrative = require('./narrative.js');
+// Reports carry a plain-words narrative computed from the snapshot (what rose, fell, to watch; no causes guessed).
+const opsReportOut = r => ({ ...r, period_start: String(r.period_start).slice(0, 10), period_end: String(r.period_end).slice(0, 10), ...(r.content ? { narrative: Narrative.narrate(r.content) } : {}) });
 
 app.get('/api/ops/units/:unitId/reports', authenticateToken, Portfolio.read('training_units', { child: true }), apiLimiter, opsWrap(async (req, res) => {
   const unit = await supabase.from('training_units').select('id, unit_name, unit_code, ops_enabled').eq('id', req.params.unitId).maybeSingle();

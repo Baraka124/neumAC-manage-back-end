@@ -21,3 +21,4 @@ Backend quick map:
 - Tests: `tests/ops-room*.test.cjs` + `tests/boot-smoke.cjs`; CI `.github/workflows/ops-room.yml`.
 - Conventions: no patient data · rows must belong to the unit in the URL (`opsOwned`) · missing tables read as
   empty (`opsSoft`) · permanent deletes = head of department / admin · never invent targets.
+- Outlook (`outlook.js`, `GET /api/ops/outlook`) and report narrative (`narrative.js`); Grounded snapshot `GET /api/ops/grounded`.
